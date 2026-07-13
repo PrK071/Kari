@@ -4,22 +4,21 @@ export default {
   theme: {
     extend: {
       colors: {
-        app: "#050506",
-        panel: "#0d0d10",
-        soft: "#151519",
-        line: "#26262b",
-        muted: "#9a9aa1",
-        // accent neutro (no lugar do rosa): branco-gelo + cinza claro
-        accent: "#f4f4f5",
-        "accent-dim": "#d4d4d8",
+        app: "#080c0e",
+        panel: "#101518",
+        soft: "#151c20",
+        line: "#273238",
+        muted: "#8c999f",
+        accent: "#62d69a",
+        "accent-dim": "#b7f1d1",
       },
       boxShadow: {
-        glow: "0 10px 34px -14px rgba(255,255,255,0.22)",
-        card: "0 2px 14px -8px rgba(0,0,0,0.8)",
+        glow: "0 14px 36px -20px rgba(98,214,154,0.34)",
+        card: "0 12px 26px -22px rgba(0,0,0,0.92)",
       },
       backgroundImage: {
         "fade-app":
-          "linear-gradient(to top, #050506 8%, rgba(5,5,6,0.72) 46%, rgba(5,5,6,0) 100%)",
+          "linear-gradient(to top, #000000 8%, rgba(0,0,0,0.72) 46%, rgba(0,0,0,0) 100%)",
       },
     },
   },

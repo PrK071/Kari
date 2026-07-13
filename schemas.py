@@ -34,9 +34,12 @@ class MangaHomeItem(BaseModel):
     authors: list[str] = Field(default_factory=list)
     rating: float | None = None
     chapter_count: int | None = None
+    chapter_preview: list[str] = Field(default_factory=list)
+    chapter_status: str = "pending"
     latest_chapter: str = ""
     updated_at: str = ""
     source_url: str = ""
+    chapter_languages: list[str] = Field(default_factory=list)
 
 
 class MangaSearchItem(BaseModel):

@@ -1,19 +1,32 @@
 from __future__ import annotations
 
+import copy
 import time
 import mimetypes
+import html
 import json
 import logging
+import os
+import base64
+import binascii
+import secrets
+import hashlib
+import io
 import random
+import re
+import socket
 import threading
+from uuid import uuid4
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 
 import requests
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Response
+from requests.adapters import HTTPAdapter
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -27,11 +40,26 @@ from schemas import (
 )
 
 from reader_server import (
+    ANILIST_GRAPHQL_URL,
     DEFAULT_HEADERS,
     MangaReader,
     fuzzy_match_score,
     normalize_match_text,
 )
+
+try:  # Imagens de perfil (avatar/background) sao validadas/normalizadas via Pillow.
+    from PIL import Image, UnidentifiedImageError
+except Exception:  # noqa: BLE001 - Pillow e requisito, mas nao quebra o import se faltar.
+    Image = None
+    UnidentifiedImageError = Exception
+
+# Credenciais OAuth (AniList/MyAnimeList) vivem no .env da raiz do projeto.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+except Exception:  # noqa: BLE001 - sem dotenv o app ainda roda (OAuth fica desligado).
+    pass
 
 
 CATALOG_CACHE_TTL_SECONDS = 30 * 60
@@ -39,26 +67,68 @@ SEARCH_CACHE_TTL_SECONDS = 5 * 60
 SOURCE_RESOLUTION_CACHE_TTL_SECONDS = 10 * 60
 CHAPTER_COUNT_CACHE_TTL_SECONDS = 20 * 60
 CHAPTERS_CACHE_TTL_SECONDS = 10 * 60
+CHAPTER_PAYLOAD_CACHE_TTL_SECONDS = 30 * 60
+MANGA_META_CACHE_TTL_SECONDS = 12 * 60 * 60
 IMAGE_CACHE_TTL_SECONDS = 15 * 60
 IMAGE_CACHE_MAX_ITEMS = 1000
 ANILIST_CACHE_TTL_SECONDS = 12 * 60 * 60
 KITSU_CACHE_TTL_SECONDS = 12 * 60 * 60
+MANGAUPDATES_CACHE_TTL_SECONDS = 24 * 60 * 60
+MANGAUPDATES_API_URL = "https://api.mangaupdates.com/v1"
+MANGAUPDATES_REQUEST_GAP_SECONDS = 0.5
+MANGAUPDATES_REQUEST_ATTEMPTS = 3
 TRANSLATION_CACHE_TTL_SECONDS = 24 * 60 * 60
 DEFAULT_LIMIT = 80
-SOURCE_SEARCH_TIMEOUT_SECONDS = 8.0
+SOURCE_SEARCH_TIMEOUT_SECONDS = 4.0
+# Sakura passa pelo navegador (CDP) e nao cabe no batch rapido de 4s. Quando a
+# busca nao acha a obra nas fontes rapidas, roda um passe DEDICADO no Sakura com
+# este orcamento maior (obra especifica pedida em tempo real).
+SAKURA_LIVE_SEARCH_TIMEOUT_SECONDS = 20.0
+SEARCH_MAX_PER_SOURCE = 18
 SOURCE_RESOLUTION_TIMEOUT_SECONDS = 5.0
 CATALOG_SNAPSHOT_TTL_SECONDS = 6 * 60 * 60
 CATALOG_SNAPSHOT_PATH = Path(__file__).resolve().parent / ".cache" / "catalog.json"
+CATALOG_SNAPSHOT_VERSION = 8
+CHAPTER_AUDIT_FAILURE_TTL_SECONDS = 5 * 60
+# Timeout POR FONTE no audit de capitulos da home. Uma fonte que trava (browser
+# offline, provider lento, Cloudflare) vira falha registrada em vez de segurar o
+# worker e travar o audit inteiro (deixando cards eternamente "Verificando").
+CHAPTER_AUDIT_TARGET_TIMEOUT_SECONDS = 15.0
+# Teto do lote inteiro: mesmo que alguma fonte ignore o timeout individual, o
+# audit sempre termina e libera a flag global p/ o proximo ciclo.
+CHAPTER_AUDIT_BATCH_TIMEOUT_SECONDS = 60.0
+PARTNER_CATALOG_LIMIT = 24
 
 # Capitulos basicos cacheados em disco (id/numero/titulo/lingua) -> rota local,
 # sem fetch externo a cada clique. TTL longo; sobrevive a restart.
 CHAPTERS_DISK_TTL_SECONDS = 24 * 60 * 60
+CHAPTERS_CACHE_VERSION = 3
 CHAPTERS_SNAPSHOT_PATH = Path(__file__).resolve().parent / ".cache" / "chapters.json"
+PROFILES_STORE_PATH = Path(__file__).resolve().parent / ".cache" / "profiles.json"
+# Contas de usuario (cadastro/login) e sessoes. Local, senha com PBKDF2.
+USERS_STORE_PATH = Path(__file__).resolve().parent / ".cache" / "users.json"
+AUTH_TOKENS_PATH = Path(__file__).resolve().parent / ".cache" / "tokens.json"
+AUTH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60
+PBKDF2_ITERATIONS = 200_000
+# Obras adicionadas manualmente (ex.: via tools/add_sakura_manga.py). Mescladas
+# ao CURATED_CATALOG p/ aparecerem na home como as fontes fixas.
+CUSTOM_CATALOG_PATH = Path(__file__).resolve().parent / ".cache" / "custom_catalog.json"
+PIECEPROJECT_OUTAGE_TTL_SECONDS = 60
+ONE_PIECE_PIECEPROJECT_URL = "https://www.pieceproject.xyz/"
+ONE_PIECE_MANGALIVRE_URL = "https://mangalivre.blog/manga/one-piece/"
 
 # Resiliencia da busca de capitulos: retry com backoff exponencial + rotacao de UA.
-CHAPTERS_FETCH_ATTEMPTS = 4          # 4 tentativas
-CHAPTERS_BACKOFF_BASE = 2.0          # espera 1s, 2s, 4s entre tentativas
-CHAPTERS_BACKOFF_START = 1.0
+CHAPTERS_FETCH_ATTEMPTS = 2
+CHAPTERS_BACKOFF_BASE = 2.0
+CHAPTERS_BACKOFF_START = 0.35
+
+DIRECT_IMAGE_HOSTS = {
+    "uploads.mangadex.org",
+    "cdn.mugiverso.com",
+    "i.imgur.com",
+    "i.ibb.co",
+    "i.postimg.cc",
+}
 
 logger = logging.getLogger("mangatemp")
 
@@ -80,6 +150,75 @@ USER_AGENTS = [
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 COVERS_DIR = STATIC_DIR / "covers"
 COVERS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Imagens de perfil (avatar/background) enviadas pelo usuario ficam salvas
+# localmente em static/profiles/<profile_id>/ e servidas por /static/profiles/...
+PROFILE_MEDIA_DIR = STATIC_DIR / "profiles"
+PROFILE_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+
+# Backgrounds pre-definidos (o leitor escolhe). Qualquer imagem/video colocado
+# em static/backgrounds/ aparece automaticamente no seletor do perfil.
+BACKGROUNDS_DIR = STATIC_DIR / "backgrounds"
+BACKGROUNDS_DIR.mkdir(parents=True, exist_ok=True)
+BACKGROUND_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+BACKGROUND_VIDEO_EXTS = {".mp4", ".webm", ".mov", ".m4v"}
+
+# Limites de upload de imagem de perfil (bytes) e dimensao maxima (px).
+PROFILE_AVATAR_MAX_BYTES = 4 * 1024 * 1024
+PROFILE_BACKGROUND_MAX_BYTES = 8 * 1024 * 1024
+PROFILE_AVATAR_MAX_DIM = 512
+PROFILE_BACKGROUND_MAX_DIM = 2560
+# Background da HOME e uma imagem de tela cheia; preserva ate 4K e aceita ate 24MB.
+PROFILE_HOME_BACKGROUND_MAX_BYTES = 24 * 1024 * 1024
+PROFILE_HOME_BACKGROUND_MAX_DIM = 3840
+# Background animado (mp4/webm/gif). Salvo bruto, sem reprocessar.
+PROFILE_VIDEO_MAX_BYTES = 64 * 1024 * 1024
+
+# ---------------------------------------------------------------------------
+# OAuth de contas externas (AniList / MyAnimeList).
+# Credenciais vem do .env; sem elas o vinculo fica desabilitado (HTTP 503).
+# ---------------------------------------------------------------------------
+BACKEND_BASE_URL = os.environ.get("KARI_BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
+FRONTEND_BASE_URL = os.environ.get("KARI_FRONTEND_URL", "http://127.0.0.1:5173").rstrip("/")
+
+ANILIST_CLIENT_ID = os.environ.get("ANILIST_CLIENT_ID", "").strip()
+ANILIST_CLIENT_SECRET = os.environ.get("ANILIST_CLIENT_SECRET", "").strip()
+ANILIST_AUTHORIZE_URL = "https://anilist.co/api/v2/oauth/authorize"
+ANILIST_TOKEN_URL = "https://anilist.co/api/v2/oauth/token"
+
+MAL_CLIENT_ID = os.environ.get("MAL_CLIENT_ID", "").strip()
+MAL_CLIENT_SECRET = os.environ.get("MAL_CLIENT_SECRET", "").strip()
+MAL_AUTHORIZE_URL = "https://myanimelist.net/v1/oauth2/authorize"
+MAL_TOKEN_URL = "https://myanimelist.net/v1/oauth2/token"
+MAL_USER_URL = "https://api.myanimelist.net/v2/users/@me"
+
+# Discord como metodo de LOGIN/CADASTRO (cria/entra numa conta local).
+DISCORD_CLIENT_ID = os.environ.get("DISCORD_CLIENT_ID", "").strip()
+DISCORD_CLIENT_SECRET = os.environ.get("DISCORD_CLIENT_SECRET", "").strip()
+DISCORD_AUTHORIZE_URL = "https://discord.com/oauth2/authorize"
+DISCORD_TOKEN_URL = "https://discord.com/api/oauth2/token"
+DISCORD_USER_URL = "https://discord.com/api/users/@me"
+
+def _discord_configured() -> bool:
+    return bool(DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET)
+
+def _discord_redirect_uri() -> str:
+    return f"{BACKEND_BASE_URL}/api/auth/discord/callback"
+
+OAUTH_PROVIDERS = ("anilist", "myanimelist")
+OAUTH_STATE_TTL_SECONDS = 10 * 60
+PROVIDER_LABELS = {"anilist": "AniList", "myanimelist": "MyAnimeList"}
+
+def _oauth_redirect_uri(provider: str) -> str:
+    return f"{BACKEND_BASE_URL}/api/oauth/{provider}/callback"
+
+def _oauth_provider_configured(provider: str) -> bool:
+    if provider == "anilist":
+        return bool(ANILIST_CLIENT_ID and ANILIST_CLIENT_SECRET)
+    if provider == "myanimelist":
+        return bool(MAL_CLIENT_ID)  # MAL aceita client publico (secret opcional).
+    return False
+
 
 # Placeholder "Sem Capa" servido quando a obra nao tem capa local valida.
 # Fica em static/ (fora de covers/) p/ nao ser limpo junto com o cache de capas.
@@ -140,12 +279,15 @@ SOURCE_LABELS = {
 
 SEARCH_SOURCES = ["sakura", "yumo", "mangasbrasuka", "mangalivre", "mangadex"]
 PT_COMPLETE_SOURCES = ["sakura", "yumo", "mangasbrasuka", "mangalivre"]
+SEARCH_CACHE_VERSION = 5
+SEARCH_COVER_RECOVERY_LIMIT = 4
 
 SOURCE_RELIABILITY = {
+    "pieceproject": 0.99,
     "sakura": 0.98,
     "yumo": 0.96,
-    "mangalivre": 0.94,
-    "mangasbrasuka": 0.92,
+    "mangasbrasuka": 0.97,
+    "mangalivre": 0.90,
     "toomics": 0.78,
     "mangadex": 0.72,
 }
@@ -190,11 +332,61 @@ CURATED_CATALOG = [
     {
         "title": "One Piece",
         "aliases": ["One Piece"],
-        "url": "pieceproject://one-piece",
+        "url": ONE_PIECE_PIECEPROJECT_URL,
         "poster": "https://i.ibb.co/NnFxkGJ/manga1130.jpg",
         "provider": "pieceproject",
         "section": "Aventura",
         "genres": ["Acao", "Aventura", "Comedia"],
+    },
+    {
+        "title": "One Punch-Man",
+        "aliases": ["One Punch-Man", "One Punch Man"],
+        "url": "https://mangasbrasuka.com.br/manga/one-punch-man/",
+        "provider": "mangasbrasuka",
+        "section": "Acao",
+        "genres": ["Acao", "Comedia", "Super-heroi"],
+    },
+    {
+        "title": "Revenge of the Baskerville Bloodhound",
+        "aliases": [
+            "Revenge of the Baskerville Bloodhound",
+            "A Vinganca do Cao de Caca dos Baskerville",
+            "Vinganca do Cao de Caca dos Baskerville",
+        ],
+        "url": "https://mangasbrasuka.com.br/manga/a-vinganca-do-cao-de-caca-dos-baskerville/",
+        "provider": "mangasbrasuka",
+        "section": "Acao",
+        "genres": ["Acao", "Fantasia", "Reencarnacao"],
+    },
+    {
+        "title": "Magic Emperor",
+        "aliases": ["Magic Emperor", "The Devil Butler"],
+        "url": "yumo://manga/75",
+        "provider": "yumo",
+        "section": "Acao",
+        "genres": ["Acao", "Fantasia", "Cultivo"],
+    },
+    {
+        "title": "The Genius Blacksmith's Game",
+        "aliases": ["The Genius Blacksmith's Game", "The Genius Blacksmith’s Game"],
+        "url": "yumo://manga/1299",
+        "provider": "yumo",
+        "section": "Fantasia",
+        "genres": ["Acao", "Fantasia", "Jogo"],
+    },
+    {
+        "title": "Oyasumi Punpun",
+        "aliases": [
+            "Oyasumi Punpun",
+            "Goodnight Punpun",
+            "Boa noite Punpun",
+            "Boa noite Punpun!",
+            "Buenas noches, Punpun",
+        ],
+        "url": "yumo://manga/oyasumi-punpun",
+        "provider": "yumo",
+        "section": "Drama",
+        "genres": ["Drama", "Psicologico", "Slice of Life"],
     },
 ]
 
@@ -216,24 +408,151 @@ reader = MangaReader(
     SimpleNamespace(
         librewolf_path=None,
         show_browser=False,
-        timeout=35,
+        timeout=12,
         readfull_api_url="https://readfullapi.herokuapp.com",
         dragontea_browser="edge",
     )
 )
+
+
+def _tcp_port_open(host: str, port: int, timeout: float = 0.15) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _sakura_search_available() -> bool:
+    # Sakura precisa de navegador/CDP. Sem isso, search vira abertura pesada de browser.
+    cdp_url = str(getattr(reader, "sakura_cdp_url", "") or "").strip()
+    if not cdp_url:
+        return False
+    parsed = urlparse(cdp_url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return _tcp_port_open(host, port)
+
+
+def _pt_complete_sources() -> list[str]:
+    return list(PT_COMPLETE_SOURCES)
+
+
+def _search_sources() -> list[str]:
+    sources = list(SEARCH_SOURCES)
+    if not _sakura_search_available():
+        sources = [source for source in sources if source != "sakura"]
+    return sources
+
+
+def _search_source_limit(limit: int) -> int:
+    return min(max(limit, 8), SEARCH_MAX_PER_SOURCE)
+
+
+def _number_value(value) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _matching_chapter_url(chapters_payload: dict, chapter_number: str | float | None) -> str:
+    wanted = _number_value(chapter_number)
+    if wanted is None:
+        return ""
+    for chapter in chapters_payload.get("chapters") or []:
+        number = _number_value(chapter.get("number"))
+        if number is not None and abs(number - wanted) < 0.0001:
+            return str(chapter.get("url") or "")
+    return ""
+
+
+def _yumo_chapter_number(source: str, lang: str) -> str:
+    parts = reader._yumo_chapter_parts(source)
+    if not parts:
+        return ""
+    manga_id, chapter_id = parts
+    try:
+        chapters_payload = reader.list_chapters(reader._yumo_manga_url(manga_id), lang)
+    except Exception:
+        return ""
+    for chapter in chapters_payload.get("chapters") or []:
+        if (
+            str(chapter.get("chapter_id") or "") == str(chapter_id)
+            or str(chapter.get("url") or "") == source
+        ):
+            return str(chapter.get("number_text") or chapter.get("number") or "")
+    return ""
+
+
+def _open_fallback_chapter(
+    fallback_source_url: str,
+    lang: str,
+    chapter_number: str | float | None,
+    original_source: str,
+    original_error: Exception,
+) -> dict | None:
+    fallback_source = unquote(fallback_source_url or "").strip()
+    if not fallback_source or fallback_source == original_source:
+        return None
+    chapters_payload = reader.list_chapters(fallback_source, lang, str(chapter_number or ""))
+    selected_url = _matching_chapter_url(chapters_payload, chapter_number)
+    if not selected_url:
+        return None
+    payload = reader.chapter_metadata(
+        selected_url,
+        cache_pages=False,
+        include_source_urls=True,
+    )
+    payload["fallback"] = {
+        "from": original_source,
+        "to": fallback_source,
+        "reason": str(original_error),
+        "chapter_number": str(chapter_number or ""),
+    }
+    return payload
+
+
 catalog_cache: CacheEntry | None = None
 catalog_refresh_lock = threading.Lock()
 catalog_refreshing = False
 search_cache: dict[str, CacheEntry] = {}
 source_resolution_cache: dict[str, CacheEntry] = {}
+source_outage_cache: dict[str, CacheEntry] = {}
 chapter_count_cache: dict[str, CacheEntry] = {}
 chapters_cache: dict[str, CacheEntry] = {}
+chapter_audit_failures: dict[str, CacheEntry] = {}
+chapter_payload_cache: dict[str, CacheEntry] = {}
+manga_meta_cache: dict[str, CacheEntry] = {}
 anilist_cache: dict[str, CacheEntry] = {}
+author_cache: dict[str, CacheEntry] = {}
+author_profile_cache: dict[str, CacheEntry] = {}
 kitsu_cache: dict[str, CacheEntry] = {}
+mangaupdates_series_cache: dict[str, CacheEntry] = {}
+mangaupdates_author_cache: dict[str, CacheEntry] = {}
 translation_cache: dict[str, CacheEntry] = {}
 image_cache: dict[str, ImageCacheEntry] = {}
+image_inflight: dict[str, threading.Event] = {}
+
+mangaupdates_request_lock = threading.Lock()
+mangaupdates_last_request_at = 0.0
 
 _chapters_disk_lock = threading.Lock()
+_chapters_cache_lock = threading.RLock()
+_chapters_refresh_lock = threading.Lock()
+_chapters_refreshing: set[str] = set()
+_source_resolution_refresh_lock = threading.Lock()
+_source_resolution_refreshing: set[str] = set()
+_chapter_payload_cache_lock = threading.Lock()
+_image_cache_lock = threading.Lock()
+_chapter_audit_local = threading.local()
+_home_chapter_audit_lock = threading.Lock()
+_home_chapter_audit_running = False
+
+_image_http = requests.Session()
+_image_http_adapter = HTTPAdapter(pool_connections=32, pool_maxsize=64, max_retries=0)
+_image_http.mount("http://", _image_http_adapter)
+_image_http.mount("https://", _image_http_adapter)
 
 
 def _load_chapters_snapshot() -> None:
@@ -242,9 +561,10 @@ def _load_chapters_snapshot() -> None:
         if not CHAPTERS_SNAPSHOT_PATH.exists():
             return
         raw = json.loads(CHAPTERS_SNAPSHOT_PATH.read_text(encoding="utf-8"))
-        for key, entry in (raw or {}).items():
-            if isinstance(entry, dict) and isinstance(entry.get("data"), dict):
-                chapters_cache[key] = CacheEntry(float(entry.get("saved_at") or 0), entry["data"])
+        with _chapters_cache_lock:
+            for key, entry in (raw or {}).items():
+                if isinstance(entry, dict) and isinstance(entry.get("data"), dict):
+                    chapters_cache[key] = CacheEntry(float(entry.get("saved_at") or 0), entry["data"])
     except Exception:
         pass
 
@@ -252,15 +572,77 @@ def _load_chapters_snapshot() -> None:
 def _save_chapters_snapshot() -> None:
     """Persiste o cache de capitulos no disco (.cache/chapters.json)."""
     try:
-        CHAPTERS_SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
         with _chapters_disk_lock:
-            payload = {
-                key: {"saved_at": entry.saved_at, "data": entry.data}
-                for key, entry in chapters_cache.items()
-            }
-        CHAPTERS_SNAPSHOT_PATH.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            CHAPTERS_SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with _chapters_cache_lock:
+                payload = {
+                    key: {"saved_at": entry.saved_at, "data": entry.data}
+                    for key, entry in chapters_cache.items()
+                }
+            tmp = CHAPTERS_SNAPSHOT_PATH.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(CHAPTERS_SNAPSHOT_PATH)
     except Exception:
         pass
+
+
+def _refresh_chapters_source_payload(cache_key: str, source: str, lang: str) -> None:
+    try:
+        payload = _resilient_list_chapters(source, lang)
+        with _chapters_cache_lock:
+            chapters_cache[cache_key] = CacheEntry(time.time(), dict(payload))
+        _save_chapters_snapshot()
+    except Exception as exc:
+        logger.warning("Falha ao atualizar capitulos em background p/ %s: %s", source, exc)
+    finally:
+        with _chapters_refresh_lock:
+            _chapters_refreshing.discard(cache_key)
+
+
+def _schedule_chapters_refresh(cache_key: str, source: str, lang: str) -> None:
+    with _chapters_refresh_lock:
+        if cache_key in _chapters_refreshing:
+            return
+        _chapters_refreshing.add(cache_key)
+    threading.Thread(
+        target=_refresh_chapters_source_payload,
+        args=(cache_key, source, lang),
+        daemon=True,
+    ).start()
+
+
+def _load_chapters_source_payload(source: str, lang: str) -> dict:
+    cache_key = _chapters_cache_key(source, lang)
+    with _chapters_cache_lock:
+        cached = chapters_cache.get(cache_key)
+    if _cache_is_fresh(cached, CHAPTERS_DISK_TTL_SECONDS):
+        payload = dict(cached.data)
+        payload["cached"] = True
+        return payload
+
+    if cached is not None and isinstance(cached.data, dict) and cached.data:
+        _schedule_chapters_refresh(cache_key, source, lang)
+        payload = dict(cached.data)
+        payload["cached"] = True
+        payload["stale"] = True
+        payload["refreshing"] = True
+        return payload
+
+    try:
+        payload = _resilient_list_chapters(source, lang)
+        with _chapters_cache_lock:
+            chapters_cache[cache_key] = CacheEntry(time.time(), dict(payload))
+        _save_chapters_snapshot()
+        payload["cached"] = False
+        return payload
+    except Exception:
+        if cached is None or not isinstance(cached.data, dict) or not cached.data:
+            raise
+        logger.warning("Fonte externa indisponivel p/ %s; servindo cache STALE.", source)
+        payload = dict(cached.data)
+        payload["cached"] = True
+        payload["stale"] = True
+        return payload
 
 
 _load_chapters_snapshot()
@@ -286,17 +668,18 @@ def _resilient_list_chapters(source: str, lang: str) -> dict:
     excecao se TODAS falharem — o chamador decide o fallback (cache stale).
     """
     last_exc: Exception | None = None
-    for attempt in range(CHAPTERS_FETCH_ATTEMPTS):
+    attempts = 1 if reader._is_pieceproject_source(source) else CHAPTERS_FETCH_ATTEMPTS
+    for attempt in range(attempts):
         try:
             _rotate_headers(attempt)
             return reader.list_chapters(source, lang=lang)
         except Exception as exc:  # noqa: BLE001 (rede/HTTP/timeout/parse)
             last_exc = exc
-            if attempt < CHAPTERS_FETCH_ATTEMPTS - 1:
+            if attempt < attempts - 1:
                 wait = CHAPTERS_BACKOFF_START * (CHAPTERS_BACKOFF_BASE ** attempt)
                 logger.warning(
                     "list_chapters tentativa %d/%d falhou p/ %s (%s); retry em %.1fs",
-                    attempt + 1, CHAPTERS_FETCH_ATTEMPTS, source, exc, wait,
+                    attempt + 1, attempts, source, exc, wait,
                 )
                 time.sleep(wait)
     raise last_exc if last_exc else RuntimeError("Falha desconhecida ao buscar capitulos.")
@@ -314,7 +697,7 @@ app.add_middleware(
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     ],
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=["*"],
 )
 
@@ -354,33 +737,382 @@ class MangaHomeSchema(BaseModel):
     authors: list[str] = Field(default_factory=list)
     rating: float | None = None
     chapter_count: int | None = None
+    chapter_preview: list[str] = Field(default_factory=list)
+    chapter_status: str = "pending"
     latest_chapter: str = ""
     updated_at: str = ""
     source_url: str = ""
+    chapter_languages: list[str] = Field(default_factory=list)
+
+
+class ProfileCreateRequest(BaseModel):
+    display_name: str = Field(default="Leitor", max_length=48)
+
+
+class ProfileUpdateRequest(BaseModel):
+    display_name: str = Field(min_length=1, max_length=48)
+
+
+class ProfileFavoritesRequest(BaseModel):
+    favorites: list[dict] = Field(default_factory=list, max_length=500)
+
+
+class ProfileImageRequest(BaseModel):
+    """Define/limpa avatar ou background. Aceita `url` (remota http/https) OU
+    `data` (data-URI base64). Ambos vazios/None => limpa a imagem atual."""
+
+    url: str | None = Field(default=None, max_length=2048)
+    data: str | None = Field(default=None, description="data:image/...;base64,...")
+
+
+_PROFILE_IMAGE_KIND = {
+    "avatar": (PROFILE_AVATAR_MAX_BYTES, PROFILE_AVATAR_MAX_DIM),
+    "background": (PROFILE_BACKGROUND_MAX_BYTES, PROFILE_BACKGROUND_MAX_DIM),
+    "home_background": (PROFILE_HOME_BACKGROUND_MAX_BYTES, PROFILE_HOME_BACKGROUND_MAX_DIM),
+}
+_PROFILE_IMAGE_FORMATS = {
+    "JPEG": ".jpg",
+    "PNG": ".png",
+    "WEBP": ".webp",
+    "GIF": ".gif",
+}
+
+
+def _decode_data_uri(data: str) -> bytes:
+    """Extrai os bytes de um data-URI base64. Aceita tambem base64 puro."""
+    raw = data.strip()
+    if raw.startswith("data:"):
+        _, _, tail = raw.partition(",")
+        raw = tail
+    try:
+        return base64.b64decode(raw, validate=False)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="Imagem base64 invalida.") from exc
+
+
+def _data_uri_mime(data: str) -> str:
+    raw = data.strip()
+    if raw.startswith("data:") and "," in raw:
+        header = raw[5:raw.index(",")]
+        return header.split(";")[0].strip().lower()
+    return ""
+
+
+def _looks_like_video(mime: str, blob: bytes) -> bool:
+    """Detecta mp4/webm por mime OU magic bytes (nao passa pelo Pillow)."""
+    if mime.startswith("video/"):
+        return True
+    if len(blob) >= 12 and blob[4:8] == b"ftyp":  # mp4/mov/m4v
+        return True
+    if blob[:4] == b"\x1a\x45\xdf\xa3":  # webm/mkv (EBML)
+        return True
+    return False
+
+
+def _save_profile_video(profile_id: str, kind: str, blob: bytes, mime: str) -> str:
+    """Salva um background animado (mp4/webm) bruto, sem reprocessar."""
+    if not blob:
+        raise HTTPException(status_code=422, detail="Video vazio.")
+    if len(blob) > PROFILE_VIDEO_MAX_BYTES:
+        raise HTTPException(status_code=413, detail=f"Video excede {PROFILE_VIDEO_MAX_BYTES // (1024 * 1024)}MB.")
+    is_webm = "webm" in mime or blob[:4] == b"\x1a\x45\xdf\xa3"
+    suffix = ".webm" if is_webm else ".mp4"
+    directory = PROFILE_MEDIA_DIR / profile_id
+    directory.mkdir(parents=True, exist_ok=True)
+    _clear_profile_image_files(profile_id, kind)
+    target = directory / f"{kind}{suffix}"
+    target.write_bytes(blob)
+    rel = target.relative_to(STATIC_DIR).as_posix()
+    return f"/static/{rel}?v={int(time.time())}"
+
+
+def _clear_profile_image_files(profile_id: str, kind: str) -> None:
+    directory = PROFILE_MEDIA_DIR / profile_id
+    if not directory.exists():
+        return
+    for existing in directory.glob(f"{kind}.*"):
+        try:
+            existing.unlink()
+        except OSError:
+            pass
+
+
+def _save_profile_image(profile_id: str, kind: str, blob: bytes) -> str:
+    """Valida (Pillow), redimensiona se preciso e salva localmente.
+    Retorna a URL /static/... (com cache-buster) para o frontend."""
+    if Image is None:
+        raise HTTPException(status_code=503, detail="Pillow indisponivel no servidor.")
+    max_bytes, max_dim = _PROFILE_IMAGE_KIND[kind]
+    if not blob:
+        raise HTTPException(status_code=422, detail="Imagem vazia.")
+    if len(blob) > max_bytes:
+        raise HTTPException(status_code=413, detail=f"Imagem excede {max_bytes // (1024 * 1024)}MB.")
+
+    try:
+        image = Image.open(io.BytesIO(blob))
+        image.load()
+    except (UnidentifiedImageError, OSError) as exc:
+        raise HTTPException(status_code=422, detail="Arquivo nao e uma imagem valida.") from exc
+
+    image_format = (image.format or "").upper()
+    is_animated = getattr(image, "is_animated", False)
+    directory = PROFILE_MEDIA_DIR / profile_id
+    directory.mkdir(parents=True, exist_ok=True)
+    _clear_profile_image_files(profile_id, kind)
+
+    # GIF animado: preserva os bytes originais (nao reamostra os frames).
+    if image_format == "GIF" and is_animated:
+        target = directory / f"{kind}.gif"
+        target.write_bytes(blob)
+    else:
+        if max(image.size) > max_dim:
+            image.thumbnail((max_dim, max_dim), Image.LANCZOS)
+        if image.mode in ("RGBA", "LA", "P"):
+            image = image.convert("RGBA")
+            out_format, suffix = "PNG", ".png"
+        else:
+            image = image.convert("RGB")
+            out_format, suffix = "JPEG", ".jpg"
+        target = directory / f"{kind}{suffix}"
+        if out_format == "JPEG":
+            # Background em tela cheia sofre com recompressao: qualidade alta.
+            quality = 95 if kind in ("background", "home_background") else 90
+            save_kwargs = {"quality": quality, "subsampling": 0, "optimize": True}
+        else:
+            save_kwargs = {"optimize": True}
+        image.save(target, out_format, **save_kwargs)
+
+    rel = target.relative_to(STATIC_DIR).as_posix()
+    return f"/static/{rel}?v={int(time.time())}"
+
+
+def _apply_profile_image(profile: dict, kind: str, request: "ProfileImageRequest") -> str:
+    """Resolve o request (url/data/limpar) e devolve o valor final da URL."""
+    profile_id = str(profile.get("id") or "")
+    field = "avatar_url" if kind == "avatar" else "background_url"
+    data = (request.data or "").strip()
+    url = (request.url or "").strip()
+
+    if data:
+        mime = _data_uri_mime(data)
+        blob = _decode_data_uri(data)
+        # Background animado (mp4/webm) so p/ backgrounds, nao p/ avatar.
+        if kind in ("background", "home_background") and _looks_like_video(mime, blob):
+            return _save_profile_video(profile_id, kind, blob, mime)
+        return _save_profile_image(profile_id, kind, blob)
+    if url:
+        if not url.startswith(("http://", "https://", "/static/")):
+            raise HTTPException(status_code=422, detail="URL de imagem invalida.")
+        _clear_profile_image_files(profile_id, kind)  # troca upload local por remota
+        return url
+    # Sem url e sem data => limpar imagem.
+    _clear_profile_image_files(profile_id, kind)
+    return ""
+
+
+_profiles_lock = threading.RLock()
+
+
+def _load_profiles() -> dict[str, dict]:
+    try:
+        if not PROFILES_STORE_PATH.exists():
+            return {}
+        data = json.loads(PROFILES_STORE_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_profiles(profiles: dict[str, dict]) -> None:
+    PROFILES_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = PROFILES_STORE_PATH.with_suffix(".json.tmp")
+    temp_path.write_text(json.dumps(profiles, ensure_ascii=False), encoding="utf-8")
+    temp_path.replace(PROFILES_STORE_PATH)
+
+
+def _profile_favorite(item: dict) -> dict | None:
+    source_url = str(item.get("source_url") or "").strip()
+    title = str(item.get("title") or "").strip()
+    identifier = str(item.get("id") or source_url or title).strip()
+    if not identifier or not title:
+        return None
+    return {
+        "id": identifier,
+        "title": title,
+        "source_url": source_url,
+        "source": str(item.get("source") or "").strip(),
+        "cover_path": str(item.get("cover_path") or "").strip(),
+        "cover_url": str(item.get("cover_url") or "").strip(),
+        "cover_fallbacks": [
+            str(url).strip()
+            for url in (item.get("cover_fallbacks") or [])[:5]
+            if str(url or "").strip()
+        ],
+        "genres": [str(genre).strip() for genre in (item.get("genres") or [])[:8] if str(genre or "").strip()],
+        "authors": [str(author).strip() for author in (item.get("authors") or [])[:8] if str(author or "").strip()],
+        "chapter_count": item.get("chapter_count"),
+        "chapter_preview": [str(chapter).strip() for chapter in (item.get("chapter_preview") or [])[:3] if str(chapter or "").strip()],
+        "chapter_status": str(item.get("chapter_status") or "pending"),
+        "latest_chapter": str(item.get("latest_chapter") or ""),
+        "updated_at": str(item.get("updated_at") or ""),
+        "chapter_languages": [str(language).strip() for language in (item.get("chapter_languages") or [])[:8] if str(language or "").strip()],
+    }
+
+
+def _profile_links_payload(profile: dict) -> dict:
+    """Contas externas vinculadas, SEM expor tokens de acesso."""
+    links: dict[str, dict] = {}
+    raw = profile.get("links") or {}
+    if isinstance(raw, dict):
+        for provider, info in raw.items():
+            if not isinstance(info, dict):
+                continue
+            links[str(provider)] = {
+                "id": info.get("id"),
+                "name": str(info.get("name") or ""),
+                "avatar": str(info.get("avatar") or ""),
+                "url": str(info.get("url") or ""),
+                "linked_at": float(info.get("linked_at") or 0),
+            }
+    return links
+
+
+def _profile_payload(profile: dict) -> dict:
+    return {
+        "id": str(profile.get("id") or ""),
+        "display_name": str(profile.get("display_name") or "Leitor"),
+        "avatar_url": str(profile.get("avatar_url") or ""),
+        "background_url": str(profile.get("background_url") or ""),
+        "home_background_url": str(profile.get("home_background_url") or ""),
+        "links": _profile_links_payload(profile),
+        "favorites": list(profile.get("favorites") or []),
+        "created_at": float(profile.get("created_at") or 0),
+        "updated_at": float(profile.get("updated_at") or 0),
+    }
+
+
+def _get_profile_or_404(profile_id: str, profiles: dict[str, dict]) -> dict:
+    profile = profiles.get(profile_id)
+    if not isinstance(profile, dict):
+        raise HTTPException(status_code=404, detail="Perfil nao encontrado.")
+    return profile
 
 
 def _home_has_real_cover(item: dict) -> bool:
-    """Capa REAL FISICA no disco. Placeholder ou capa so-remota nao contam:
-    a obra so entra na home com arquivo local existente em /static/covers.
+    """Capa disponivel: arquivo local OU URL remota (proxy serve via /api/image).
+    Aceita qualquer fonte de imagem valida — nao bloqueia a home enquanto o
+    background thread baixa capas pro disco.
     """
     cover_path = str(item.get("cover_path") or "")
-    return bool(cover_path) and cover_path != PLACEHOLDER_URL and _cover_file_exists(cover_path)
+    if cover_path and cover_path != PLACEHOLDER_URL and _cover_file_exists(cover_path):
+        return True
+    # Aceita capa remota (o frontend usa cover_url/fallbacks via proxy)
+    cover_url = str(item.get("cover_url") or item.get("cover_original_url") or "")
+    return bool(cover_url.strip())
 
 
 def _home_has_chapters(item: dict) -> bool:
     """Tem capitulos associados (evita 'null caps' poluindo a home)."""
-    count = item.get("chapter_count")
+    source_url = str(item.get("source_url") or "").strip()
+    language = _item_chapter_language(item)
+    cached = _cached_chapters_payload(source_url, language) if source_url else None
+    if cached is not None:
+        return int(cached.get("count") or len(cached.get("chapters") or [])) > 0
+
+    latest = str(item.get("latest_chapter") or "").strip()
+    latest_normalized = normalize_match_text(latest)
+    if latest_normalized in {
+        "n a",
+        "na",
+        "none",
+        "null",
+        "unknown",
+        "not available",
+        "not avaliable",
+        "indisponivel",
+        "nao disponivel",
+    }:
+        return False
+
+    if _guess_provider(item) == "mangadex":
+        languages = {
+            str(language or "").strip().lower()
+            for language in (item.get("chapter_languages") or [])
+            if str(language or "").strip()
+        }
+        if not languages:
+            return False
+
+    count = item.get("chapter_count") if item.get("chapter_count_verified") else None
     try:
         if count not in (None, "") and int(count) > 0:
             return True
     except (TypeError, ValueError):
         pass
-    return bool(str(item.get("latest_chapter") or "").strip())
+    return bool(latest)
 
 
 def _is_home_ready(item: dict) -> bool:
     """Obra pronta p/ a linha de frente: tem capa real E capitulos."""
     return _home_has_real_cover(item) and _home_has_chapters(item)
+
+
+def _preferred_home_source(item: dict) -> dict:
+    title = str(item.get("title") or "")
+    title_identity = normalize_match_text(title)
+    curated_raw = next(
+        (
+            raw
+            for raw in _iter_curated()
+            if title_identity
+            and title_identity in {
+                normalize_match_text(str(name or ""))
+                for name in [raw.get("title"), *(raw.get("aliases") or [])]
+                if str(name or "").strip()
+            }
+        ),
+        None,
+    )
+    if not curated_raw:
+        return item
+    curated = _normalize_manga_item(
+        {**curated_raw, "title": title},
+        section=str(item.get("section") or curated_raw.get("section") or ""),
+    )
+    if not curated:
+        return item
+    preferred_url = str(curated.get("source_url") or "")
+    current_url = str(item.get("source_url") or "")
+    if not preferred_url or preferred_url == current_url:
+        return item
+    merged = dict(item)
+    for key in ("source_url", "provider", "source", "language", "chapter_languages"):
+        merged[key] = curated.get(key)
+    return merged
+
+
+def _item_chapter_language(item: dict) -> str:
+    """Idioma no qual os capitulos desta obra REALMENTE existem.
+
+    O campo `language` frequentemente e o default "pt-br", mas a obra pode so ter
+    capitulos em outro idioma (ex.: MangaDex so em EN). Auditar/consultar no
+    idioma errado devolve zero capitulos e trava o card em "Verificando".
+    Prioriza: language (se disponivel), depois pt-br/pt, depois o 1o disponivel.
+    """
+    language = str(item.get("language") or "").strip().lower()
+    langs = [
+        str(entry).strip().lower()
+        for entry in (item.get("chapter_languages") or [])
+        if str(entry or "").strip()
+    ]
+    if language and (not langs or language in langs):
+        return language
+    for preferred in ("pt-br", "pt"):
+        if preferred in langs:
+            return preferred
+    if langs:
+        return langs[0]
+    return language or "pt-br"
 
 
 def _home_item(item: dict) -> dict:
@@ -401,6 +1133,28 @@ def _home_item(item: dict) -> dict:
         except (TypeError, ValueError):
             return None
 
+    item = _preferred_home_source(item)
+    source_url = str(item.get("source_url") or item.get("url") or "")
+    language = _item_chapter_language(item)
+    cached_chapters = _cached_chapters_payload(source_url, language) if source_url else None
+    if cached_chapters:
+        chapter_count = int(cached_chapters.get("count") or len(cached_chapters.get("chapters") or []))
+        chapter_preview = _chapter_preview_from_payload(cached_chapters)
+        # Cache vazio (0 caps neste idioma): audit ja rodou e nao achou nada.
+        # Marca como indisponivel em vez de deixar o card eternamente "Verificando".
+        chapter_status = "ready" if chapter_count > 0 else "unavailable"
+    else:
+        # Catalogo externo frequentemente reporta ultimo numero publicado, nao
+        # quantidade disponivel nesta fonte/idioma. Nunca exibir isso como caps.
+        chapter_count = None
+        chapter_preview = []
+        failure = chapter_audit_failures.get(source_url)
+        chapter_status = (
+            "unavailable"
+            if _cache_is_fresh(failure, CHAPTER_AUDIT_FAILURE_TTL_SECONDS)
+            else "pending"
+        )
+
     return MangaHomeSchema(
         id=str(item.get("id") or item.get("slug") or item.get("source_url") or ""),
         title=str(item.get("title") or ""),
@@ -408,14 +1162,21 @@ def _home_item(item: dict) -> dict:
         cover_url=str(item.get("cover_url") or ""),
         cover_fallbacks=[str(u) for u in (item.get("cover_fallbacks") or []) if str(u or "").strip()],
         source=str(item.get("source") or ""),
-        description=str(item.get("description") or ""),
+        description=_clean_synopsis(item.get("description")),
         genres=[str(g) for g in (item.get("genres") or []) if str(g or "").strip()],
         authors=[str(a) for a in (item.get("authors") or []) if str(a or "").strip()],
         rating=_to_float(item.get("rating")),
-        chapter_count=_to_int(item.get("chapter_count")),
+        chapter_count=chapter_count,
+        chapter_preview=chapter_preview,
+        chapter_status=chapter_status,
         latest_chapter=str(item.get("latest_chapter") or ""),
         updated_at=str(item.get("updated_at") or ""),
-        source_url=str(item.get("source_url") or item.get("url") or ""),
+        source_url=source_url,
+        chapter_languages=[
+            str(language).lower()
+            for language in (item.get("chapter_languages") or [])
+            if str(language or "").strip()
+        ],
     ).model_dump()
 
 
@@ -423,9 +1184,62 @@ def _cache_is_fresh(entry: CacheEntry | None, ttl: int) -> bool:
     return bool(entry and time.time() - entry.saved_at < ttl)
 
 
+def _chapters_cache_key(source: str, lang: str) -> str:
+    return f"v{CHAPTERS_CACHE_VERSION}|{source.strip()}|{normalize_match_text(lang)}"
+
+
+def _cached_chapters_payload(source: str, lang: str) -> dict | None:
+    with _chapters_cache_lock:
+        entry = chapters_cache.get(_chapters_cache_key(source, lang))
+    if entry is None or not isinstance(entry.data, dict) or not entry.data:
+        return None
+    return entry.data
+
+
+def _cached_chapter_count(source: str, lang: str = "pt-br") -> int:
+    payload = _cached_chapters_payload(source, lang)
+    if payload is not None:
+        return int(payload.get("count") or len(payload.get("chapters") or []))
+    return 0
+
+
+def _chapter_preview_from_payload(payload: dict, limit: int = 3) -> list[str]:
+    preview: list[str] = []
+    chapters = payload.get("chapters") or []
+    for chapter in chapters:
+        number = str(
+            chapter.get("number_text")
+            or chapter.get("number")
+            or chapter.get("label")
+            or ""
+        ).strip()
+        # Oneshot / capitulo sem numeracao (comum no MangaDex): nao tem numero,
+        # entao mostra o titulo do capitulo (e "Unico" so se nem titulo houver).
+        # Sem isso o preview ficava vazio e o card travava em "Verificando".
+        if not number:
+            title = str(chapter.get("title") or "").strip()
+            number = title or "Unico"
+        if number and number not in preview:
+            preview.append(number)
+        if len(preview) >= limit:
+            break
+    return preview
+
+
+def _apply_verified_chapters(item: dict, payload: dict) -> None:
+    item["chapter_count"] = int(payload.get("count") or len(payload.get("chapters") or []))
+    item["chapter_preview"] = _chapter_preview_from_payload(payload)
+    item["chapter_count_verified"] = True
+
+
 def _slug(value: str) -> str:
     normalized = normalize_match_text(value)
     return "-".join(part for part in normalized.split() if part)
+
+
+def _is_one_piece_title(value: str) -> bool:
+    normalized = normalize_match_text(str(value or ""))
+    return normalized == "one piece" or normalized.startswith("one piece ")
 
 
 def _source_label(provider: str | None) -> str:
@@ -436,6 +1250,11 @@ def _source_label(provider: str | None) -> str:
 def _is_remote_image_url(url: str) -> bool:
     parsed = urlparse(url)
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _can_load_image_directly(url: str) -> bool:
+    host = (urlparse(str(url or "")).hostname or "").lower()
+    return host in DIRECT_IMAGE_HOSTS or _is_mangadex_image_url(url)
 
 
 def _proxy_image_url(url: str) -> str:
@@ -455,7 +1274,11 @@ def _unproxy_image_url(url: str) -> str:
 
 def _is_mangadex_image_url(url: str) -> bool:
     host = urlparse(str(url or "")).netloc.lower()
-    return host == "uploads.mangadex.org" or host.endswith(".mangadex.org")
+    return (
+        host == "uploads.mangadex.org"
+        or host.endswith(".mangadex.org")
+        or host.endswith(".mangadex.network")
+    )
 
 
 def _cover_urls(primary: str, fallbacks: list[str]) -> tuple[str, list[str]]:
@@ -505,6 +1328,33 @@ def _refresh_cover_fields(item: dict) -> dict:
     return merged
 
 
+def _item_has_cover(item: dict) -> bool:
+    return bool(
+        str(item.get("cover_path") or "").strip()
+        or str(item.get("cover_url") or "").strip()
+        or str(item.get("cover_original_url") or "").strip()
+    )
+
+
+def _copy_cover_fields(target: dict, source: dict) -> None:
+    for field in (
+        "cover_path",
+        "cover_url",
+        "cover_original_url",
+        "cover_fallbacks",
+        "cover_original_fallbacks",
+    ):
+        if target.get(field):
+            continue
+        value = source.get(field)
+        if isinstance(value, list):
+            value = list(value)
+        if value:
+            target[field] = value
+    if target.get("cover_original_url") and not target.get("cover_url"):
+        target.update(_refresh_cover_fields(target))
+
+
 def _guess_provider(item: dict) -> str:
     provider = str(item.get("provider") or item.get("source") or "").lower()
     url = str(item.get("url") or "")
@@ -522,7 +1372,7 @@ def _guess_provider(item: dict) -> str:
         return "sakura"
     if "mangadex" in url:
         return "mangadex"
-    if url.startswith("pieceproject://"):
+    if url.startswith("pieceproject://") or "pieceproject.xyz" in url:
         return "pieceproject"
     return "mangadex"
 
@@ -571,7 +1421,10 @@ def _normalize_manga_item(item: dict, *, section: str = "") -> dict | None:
             str(l).lower() for l in (item.get("available_translated_languages") or []) if l
         ],
         "authors": item.get("authors") or [],
-        "chapter_count": item.get("chapter_count"),
+        # Valor de listagem externa pode ser total global ou ultimo numero de
+        # capitulo. So usamos contagem verificada pela lista desta mesma fonte.
+        "chapter_count": None,
+        "reported_chapter_count": item.get("chapter_count"),
         "rating": item.get("rating"),
         "status": item.get("status") or "",
         "language": item.get("language") or "pt-br",
@@ -579,8 +1432,11 @@ def _normalize_manga_item(item: dict, *, section: str = "") -> dict | None:
     }
 
 
-def _provider_preference_score(item: dict) -> tuple[int, float, float]:
-    chapter_count = int(item.get("chapter_count") or 0)
+def _provider_preference_score(item: dict) -> tuple[float, float, float]:
+    try:
+        chapter_count = float(item.get("chapter_count") or 0)
+    except (TypeError, ValueError):
+        chapter_count = 0.0
     reliability = SOURCE_RELIABILITY.get(str(item.get("provider") or "").lower(), 0.5)
     relevance = float(item.get("relevance") or 0)
     return chapter_count, reliability, relevance
@@ -617,11 +1473,26 @@ def _merge_duplicate(existing: dict, candidate: dict) -> dict:
     return merged
 
 
+def _canonical_title_identity(title: str) -> str:
+    identity = normalize_match_text(str(title or ""))
+    if not identity:
+        return ""
+    for raw in _iter_curated():
+        names = [raw.get("title"), *(raw.get("aliases") or [])]
+        if identity in {
+            normalize_match_text(str(name or ""))
+            for name in names
+            if str(name or "").strip()
+        }:
+            return normalize_match_text(str(raw.get("title") or title))
+    return identity
+
+
 def _dedupe(items: list[dict]) -> list[dict]:
     by_identity: dict[str, int] = {}
     result: list[dict] = []
     for item in items:
-        title_key = normalize_match_text(str(item.get("title") or ""))
+        title_key = _canonical_title_identity(str(item.get("title") or ""))
         url_key = str(item.get("source_url") or item.get("id") or "")
         identity = title_key or url_key
         if not identity:
@@ -637,6 +1508,72 @@ def _dedupe(items: list[dict]) -> list[dict]:
     return result
 
 
+def _dedupe_search_results(items: list[dict]) -> list[dict]:
+    """Busca preserva homonimos: dedupe por fonte/URL, nao so por titulo."""
+    seen: set[str] = set()
+    result: list[dict] = []
+    for item in items:
+        provider = str(item.get("provider") or "").lower()
+        source_url = str(item.get("source_url") or item.get("url") or "").strip()
+        title = normalize_match_text(str(item.get("title") or ""))
+        identity = source_url or str(item.get("id") or "").strip() or title
+        key = f"{provider}:{identity}"
+        if not identity or key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
+
+
+def _search_title_candidates(item: dict) -> list[str]:
+    alternatives = item.get("alternative_titles") or []
+    if not isinstance(alternatives, list):
+        alternatives = [str(alternatives)]
+    candidates = [str(item.get("title") or ""), *[str(title) for title in alternatives]]
+    return [normalize_match_text(title) for title in candidates if normalize_match_text(title)]
+
+
+def _search_query_tokens(query: str) -> list[str]:
+    return [token for token in normalize_match_text(query).split() if len(token) >= 2]
+
+
+def _title_contains_query_tokens(query: str, item: dict) -> bool:
+    query_norm = normalize_match_text(query)
+    if not query_norm:
+        return False
+    compact_query = query_norm.replace(" ", "")
+    query_tokens = _search_query_tokens(query)
+    for candidate in _search_title_candidates(item):
+        if candidate == query_norm or query_norm in candidate:
+            return True
+        if compact_query and compact_query in candidate.replace(" ", ""):
+            return True
+        candidate_tokens = set(candidate.split())
+        if query_tokens and all(token in candidate_tokens for token in query_tokens):
+            return True
+    return False
+
+
+def _search_rank_tier(query: str, item: dict) -> int:
+    query_norm = normalize_match_text(query)
+    if not query_norm:
+        return 9
+    candidates = _search_title_candidates(item)
+    if any(candidate == query_norm for candidate in candidates):
+        return 0
+    if any(candidate.startswith(f"{query_norm} ") or candidate.startswith(query_norm) for candidate in candidates):
+        return 1
+    query_tokens = [token for token in query_norm.split() if len(token) >= 2]
+    if query_tokens:
+        for candidate in candidates:
+            candidate_tokens = set(candidate.split())
+            if all(token in candidate_tokens or token in candidate for token in query_tokens):
+                return 2
+    if any(query_norm in candidate for candidate in candidates):
+        return 3
+    return 4
+
+
 def _build_sections_from_items(items: list[dict], per_section: int = 18) -> list[dict]:
     """Fallback: group items by their 'section' field when catalog sections are empty."""
     grouped: dict[str, list[dict]] = {}
@@ -650,17 +1587,21 @@ def _build_sections_from_items(items: list[dict], per_section: int = 18) -> list
     return sections
 
 
-def _chapter_count_for_source(source_url: str) -> int:
-    cache_key = source_url.strip()
+def _chapter_count_for_source(source_url: str, lang: str = "pt-br") -> int:
+    cache_key = f"{source_url.strip()}|{normalize_match_text(lang)}"
     cached = chapter_count_cache.get(cache_key)
     if _cache_is_fresh(cached, CHAPTER_COUNT_CACHE_TTL_SECONDS):
         return int(cached.data.get("count") or 0)
+
+    disk_count = _cached_chapter_count(source_url, lang)
+    if disk_count > 0:
+        chapter_count_cache[cache_key] = CacheEntry(time.time(), {"count": disk_count})
+        return disk_count
     try:
-        if _guess_provider({"url": source_url}) == "mangadex":
-            count = int(reader.mangadex_chapter_total(source_url))  # barato, sem conteudo
-        else:
-            payload = reader.list_chapters(source_url)
-            count = int(payload.get("count") or 0)
+        payload = reader.list_chapters(source_url, lang=lang)
+        count = int(payload.get("count") or 0)
+        with _chapters_cache_lock:
+            chapters_cache[_chapters_cache_key(source_url, lang)] = CacheEntry(time.time(), dict(payload))
     except Exception:
         count = 0
     chapter_count_cache[cache_key] = CacheEntry(time.time(), {"count": count})
@@ -691,7 +1632,7 @@ def _curated_match_score(query: str, raw: dict) -> float:
 def _curated_override_for_title(title: str) -> dict | None:
     matches = [
         (_curated_match_score(title, raw), raw)
-        for raw in CURATED_CATALOG
+        for raw in _iter_curated()
     ]
     matches.sort(key=lambda item: item[0], reverse=True)
     if not matches or matches[0][0] < 0.78:
@@ -750,9 +1691,39 @@ def _enrich_curated_item(raw: dict) -> dict | None:
     return item
 
 
+_custom_catalog_cache: tuple[float, list[dict]] | None = None
+
+
+def _load_custom_catalog() -> list[dict]:
+    """Obras adicionadas manualmente (custom_catalog.json). Recarrega sozinho
+    quando o arquivo muda (mtime), sem precisar reiniciar o servidor."""
+    global _custom_catalog_cache
+    try:
+        mtime = CUSTOM_CATALOG_PATH.stat().st_mtime
+    except OSError:
+        _custom_catalog_cache = None
+        return []
+    if _custom_catalog_cache and _custom_catalog_cache[0] == mtime:
+        return _custom_catalog_cache[1]
+    try:
+        data = json.loads(CUSTOM_CATALOG_PATH.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - json invalido nao pode derrubar a home
+        return []
+    entries = [dict(item) for item in data if isinstance(item, dict) and item.get("url")]
+    _custom_catalog_cache = (mtime, entries)
+    return entries
+
+
+def _iter_curated() -> list[dict]:
+    """CURATED_CATALOG fixo + obras adicionadas manualmente (sem duplicar URL)."""
+    seen = {str(raw.get("url") or "").strip() for raw in CURATED_CATALOG}
+    extra = [raw for raw in _load_custom_catalog() if str(raw.get("url") or "").strip() not in seen]
+    return CURATED_CATALOG + extra
+
+
 def _curated_catalog_items() -> list[dict]:
     items: list[dict] = []
-    for raw in CURATED_CATALOG:
+    for raw in _iter_curated():
         item = _enrich_curated_item(raw)
         if item:
             items.append(item)
@@ -761,7 +1732,7 @@ def _curated_catalog_items() -> list[dict]:
 
 def _fast_curated_catalog_items() -> list[dict]:
     items: list[dict] = []
-    for raw in CURATED_CATALOG:
+    for raw in _iter_curated():
         payload = dict(raw)
         if not payload.get("url"):
             continue
@@ -795,6 +1766,10 @@ def _apply_fast_curated_fields(data: dict) -> dict:
         if not seed:
             return _refresh_cover_fields(item)
         merged = dict(item)
+        if _is_one_piece_title(str(item.get("title") or "")) and seed.get("provider") == "pieceproject":
+            merged["source_url"] = seed["source_url"]
+            merged["provider"] = "pieceproject"
+            merged["source"] = _source_label("pieceproject")
         for field in ("cover_url", "cover_original_url", "cover_fallbacks", "cover_original_fallbacks"):
             if not merged.get(field) and seed.get(field):
                 merged[field] = seed[field]
@@ -846,17 +1821,188 @@ def _fast_catalog_seed(limit: int) -> dict:
         "total": len(items),
         "limit": limit,
         "offset": 0,
-        "sources": ["MangaDex", "MangasBrasuka", "MangaLivre"],
+        "sources": ["MangaDex", "YomuMangas", "MangasBrasuka", "MangaLivre"],
         "cached": True,
         "refreshing": True,
+        "version": CATALOG_SNAPSHOT_VERSION,
     }
     return data
+
+
+def _partner_catalog_source(provider: str, limit: int) -> tuple[list[dict], dict | None]:
+    if provider == "yumo":
+        payload = reader.catalog_yumo(limit=limit)
+    elif provider == "mangasbrasuka":
+        payload = reader.catalog_mangasbrasuka(limit=limit)
+    elif provider == "mangalivre":
+        payload = reader.catalog_mangalivre(limit=limit)
+    else:
+        return [], None
+
+    label = _source_label(provider)
+    items: list[dict] = []
+    for raw in payload.get("results") or []:
+        item = _normalize_manga_item(raw, section=f"Catalogo - {label}")
+        if item:
+            items.append(item)
+    items = _dedupe(items)[:limit]
+    if not items:
+        return [], None
+    return items, {"title": f"Catalogo - {label}", "items": items}
+
+
+def _dedupe_cross_source_sections(sections: list[dict]) -> list[dict]:
+    candidates: dict[str, list[dict]] = {}
+    catalog_memberships: dict[str, set[str]] = {}
+    for section in sections:
+        section_title = str(section.get("title") or "")
+        is_catalog_section = normalize_match_text(section_title).startswith("catalogo ")
+        for item in section.get("items") or []:
+            identity = _canonical_title_identity(str(item.get("title") or ""))
+            if identity:
+                candidates.setdefault(identity, []).append(item)
+                if is_catalog_section:
+                    catalog_memberships.setdefault(identity, set()).add(section_title)
+
+    winners: dict[str, dict] = {}
+    for identity, items in candidates.items():
+        providers = {str(item.get("provider") or "").lower() for item in items}
+        if len(providers) <= 1 and len(catalog_memberships.get(identity, set())) <= 1:
+            continue
+        winner = items[0]
+        for candidate in items[1:]:
+            winner = _merge_duplicate(winner, candidate)
+        winners[identity] = winner
+
+    if not winners:
+        return sections
+
+    emitted: set[str] = set()
+    cleaned: list[dict] = []
+    for section in sections:
+        section_items: list[dict] = []
+        for item in section.get("items") or []:
+            identity = _canonical_title_identity(str(item.get("title") or ""))
+            winner = winners.get(identity)
+            if winner is None:
+                section_items.append(item)
+                continue
+            same_source = (
+                str(item.get("provider") or "").lower() == str(winner.get("provider") or "").lower()
+                and str(item.get("source_url") or "") == str(winner.get("source_url") or "")
+            )
+            if not same_source or identity in emitted:
+                continue
+            emitted.add(identity)
+            section_items.append(winner)
+        if section_items:
+            cleaned.append({**section, "items": section_items})
+    return cleaned
+
+
+def _partner_catalog_sections(limit: int = PARTNER_CATALOG_LIMIT) -> tuple[list[dict], list[dict]]:
+    providers = ("yumo", "mangasbrasuka", "mangalivre")
+    all_items: list[dict] = []
+    sections: list[dict] = []
+    with ThreadPoolExecutor(max_workers=len(providers)) as executor:
+        futures = {
+            executor.submit(_partner_catalog_source, provider, limit): provider
+            for provider in providers
+        }
+        for future in as_completed(futures):
+            provider = futures[future]
+            try:
+                items, section = future.result()
+            except Exception as exc:
+                logger.warning("Falha ao atualizar catalogo %s: %s", provider, exc)
+                continue
+            all_items.extend(items)
+            if section:
+                sections.append(section)
+    order = {provider: index for index, provider in enumerate(providers)}
+    sections.sort(
+        key=lambda section: order.get(
+            str((section.get("items") or [{}])[0].get("provider") or ""),
+            len(order),
+        )
+    )
+    sections = _dedupe_cross_source_sections(sections)
+    balanced_items: list[dict] = []
+    max_size = max((len(section.get("items") or []) for section in sections), default=0)
+    for index in range(max_size):
+        for section in sections:
+            source_items = section.get("items") or []
+            if index < len(source_items):
+                balanced_items.append(source_items[index])
+    return _dedupe(balanced_items or all_items), sections
 
 
 def _refresh_catalog_cache(limit: int = DEFAULT_LIMIT) -> None:
     global catalog_cache, catalog_refreshing
     try:
-        items, sections = _catalog_sections_from_mangadex(min(max(limit, 24), 80))
+        previous = dict(catalog_cache.data) if catalog_cache else (_read_catalog_snapshot() or {})
+        previous_items = list(previous.get("items") or [])
+        previous_sections = list(previous.get("sections") or [])
+        previous_partner_sections = [
+            section
+            for section in previous_sections
+            if normalize_match_text(str(section.get("title") or "")).startswith("catalogo ")
+        ]
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            mangadex_future = executor.submit(
+                _catalog_sections_from_mangadex,
+                min(max(limit, 24), 80),
+            )
+            partner_future = executor.submit(_partner_catalog_sections, PARTNER_CATALOG_LIMIT)
+            try:
+                items, sections = mangadex_future.result()
+            except Exception as exc:
+                logger.warning("Falha ao atualizar MangaDex; mantendo snapshot: %s", exc)
+                items = previous_items
+                sections = [
+                    section
+                    for section in previous_sections
+                    if section not in previous_partner_sections
+                ]
+            try:
+                partner_items, partner_sections = partner_future.result()
+            except Exception as exc:
+                logger.warning("Falha ao atualizar catalogos parceiros; mantendo snapshot: %s", exc)
+                partner_items, partner_sections = [], previous_partner_sections
+
+        if not partner_sections and previous_partner_sections:
+            partner_sections = previous_partner_sections
+            partner_items = [
+                item
+                for section in previous_partner_sections
+                for item in (section.get("items") or [])
+            ]
+
+        items = _dedupe([*partner_items, *items])
+        insert_at = 1 if sections and sections[0].get("layout") == "carousel" else 0
+        while insert_at < len(sections) and str(sections[insert_at].get("title") or "").startswith("Rec"):
+            insert_at += 1
+        sections[insert_at:insert_at] = partner_sections
+        sections = _dedupe_cross_source_sections(sections)
+        if not sections and items:
+            sections = _build_sections_from_items(items)
+
+        data = {
+            "items": items,
+            "sections": sections,
+            "total": len(items),
+            "limit": limit,
+            "offset": 0,
+            "sources": ["MangaDex", "YomuMangas", "MangasBrasuka", "MangaLivre"],
+            "cached": False,
+            "refreshing": True,
+            "version": CATALOG_SNAPSHOT_VERSION,
+        }
+        # Publica listagens leves imediatamente. Metadados/capas continuam no mesmo
+        # worker e nunca bloqueiam a resposta da homepage.
+        catalog_cache = CacheEntry(time.time(), data)
+        _write_catalog_snapshot(data)
+
         # enrich items + section items (dedup por identidade, cap p/ nao estourar rate-limit)
         seen_ids: set[int] = set()
         bucket: list[dict] = []
@@ -865,36 +2011,26 @@ def _refresh_catalog_cache(limit: int = DEFAULT_LIMIT) -> None:
                 if id(it) not in seen_ids:
                     seen_ids.add(id(it))
                     bucket.append(it)
-        _enrich_items_metadata(bucket[:60], max_workers=4)
-        _fill_chapter_counts(bucket[:60], max_workers=6)
-        if not sections and items:
-            sections = _build_sections_from_items(items)
-        data = {
-            "items": items,
-            "sections": sections,
-            "total": len(items),
-            "limit": limit,
-            "offset": 0,
-            "sources": ["MangaDex", "MangasBrasuka", "MangaLivre"],
-            "cached": False,
-            "refreshing": False,
-        }
-        catalog_cache = CacheEntry(time.time(), data)
-        _write_catalog_snapshot(data)
+        mangadex_items = [item for item in bucket if _guess_provider(item) == "mangadex"]
+        _enrich_items_metadata(mangadex_items[:24], max_workers=4)
         # Baixa as capas p/ static/covers (define item['cover_path']) e re-grava o
         # snapshot ja com os caminhos locais -> home serve estatico, sem proxy.
-        _download_covers_to_disk(bucket, limit=300)
+        _download_covers_to_disk(bucket, limit=96)
         # Capa falhou? tenta fonte alternativa (MangaDex/AniList por titulo);
         # so marca placeholder (incompleta) se nem assim achar.
-        for it in bucket:
+        for it in bucket[:96]:
             if _cover_file_exists(it.get("cover_path") or ""):
                 continue
             if not _recover_and_store_cover(it):
                 it["cover_path"] = PLACEHOLDER_URL
         catalog_cache = CacheEntry(time.time(), data)
         _write_catalog_snapshot(data)
-        # Pre-aquece a lista de capitulos das obras (1x) -> 1o clique ja vem local.
-        _prewarm_chapters(bucket, limit=40)
+        # Auditoria usa leitor separado: valida cada card contra lista que abre
+        # no painel, sem disputar lock com requisicoes do usuario.
+        _prewarm_chapters(bucket, limit=200, max_workers=4)
+        data["refreshing"] = False
+        catalog_cache = CacheEntry(time.time(), data)
+        _write_catalog_snapshot(data)
     finally:
         with catalog_refresh_lock:
             catalog_refreshing = False
@@ -913,14 +2049,20 @@ def _schedule_catalog_refresh(limit: int = DEFAULT_LIMIT) -> None:
 def _apply_curated_source_overrides(items: list[dict], query: str) -> list[dict]:
     """Substitui obras curadas por fontes preferidas quando a busca bate com o titulo."""
     updated = list(items)
-    for raw in CURATED_CATALOG:
+    for raw in _iter_curated():
         source_url = str(raw.get("url") or "").strip()
         if not source_url:
             continue
         title = str(raw.get("title") or "").strip()
         if _curated_match_score(query, raw) < 0.78:
             continue
-        curated = _enrich_curated_item({**raw, "section": "Busca"})
+        curated = _normalize_manga_item(
+            {
+                **raw,
+                "section": "Busca",
+                "alternative_titles": raw.get("aliases") or [],
+            }
+        )
         if not curated:
             continue
         aliases = [title, *[str(alias) for alias in raw.get("aliases") or []]]
@@ -944,7 +2086,7 @@ def _apply_curated_source_overrides(items: list[dict], query: str) -> list[dict]
 def _resolve_best_sources(items: list[dict]) -> list[dict]:
     grouped: dict[str, list[dict]] = {}
     for item in items:
-        identity = normalize_match_text(str(item.get("title") or "")) or str(item.get("source_url") or "")
+        identity = _canonical_title_identity(str(item.get("title") or "")) or str(item.get("source_url") or "")
         grouped.setdefault(identity, []).append(item)
 
     resolved: list[dict] = []
@@ -1059,7 +2201,11 @@ def _build_catalog(limit: int) -> dict:
     if snapshot:
         catalog_cache = CacheEntry(time.time(), snapshot)
         age = _catalog_snapshot_age()
-        if age is None or age > CATALOG_SNAPSHOT_TTL_SECONDS:
+        if (
+            snapshot.get("version") != CATALOG_SNAPSHOT_VERSION
+            or age is None
+            or age > CATALOG_SNAPSHOT_TTL_SECONDS
+        ):
             _schedule_catalog_refresh(max(limit, DEFAULT_LIMIT))
             snapshot = {**snapshot, "refreshing": True, "cached": True}
         return _snapshot_payload(snapshot, limit)
@@ -1163,6 +2309,97 @@ def _current_source_item(title: str, source_url: str) -> dict | None:
     )
 
 
+def _mangadex_alt_titles(source_url: str) -> list[str]:
+    """Busca titulos alternativos de um manga no MangaDex (altTitles do metadata).
+
+    Retorna lista de strings com PT-BR e EN no topo (sao os mais provaveis de
+    encontrar nas fontes brasileiras como MangaLivre).
+    """
+    manga_id = reader._mangadex_manga_id_from_source(source_url)
+    if not manga_id:
+        return []
+    try:
+        payload = reader._mangadex_get(f"/manga/{manga_id}", {"includes[]": ["author"]})
+        attrs = (payload.get("data") or {}).get("attributes") or {}
+        priority: list[str] = []  # pt-br, en, ja-ro
+        rest: list[str] = []
+        seen: set[str] = set()
+
+        def add(text: str, is_priority: bool) -> None:
+            text = str(text or "").strip()
+            if not text or text in seen:
+                return
+            seen.add(text)
+            (priority if is_priority else rest).append(text)
+
+        # titulo principal
+        main_title = attrs.get("title") or {}
+        for lang_code, text in main_title.items():
+            add(text, lang_code in ("pt-br", "en", "ja-ro"))
+
+        # alt titles — separa priority langs do resto
+        priority_langs = {"pt-br", "pt", "en", "ja-ro"}
+        for alt in attrs.get("altTitles") or []:
+            if not isinstance(alt, dict):
+                continue
+            for lang_code, text in alt.items():
+                add(text, lang_code in priority_langs)
+
+        return priority + rest
+    except Exception:
+        return []
+
+
+def _source_search_terms(title: str) -> list[str]:
+    raw = str(title or "").strip()
+    if not raw:
+        return []
+    plain = re.sub(r"[-‐‑‒–—_/]+", " ", raw)
+    plain = re.sub(r"[^\w\s]", " ", plain, flags=re.UNICODE)
+    plain = re.sub(r"\s+", " ", plain).strip()
+    return list(dict.fromkeys(term for term in (raw, plain) if term))
+
+
+def _fallback_source_via_alt_titles(
+    title: str, original_source: str, failed_source: str, lang: str
+) -> str:
+    """Quando a fonte resolvida falha (ex: yumo bloqueou a leitura), tenta achar
+    fonte alternativa via titulo/alt titles. Prioriza PT-completas e, como ultimo
+    recurso, o MangaDex (que quase sempre tem a obra). Retorna source_url ou "".
+    """
+    complete_sources = _pt_complete_sources()
+    if "mangadex" not in complete_sources:
+        complete_sources = [*complete_sources, "mangadex"]
+    search_terms = _source_search_terms(title)
+
+    # Busca alt titles do MangaDex se fonte original era MangaDex
+    if _guess_provider({"url": original_source}) == "mangadex":
+        alt = _mangadex_alt_titles(original_source)
+        alt = [t for t in alt if normalize_match_text(t) != normalize_match_text(title)]
+        for alt_title in alt[:4]:
+            search_terms.extend(_source_search_terms(alt_title))
+    search_terms = list(dict.fromkeys(search_terms))
+
+    for term in search_terms:
+        candidates, _ = _search_sources_with_timeout(
+            complete_sources,
+            term,
+            5,
+            timeout=SOURCE_RESOLUTION_TIMEOUT_SECONDS,
+        )
+        for hit in candidates:
+            score = _search_match_score(term, hit)
+            if score < 0.7:
+                continue
+            hit_url = str(hit.get("source_url") or hit.get("url") or "").strip()
+            if not hit_url or hit_url == failed_source:
+                continue
+            hit = _copy_with_chapter_count(hit)
+            if int(hit.get("chapter_count") or 0) > 0:
+                return hit_url
+    return ""
+
+
 def _resolve_best_source_for_title(title: str, current_source_url: str, lang: str = "pt-br") -> dict | None:
     title = title.strip()
     current_source_url = current_source_url.strip()
@@ -1174,11 +2411,41 @@ def _resolve_best_source_for_title(title: str, current_source_url: str, lang: st
     if _cache_is_fresh(cached, SOURCE_RESOLUTION_CACHE_TTL_SECONDS):
         return dict(cached.data.get("item") or {})
 
+    if _is_one_piece_title(title):
+        raw = next(
+            (item for item in CURATED_CATALOG if _is_one_piece_title(str(item.get("title") or ""))),
+            None,
+        )
+        preferred = _normalize_manga_item(
+            {**raw, "section": "Fonte preferida"},
+            section="Fonte preferida",
+        ) if raw else None
+        if preferred:
+            source_resolution_cache[cache_key] = CacheEntry(time.time(), {"item": preferred})
+            return preferred
+
     current = _current_source_item(title, current_source_url)
+    complete_sources = _pt_complete_sources()
     current_provider = str((current or {}).get("provider") or "").lower()
-    if current and current_provider in PT_COMPLETE_SOURCES:
+    current_outage = source_outage_cache.get(current_source_url)
+    current_available = not _cache_is_fresh(
+        current_outage,
+        SOURCE_RESOLUTION_CACHE_TTL_SECONDS,
+    )
+    if (
+        current
+        and current_provider in complete_sources
+        and current_available
+        and _cached_chapter_count(current_source_url, lang) > 0
+    ):
         source_resolution_cache[cache_key] = CacheEntry(time.time(), {"item": current})
         return current
+
+    if current and current_provider == "mangadex":
+        current_with_count = _copy_with_chapter_count(current)
+        if int(current_with_count.get("chapter_count") or 0) >= SPARSE_CHAPTER_THRESHOLD:
+            source_resolution_cache[cache_key] = CacheEntry(time.time(), {"item": current_with_count})
+            return current_with_count
 
     curated_raw = _curated_override_for_title(title)
     if curated_raw:
@@ -1190,31 +2457,40 @@ def _resolve_best_source_for_title(title: str, current_source_url: str, lang: st
     if not title:
         return current
 
-    candidates, _errors = _search_sources_with_timeout(
-        PT_COMPLETE_SOURCES,
-        title,
-        5,
-        timeout=SOURCE_RESOLUTION_TIMEOUT_SECONDS,
-    )
+    # Busca nas fontes PT-completas pelo titulo principal e, se necessario,
+    # por titulos alternativos do MangaDex (ex: "Oyasumi Punpun" -> "Goodnight Punpun").
+    search_titles = _source_search_terms(title)
+    candidates: list[dict] = []
+    for search_title in search_titles:
+        found, _errors = _search_sources_with_timeout(
+            complete_sources,
+            search_title,
+            5,
+            timeout=SOURCE_RESOLUTION_TIMEOUT_SECONDS,
+        )
+        candidates.extend(found)
 
     exact_hits: list[tuple[int, float, dict]] = []
     for hit in candidates:
-        score = _search_match_score(title, hit)
+        score = max(_search_match_score(search_title, hit) for search_title in search_titles)
         if score < 0.92:
             continue
         provider = str(hit.get("provider") or "").lower()
-        source_order = PT_COMPLETE_SOURCES.index(provider) if provider in PT_COMPLETE_SOURCES else len(PT_COMPLETE_SOURCES)
+        source_order = complete_sources.index(provider) if provider in complete_sources else len(complete_sources)
         exact_hits.append((source_order, score, hit))
     if exact_hits:
         exact_hits.sort(key=lambda pair: (pair[0], -pair[1]))
-        candidate = dict(exact_hits[0][2])
-        candidate["relevance"] = round(exact_hits[0][1], 4)
-        source_resolution_cache[cache_key] = CacheEntry(time.time(), {"item": candidate})
-        return candidate
+        for source_order, score, hit in exact_hits:
+            candidate = _copy_with_chapter_count(dict(hit))
+            if int(candidate.get("chapter_count") or 0) <= 0:
+                continue
+            candidate["relevance"] = round(score, 4)
+            source_resolution_cache[cache_key] = CacheEntry(time.time(), {"item": candidate})
+            return candidate
 
     scored_candidates: list[dict] = []
     for item in candidates:
-        relevance = _search_match_score(title, item)
+        relevance = max(_search_match_score(search_title, item) for search_title in search_titles)
         if relevance < MIN_SOURCE_RELEVANCE:
             continue
         item = dict(item)
@@ -1223,6 +2499,37 @@ def _resolve_best_source_for_title(title: str, current_source_url: str, lang: st
         if int(item.get("chapter_count") or 0) <= 0:
             continue
         scored_candidates.append(item)
+
+    # Alt-title fallback SO para mangas quase vazios no MangaDex em TODAS as
+    # linguas (ex: Punpun, licenciado/removido). Mangas com muitos caps em
+    # qualquer lingua NAO entram aqui — evita 20s de busca desnecessaria.
+    if not scored_candidates and _guess_provider({"url": current_source_url}) == "mangadex":
+        try:
+            total_all_langs = reader.mangadex_chapter_total(current_source_url, "")
+        except Exception:
+            total_all_langs = 0
+        if total_all_langs < SPARSE_CHAPTER_THRESHOLD:
+            alt_titles = _mangadex_alt_titles(current_source_url)
+            alt_titles = [t for t in alt_titles if normalize_match_text(t) != normalize_match_text(title)]
+            for alt in alt_titles[:2]:
+                alt_candidates, _ = _search_sources_with_timeout(
+                    complete_sources,
+                    alt,
+                    5,
+                    timeout=3.0,
+                )
+                for hit in alt_candidates:
+                    score = _search_match_score(alt, hit)
+                    if score < 0.7:
+                        continue
+                    hit = dict(hit)
+                    hit["relevance"] = round(score, 4)
+                    hit = _copy_with_chapter_count(hit)
+                    if int(hit.get("chapter_count") or 0) <= 0:
+                        continue
+                    scored_candidates.append(hit)
+                if scored_candidates:
+                    break
 
     all_items = [*scored_candidates]
     if current:
@@ -1247,6 +2554,40 @@ def _resolve_best_source_for_title(title: str, current_source_url: str, lang: st
     resolved = best if should_swap else current
     source_resolution_cache[cache_key] = CacheEntry(time.time(), {"item": resolved})
     return resolved
+
+
+def _source_resolution_key(title: str, source_url: str, lang: str) -> str:
+    return f"{normalize_match_text(title)}|{source_url.strip()}|{normalize_match_text(lang)}"
+
+
+def _cached_source_resolution(title: str, source_url: str, lang: str) -> dict | None:
+    entry = source_resolution_cache.get(_source_resolution_key(title, source_url, lang))
+    if not _cache_is_fresh(entry, SOURCE_RESOLUTION_CACHE_TTL_SECONDS):
+        return None
+    return dict(entry.data.get("item") or {})
+
+
+def _refresh_source_resolution(title: str, source_url: str, lang: str, key: str) -> None:
+    try:
+        _resolve_best_source_for_title(title, source_url, lang)
+    except Exception as exc:
+        logger.debug("Falha ao resolver fonte em background p/ %s: %s", title, exc)
+    finally:
+        with _source_resolution_refresh_lock:
+            _source_resolution_refreshing.discard(key)
+
+
+def _schedule_source_resolution(title: str, source_url: str, lang: str) -> None:
+    key = _source_resolution_key(title, source_url, lang)
+    with _source_resolution_refresh_lock:
+        if key in _source_resolution_refreshing:
+            return
+        _source_resolution_refreshing.add(key)
+    threading.Thread(
+        target=_refresh_source_resolution,
+        args=(title, source_url, lang, key),
+        daemon=True,
+    ).start()
 
 
 def _search_match_score(query: str, item: dict) -> float:
@@ -1282,6 +2623,498 @@ def _anilist_metadata(title: str) -> dict:
     metadata = reader.anilist_metadata(title)
     anilist_cache[key] = CacheEntry(time.time(), metadata)
     return dict(metadata)
+
+
+def _anilist_graphql(query: str, variables: dict) -> dict:
+    response = requests.post(
+        ANILIST_GRAPHQL_URL,
+        json={"query": query, "variables": variables},
+        timeout=getattr(reader.args, "timeout", 20),
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": DEFAULT_HEADERS["User-Agent"],
+        },
+    )
+    try:
+        payload = response.json()
+    except ValueError:
+        response.raise_for_status()
+        raise RuntimeError("AniList retornou uma resposta invalida.")
+    if payload.get("errors"):
+        message = payload["errors"][0].get("message") or "AniList retornou erro."
+        raise RuntimeError(message)
+    response.raise_for_status()
+    return payload.get("data") or {}
+
+
+def _mangaupdates_request(method: str, path: str, json_body: dict | None = None) -> dict:
+    global mangaupdates_last_request_at
+
+    url = f"{MANGAUPDATES_API_URL}/{path.lstrip('/')}"
+    last_error: Exception | None = None
+    for attempt in range(MANGAUPDATES_REQUEST_ATTEMPTS):
+        retry_after = 0.0
+        with mangaupdates_request_lock:
+            wait_for = MANGAUPDATES_REQUEST_GAP_SECONDS - (
+                time.monotonic() - mangaupdates_last_request_at
+            )
+            if wait_for > 0:
+                time.sleep(wait_for)
+            try:
+                response = requests.request(
+                    method.upper(),
+                    url,
+                    json=json_body,
+                    timeout=(8, 20),
+                    headers={
+                        "Accept": "application/json",
+                        "Content-Type": "application/json",
+                        "User-Agent": "Kari/0.1 (local personal manga reader; MangaUpdates fallback)",
+                    },
+                )
+                mangaupdates_last_request_at = time.monotonic()
+            except requests.RequestException as exc:
+                mangaupdates_last_request_at = time.monotonic()
+                last_error = exc
+                response = None
+
+        if response is None:
+            if attempt < MANGAUPDATES_REQUEST_ATTEMPTS - 1:
+                time.sleep(1.0 * (2 ** attempt))
+                continue
+            raise last_error if last_error else RuntimeError("MangaUpdates indisponivel.")
+
+        if response.status_code in {429, 500, 502, 503, 504}:
+            try:
+                retry_after = float(response.headers.get("Retry-After") or 0)
+            except (TypeError, ValueError):
+                retry_after = 0.0
+            if attempt < MANGAUPDATES_REQUEST_ATTEMPTS - 1:
+                time.sleep(max(retry_after, 1.0 * (2 ** attempt)))
+                continue
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise RuntimeError("MangaUpdates retornou resposta invalida.")
+        return payload
+
+    raise last_error if last_error else RuntimeError("MangaUpdates indisponivel.")
+
+
+def _clean_anilist_staff_text(value: str | None) -> str:
+    if not value:
+        return ""
+    text = html.unescape(str(value))
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1", text)
+    text = re.sub(r"</?[^>]+>", " ", text)
+    text = re.sub(r"[*_`#>]+", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _anilist_date_text(value: dict | None) -> str:
+    if not value:
+        return ""
+    year = value.get("year")
+    month = value.get("month")
+    day = value.get("day")
+    if year and month and day:
+        return f"{year:04d}-{month:02d}-{day:02d}"
+    if year and month:
+        return f"{year:04d}-{month:02d}"
+    if year:
+        return str(year)
+    if month and day:
+        return f"{month:02d}-{day:02d}"
+    return ""
+
+
+def _same_author_name(left: str, right: str) -> bool:
+    left_raw = re.sub(r"\s+", " ", str(left or "").strip()).casefold()
+    right_raw = re.sub(r"\s+", " ", str(right or "").strip()).casefold()
+    if left_raw and left_raw == right_raw:
+        return True
+    left_norm = normalize_match_text(left)
+    right_norm = normalize_match_text(right)
+    if not left_norm or not right_norm:
+        return False
+    if left_norm == right_norm:
+        return True
+    left_parts = left_norm.split()
+    right_parts = right_norm.split()
+    return len(left_parts) > 1 and sorted(left_parts) == sorted(right_parts)
+
+
+def _author_cache_key_text(value: str) -> str:
+    normalized = normalize_match_text(value)
+    if normalized:
+        return normalized
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
+def _staff_payload(staff: dict, role: str = "", title: str = "") -> dict:
+    name = staff.get("name") or {}
+    image = staff.get("image") or {}
+    large = image.get("large")
+    medium = image.get("medium")
+    site_url = staff.get("siteUrl") or ""
+    return {
+        "id": staff.get("id"),
+        "name": name.get("full") or "",
+        "native_name": name.get("native") or "",
+        "alternative_names": name.get("alternative") or [],
+        "role": role or "",
+        "matched_title": title or "",
+        "image_url": large or medium or "",
+        "image_fallbacks": [url for url in [medium] if url and url != large],
+        "description": _clean_anilist_staff_text(staff.get("description")),
+        "gender": staff.get("gender") or "",
+        "birth_date": _anilist_date_text(staff.get("dateOfBirth")),
+        "death_date": _anilist_date_text(staff.get("dateOfDeath")),
+        "age": staff.get("age"),
+        "years_active": staff.get("yearsActive") or [],
+        "home_town": staff.get("homeTown") or "",
+        "occupations": staff.get("primaryOccupations") or [],
+        "language": staff.get("languageV2") or "",
+        "favourites": staff.get("favourites"),
+        "site_url": site_url,
+        "source_links": [{"label": "AniList", "url": site_url}] if site_url else [],
+        "source": "AniList",
+    }
+
+
+def _anilist_staff_fields() -> str:
+    return """
+      id
+      siteUrl
+      name { full native alternative }
+      image { large medium }
+      description
+      gender
+      dateOfBirth { year month day }
+      dateOfDeath { year month day }
+      age
+      yearsActive
+      homeTown
+      primaryOccupations
+      languageV2
+      favourites
+    """
+
+
+def _lookup_author_from_anilist(name: str, title: str = "") -> dict:
+    author_name = str(name or "").strip()
+    media_title = str(title or "").strip()
+    if not author_name:
+        raise ValueError("Informe o nome do autor.")
+
+    cache_key = f"author:{_author_cache_key_text(author_name)}|{normalize_match_text(media_title)}"
+    cached = author_cache.get(cache_key)
+    if _cache_is_fresh(cached, ANILIST_CACHE_TTL_SECONDS):
+        return dict(cached.data)
+
+    fields = _anilist_staff_fields()
+    if media_title:
+        query = f"""
+        query AuthorFromManga($search: String) {{
+          Media(search: $search, type: MANGA) {{
+            title {{ romaji english native }}
+            staff(sort: [RELEVANCE, FAVOURITES_DESC], perPage: 20) {{
+              edges {{
+                role
+                node {{ {fields} }}
+              }}
+            }}
+          }}
+        }}
+        """
+        media = (_anilist_graphql(query, {"search": media_title}).get("Media") or {})
+        titles = media.get("title") or {}
+        matched_title = titles.get("english") or titles.get("romaji") or titles.get("native") or media_title
+        for edge in ((media.get("staff") or {}).get("edges") or []):
+            staff = edge.get("node") or {}
+            staff_name = staff.get("name") or {}
+            candidates = [
+                staff_name.get("full"),
+                staff_name.get("native"),
+                *(staff_name.get("alternative") or []),
+            ]
+            if any(_same_author_name(author_name, str(candidate or "")) for candidate in candidates):
+                result = _staff_payload(staff, edge.get("role") or "", matched_title)
+                author_cache[cache_key] = CacheEntry(time.time(), result)
+                return dict(result)
+
+    query = f"""
+    query AuthorByName($search: String) {{
+      Staff(search: $search) {{
+        {fields}
+      }}
+    }}
+    """
+    staff = (_anilist_graphql(query, {"search": author_name}).get("Staff") or {})
+    if not staff:
+        raise RuntimeError(f"AniList nao encontrou autor: {author_name}")
+    result = _staff_payload(staff)
+    author_cache[cache_key] = CacheEntry(time.time(), result)
+    return dict(result)
+
+
+def _mangaupdates_image_urls(image: dict | None) -> tuple[str, list[str]]:
+    urls = (image or {}).get("url") or {}
+    original = str(urls.get("original") or "").strip()
+    thumb = str(urls.get("thumb") or "").strip()
+    primary = original or thumb
+    fallbacks = [url for url in [thumb, original] if url and url != primary]
+    return primary, fallbacks
+
+
+def _mangaupdates_date_text(value: dict | None) -> str:
+    if not value:
+        return ""
+    as_string = str(value.get("as_string") or "").strip()
+    if as_string:
+        return as_string
+    year = value.get("year")
+    month = value.get("month")
+    day = value.get("day")
+    if year and month and day:
+        return f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+    if year and month:
+        return f"{int(year):04d}-{int(month):02d}"
+    return str(year or "")
+
+
+def _mangaupdates_author_score(query: str, result: dict) -> float:
+    record = result.get("record") or {}
+    names = [record.get("name"), result.get("hit_name")]
+    if any(_same_author_name(query, str(name or "")) for name in names):
+        return 1.0
+    return max(
+        (fuzzy_match_score(query, str(name or "")) for name in names if str(name or "").strip()),
+        default=0.0,
+    )
+
+
+def _lookup_author_from_mangaupdates(name: str, title: str = "") -> dict:
+    author_name = str(name or "").strip()
+    media_title = str(title or "").strip()
+    if not author_name:
+        raise ValueError("Informe o nome do autor.")
+
+    cache_key = (
+        f"mu-author:v2:{_author_cache_key_text(author_name)}|"
+        f"{normalize_match_text(media_title)}"
+    )
+    cached = mangaupdates_author_cache.get(cache_key)
+    if _cache_is_fresh(cached, MANGAUPDATES_CACHE_TTL_SECONDS):
+        if not cached.data:
+            raise RuntimeError(f"MangaUpdates nao encontrou autor: {author_name}")
+        return dict(cached.data)
+
+    search = _mangaupdates_request(
+        "POST",
+        "/authors/search",
+        {"search": author_name, "perpage": 5},
+    )
+    ranked = sorted(
+        (
+            (_mangaupdates_author_score(author_name, result), result)
+            for result in search.get("results") or []
+        ),
+        key=lambda pair: pair[0],
+        reverse=True,
+    )
+    if not ranked or ranked[0][0] < 0.82:
+        series = _mangaupdates_series_metadata(media_title) if media_title else {}
+        is_series_author = any(
+            _same_author_name(author_name, str(candidate or ""))
+            for candidate in series.get("authors") or []
+        )
+        if is_series_author:
+            site_url = str(series.get("url") or "").strip()
+            result = {
+                "id": None,
+                "name": author_name,
+                "native_name": author_name,
+                "alternative_names": [],
+                "role": "Autor",
+                "matched_title": str(series.get("title") or media_title).strip(),
+                "image_url": "",
+                "image_fallbacks": [],
+                "description": "",
+                "gender": "",
+                "birth_date": "",
+                "death_date": "",
+                "age": None,
+                "years_active": [],
+                "home_town": "",
+                "occupations": [],
+                "language": "",
+                "favourites": None,
+                "status": "",
+                "genres": [],
+                "total_series": None,
+                "blood_type": "",
+                "official_site": "",
+                "twitter": "",
+                "facebook": "",
+                "site_url": "",
+                "mangaupdates_url": site_url,
+                "source_links": (
+                    [{"label": "MangaUpdates (obra)", "url": site_url}]
+                    if site_url else []
+                ),
+                "source": "MangaUpdates",
+                "profile_limited": True,
+            }
+            mangaupdates_author_cache[cache_key] = CacheEntry(time.time(), result)
+            return dict(result)
+        mangaupdates_author_cache[cache_key] = CacheEntry(time.time(), {})
+        raise RuntimeError(f"MangaUpdates nao encontrou autor: {author_name}")
+
+    search_record = ranked[0][1].get("record") or {}
+    author_id = search_record.get("id")
+    if not author_id:
+        raise RuntimeError(f"MangaUpdates retornou autor sem ID: {author_name}")
+    detail = _mangaupdates_request("GET", f"/authors/{author_id}")
+
+    image_url, image_fallbacks = _mangaupdates_image_urls(detail.get("image"))
+    associated = [
+        str(item.get("name") or "").strip()
+        for item in detail.get("associated") or []
+        if isinstance(item, dict) and str(item.get("name") or "").strip()
+    ]
+    status = str(detail.get("status") or "").strip()
+    if status == "N/A":
+        status = ""
+    gender = str(detail.get("gender") or "").strip()
+    if gender == "N/A":
+        gender = ""
+    social = detail.get("social") or {}
+    site_url = str(detail.get("url") or search_record.get("url") or "").strip()
+    result = {
+        "id": author_id,
+        "name": str(detail.get("name") or search_record.get("name") or author_name).strip(),
+        "native_name": str(detail.get("actualname") or "").strip(),
+        "alternative_names": list(dict.fromkeys(associated)),
+        "role": "",
+        "matched_title": media_title,
+        "image_url": image_url,
+        "image_fallbacks": image_fallbacks,
+        "description": _clean_anilist_staff_text(detail.get("comments")),
+        "gender": gender,
+        "birth_date": _mangaupdates_date_text(detail.get("birthday")),
+        "death_date": (
+            _mangaupdates_date_text(detail.get("status_date"))
+            if status == "Deceased"
+            else ""
+        ),
+        "age": None,
+        "years_active": [],
+        "home_town": str(detail.get("birthplace") or "").strip(),
+        "occupations": [],
+        "language": "",
+        "favourites": None,
+        "status": status,
+        "genres": detail.get("genres") or [],
+        "total_series": (detail.get("stats") or {}).get("total_series"),
+        "blood_type": "" if detail.get("bloodtype") == "N/A" else (detail.get("bloodtype") or ""),
+        "official_site": str(social.get("officialsite") or "").strip(),
+        "twitter": str(social.get("twitter") or "").strip(),
+        "facebook": str(social.get("facebook") or "").strip(),
+        "site_url": site_url,
+        "mangaupdates_url": site_url,
+        "source_links": [{"label": "MangaUpdates", "url": site_url}] if site_url else [],
+        "source": "MangaUpdates",
+    }
+    mangaupdates_author_cache[cache_key] = CacheEntry(time.time(), result)
+    return dict(result)
+
+
+def _merge_author_profiles(primary: dict, fallback: dict) -> dict:
+    if not primary:
+        return dict(fallback)
+    if not fallback:
+        return dict(primary)
+
+    merged = dict(primary)
+    used_fallback = False
+    for key in (
+        "native_name", "image_url", "description", "gender", "birth_date",
+        "death_date", "age", "home_town", "language", "status", "total_series",
+        "blood_type", "official_site", "twitter", "facebook",
+    ):
+        if merged.get(key) in (None, "", []):
+            value = fallback.get(key)
+            if value not in (None, "", []):
+                merged[key] = value
+                used_fallback = True
+
+    for key in ("alternative_names", "image_fallbacks", "years_active", "occupations", "genres"):
+        values = [
+            value
+            for value in [*(merged.get(key) or []), *(fallback.get(key) or [])]
+            if value not in (None, "")
+        ]
+        deduped = list(dict.fromkeys(values))
+        if deduped != (merged.get(key) or []):
+            used_fallback = True
+        merged[key] = deduped
+
+    links: list[dict] = []
+    seen_urls: set[str] = set()
+    for link in [*(primary.get("source_links") or []), *(fallback.get("source_links") or [])]:
+        url = str((link or {}).get("url") or "").strip()
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        links.append({"label": str((link or {}).get("label") or "Fonte"), "url": url})
+    merged["source_links"] = links
+    merged["mangaupdates_url"] = fallback.get("mangaupdates_url") or ""
+    if used_fallback:
+        merged["source"] = "AniList + MangaUpdates"
+    return merged
+
+
+def _lookup_author_profile(name: str, title: str = "") -> dict:
+    author_name = str(name or "").strip()
+    media_title = str(title or "").strip()
+    if not author_name:
+        raise ValueError("Informe o nome do autor.")
+
+    cache_key = f"profile:v2:{_author_cache_key_text(author_name)}|{normalize_match_text(media_title)}"
+    cached = author_profile_cache.get(cache_key)
+    if _cache_is_fresh(cached, ANILIST_CACHE_TTL_SECONDS):
+        return dict(cached.data)
+
+    primary: dict = {}
+    fallback: dict = {}
+    anilist_error: Exception | None = None
+    mangaupdates_error: Exception | None = None
+    try:
+        primary = _lookup_author_from_anilist(author_name, media_title)
+    except Exception as exc:
+        anilist_error = exc
+
+    needs_fallback = not primary or not primary.get("image_url") or not primary.get("description")
+    if needs_fallback:
+        try:
+            fallback = _lookup_author_from_mangaupdates(author_name, media_title)
+        except Exception as exc:
+            mangaupdates_error = exc
+
+    result = _merge_author_profiles(primary, fallback)
+    if result:
+        author_profile_cache[cache_key] = CacheEntry(time.time(), result)
+        return dict(result)
+
+    for error in (mangaupdates_error, anilist_error):
+        if isinstance(error, requests.RequestException):
+            raise error
+    raise RuntimeError(
+        f"AniList e MangaUpdates nao encontraram autor: {author_name}"
+    )
 
 
 def _apply_anilist_metadata(item: dict, metadata: dict) -> None:
@@ -1376,6 +3209,145 @@ def _apply_kitsu_metadata(item: dict, metadata: dict) -> None:
     if metadata.get("description"):
         _add_desc_lang(item, "en", metadata["description"])
     item["kitsu_url"] = metadata.get("url") or item.get("kitsu_url") or ""
+
+
+def _mangaupdates_series_score(title: str, result: dict) -> float:
+    record = result.get("record") or {}
+    candidates = [record.get("title"), result.get("hit_title")]
+    query_norm = normalize_match_text(title)
+    for candidate in candidates:
+        if query_norm and query_norm == normalize_match_text(str(candidate or "")):
+            return 1.0
+    return max(
+        (fuzzy_match_score(title, str(candidate or "")) for candidate in candidates if str(candidate or "").strip()),
+        default=0.0,
+    )
+
+
+def _mangaupdates_series_metadata(title: str) -> dict:
+    clean_title = str(title or "").strip()
+    key = normalize_match_text(clean_title)
+    cached = mangaupdates_series_cache.get(key)
+    if _cache_is_fresh(cached, MANGAUPDATES_CACHE_TTL_SECONDS):
+        return dict(cached.data)
+    if not clean_title:
+        return {}
+
+    search = _mangaupdates_request(
+        "POST",
+        "/series/search",
+        {"search": clean_title, "stype": "title", "perpage": 5},
+    )
+    ranked = sorted(
+        (
+            (_mangaupdates_series_score(clean_title, result), result)
+            for result in search.get("results") or []
+        ),
+        key=lambda pair: pair[0],
+        reverse=True,
+    )
+    if not ranked or ranked[0][0] < 0.84:
+        mangaupdates_series_cache[key] = CacheEntry(time.time(), {})
+        return {}
+
+    record = ranked[0][1].get("record") or {}
+    series_id = record.get("series_id")
+    detail: dict = {}
+    detail_complete = False
+    if series_id:
+        try:
+            detail = _mangaupdates_request("GET", f"/series/{series_id}")
+            detail_complete = True
+        except Exception:
+            detail = {}
+    merged = {**record, **detail}
+
+    image_url, image_fallbacks = _mangaupdates_image_urls(merged.get("image"))
+    genres = [
+        str(item.get("genre") if isinstance(item, dict) else item).strip()
+        for item in merged.get("genres") or []
+        if str(item.get("genre") if isinstance(item, dict) else item).strip()
+    ]
+    authors = [
+        str(item.get("name") or "").strip()
+        for item in merged.get("authors") or []
+        if isinstance(item, dict) and str(item.get("name") or "").strip()
+    ]
+    alternative_titles = [
+        str(item.get("title") or "").strip()
+        for item in merged.get("associated") or []
+        if isinstance(item, dict) and str(item.get("title") or "").strip()
+    ]
+    data = {
+        "id": series_id,
+        "title": str(merged.get("title") or clean_title).strip(),
+        "url": str(merged.get("url") or record.get("url") or "").strip(),
+        "description": _clean_anilist_staff_text(merged.get("description")),
+        "poster": image_url,
+        "poster_fallbacks": image_fallbacks,
+        "rating": merged.get("bayesian_rating"),
+        "genres": list(dict.fromkeys(genres)),
+        "authors": list(dict.fromkeys(authors)),
+        "status": str(merged.get("status") or "").strip(),
+        "alternative_titles": list(dict.fromkeys(alternative_titles)),
+        "type": str(merged.get("type") or "").strip(),
+        "year": str(merged.get("year") or "").strip(),
+        "source": "MangaUpdates",
+    }
+    saved_at = time.time()
+    if not detail_complete:
+        saved_at -= MANGAUPDATES_CACHE_TTL_SECONDS - (15 * 60)
+    mangaupdates_series_cache[key] = CacheEntry(saved_at, data)
+    return dict(data)
+
+
+def _apply_mangaupdates_metadata(item: dict, metadata: dict) -> None:
+    cover = str(metadata.get("poster") or "").strip()
+    if cover and not item.get("cover_url"):
+        item["cover_original_url"] = cover
+        item["cover_original_fallbacks"] = [
+            str(url).strip()
+            for url in metadata.get("poster_fallbacks") or []
+            if str(url or "").strip()
+        ]
+        item.update(_refresh_cover_fields(item))
+    rating = metadata.get("rating")
+    if rating and not _has_rating(item):
+        item["rating"] = round(float(rating), 1)
+    if metadata.get("description") and not item.get("description"):
+        item["description"] = metadata["description"]
+    if metadata.get("description"):
+        _add_desc_lang(item, "en", metadata["description"])
+    if metadata.get("authors") and not item.get("authors"):
+        item["authors"] = metadata["authors"]
+    if metadata.get("status") and not item.get("status"):
+        item["status"] = metadata["status"]
+    if metadata.get("genres") and not item.get("genres"):
+        item["genres"] = metadata["genres"]
+    if metadata.get("alternative_titles"):
+        item["alternative_titles"] = list(dict.fromkeys([
+            *(item.get("alternative_titles") or []),
+            *metadata["alternative_titles"],
+        ]))
+    item["mangaupdates_url"] = metadata.get("url") or item.get("mangaupdates_url") or ""
+
+
+def _complete_with_mangaupdates(item: dict, title: str) -> None:
+    if not str(title or "").strip():
+        return
+    if not (
+        not _has_rating(item)
+        or not item.get("authors")
+        or not item.get("description")
+        or not item.get("cover_url")
+        or not item.get("genres")
+        or not item.get("status")
+    ):
+        return
+    try:
+        _apply_mangaupdates_metadata(item, _mangaupdates_series_metadata(title))
+    except Exception:
+        pass
 
 
 def _kitsu_trending_raw(limit: int = 20) -> list[dict]:
@@ -1548,21 +3520,21 @@ def _trending_highlights(catalog_items: list[dict], limit: int = 20) -> list[dic
 
 
 def _fill_chapter_counts(items: list[dict], max_workers: int = 6, cap: int = 60) -> None:
-    """Conta capitulos (barato, mangadex /aggregate) p/ mostrar 'X caps' no card."""
-    targets = [
-        item for item in items
-        if _guess_provider(item) == "mangadex"
-        and int(item.get("chapter_count") or 0) <= 0
-        and str(item.get("source_url") or "")
-    ][:cap]
+    """Valida contagem pela mesma lista de capitulos aberta pelo leitor."""
+    targets = [item for item in items if str(item.get("source_url") or "")][:cap]
     if not targets:
         return
 
     def fill(item: dict) -> None:
         try:
-            count = reader.mangadex_chapter_total(str(item.get("source_url") or ""))
-            if count:
-                item["chapter_count"] = count
+            source_url = str(item.get("source_url") or "")
+            lang = _item_chapter_language(item)
+            payload = _cached_chapters_payload(source_url, lang)
+            if payload is None:
+                payload = reader.list_chapters(source_url, lang=lang)
+                with _chapters_cache_lock:
+                    chapters_cache[_chapters_cache_key(source_url, lang)] = CacheEntry(time.time(), dict(payload))
+            _apply_verified_chapters(item, payload)
         except Exception:
             pass
 
@@ -1571,7 +3543,7 @@ def _fill_chapter_counts(items: list[dict], max_workers: int = 6, cap: int = 60)
 
 
 def _enrich_items_metadata(items: list[dict], max_workers: int = 6) -> None:
-    """Preenche rating/autor/sinopse/capa: AniList primario, Kitsu fallback."""
+    """Preenche metadados: AniList, MangaUpdates e Kitsu como ultimo fallback."""
     candidates = [
         item for item in items
         if item.get("title")
@@ -1591,6 +3563,18 @@ def _enrich_items_metadata(items: list[dict], max_workers: int = 6) -> None:
             _apply_anilist_metadata(item, _anilist_metadata(title))
         except Exception:
             pass
+        if (
+            not _has_rating(item)
+            or not item.get("authors")
+            or not item.get("description")
+            or not item.get("cover_url")
+            or not item.get("genres")
+            or not item.get("status")
+        ):
+            try:
+                _apply_mangaupdates_metadata(item, _mangaupdates_series_metadata(title))
+            except Exception:
+                pass
         if not _has_rating(item) or not item.get("description") or not item.get("cover_url"):
             try:
                 _apply_kitsu_metadata(item, _kitsu_metadata(title))
@@ -1629,6 +3613,41 @@ def _enrich_items_from_anilist(items: list[dict], max_workers: int = 4) -> None:
 
 def _fill_missing_cover_from_anilist(items: list[dict], limit: int = 4) -> None:
     _enrich_items_from_anilist(items[:limit], max_workers=4)
+
+
+def _share_search_covers_by_title(items: list[dict]) -> None:
+    covers_by_title: dict[str, dict] = {}
+    for item in items:
+        title_key = normalize_match_text(str(item.get("title") or ""))
+        if title_key and _item_has_cover(item):
+            covers_by_title.setdefault(title_key, item)
+    for item in items:
+        if _item_has_cover(item):
+            continue
+        title_key = normalize_match_text(str(item.get("title") or ""))
+        source = covers_by_title.get(title_key)
+        if source:
+            _copy_cover_fields(item, source)
+
+
+def _recover_missing_search_covers(items: list[dict], limit: int = SEARCH_COVER_RECOVERY_LIMIT) -> None:
+    targets = [item for item in items if not _item_has_cover(item) and item.get("title")][:limit]
+    if not targets:
+        return
+
+    def recover(item: dict) -> tuple[dict, str]:
+        return item, _recover_cover_url(str(item.get("title") or ""))
+
+    with ThreadPoolExecutor(max_workers=min(4, len(targets))) as executor:
+        futures = [executor.submit(recover, item) for item in targets]
+        for future in as_completed(futures):
+            try:
+                item, url = future.result()
+            except Exception:
+                continue
+            if _is_remote_image_url(url):
+                item["cover_original_url"] = url
+                item.update(_refresh_cover_fields(item))
 
 
 _PT_HINTS = (
@@ -1684,10 +3703,33 @@ def _translate_to_pt(text: str) -> str:
 
 
 def _add_desc_lang(item: dict, lang: str, text: str) -> None:
-    text = str(text or "").strip()
+    text = _clean_synopsis(text)
     if not text:
         return
     item.setdefault("descriptions_map", {}).setdefault(lang, text)
+
+
+def _clean_synopsis(value: object) -> str:
+    """Remove markup e creditos soltos de fontes sem perder texto da sinopse."""
+    text = html.unescape(str(value or ""))
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", text)
+
+    def markdown_link(match: re.Match[str]) -> str:
+        label = match.group(1).strip()
+        # Links de rede social costumam ser apenas credito no fim da sinopse.
+        if label.casefold() in {"twitter", "x", "instagram", "facebook", "discord"}:
+            return ""
+        return label
+
+    text = re.sub(r"\[([^\]]+)\]\((?:https?://|www\.)[^)]*\)", markdown_link, text)
+    text = re.sub(
+        r"(?i)(?:\[?(?:twitter|instagram|facebook|discord|source)\]?\s*:?\s*)?https?://\S+",
+        "",
+        text,
+    )
+    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _finalize_descriptions(item: dict) -> None:
@@ -1695,12 +3737,12 @@ def _finalize_descriptions(item: dict) -> None:
     raw = item.get("descriptions_map") or {}
     norm: dict[str, str] = {}
     for lang, text in raw.items():
-        text = str(text or "").strip()
+        text = _clean_synopsis(text)
         if text:
             norm[str(lang or "").lower()] = text
     # sem map, mas tem description solta -> classifica por idioma
     if not norm and str(item.get("description") or "").strip():
-        d = str(item["description"]).strip()
+        d = _clean_synopsis(item["description"])
         norm["pt-br" if _looks_portuguese(d) else "en"] = d
 
     pt = norm.get("pt-br") or norm.get("pt")
@@ -1728,17 +3770,30 @@ def _finalize_descriptions(item: dict) -> None:
 def _strip_descriptions_map(item: dict) -> None:
     raw = item.pop("descriptions_map", None)
     if item.get("descriptions"):
+        for description in item["descriptions"]:
+            if isinstance(description, dict):
+                description["text"] = _clean_synopsis(description.get("text"))
+        item["descriptions"] = [
+            description
+            for description in item["descriptions"]
+            if isinstance(description, dict) and description.get("text")
+        ]
+        if item["descriptions"]:
+            item["description"] = item["descriptions"][0]["text"]
+        else:
+            item["description"] = ""
         return
     if raw:
         ordered = []
         for lang, text in raw.items():
-            text = str(text or "").strip()
+            text = _clean_synopsis(text)
             if text:
                 ordered.append({"lang": str(lang or "").lower(), "text": text})
         if ordered:
             item["descriptions"] = ordered
     elif item.get("description"):
-        d = str(item["description"])
+        d = _clean_synopsis(item["description"])
+        item["description"] = d
         item["descriptions"] = [
             {"lang": "pt-br" if _looks_portuguese(d) else "en", "text": d}
         ]
@@ -1811,9 +3866,17 @@ def _prune_image_cache() -> None:
 
 
 def _fetch_image(url: str) -> ImageCacheEntry:
-    cached = image_cache.get(url)
-    if cached and time.time() - cached.saved_at < IMAGE_CACHE_TTL_SECONDS:
-        return cached
+    while True:
+        with _image_cache_lock:
+            cached = image_cache.get(url)
+            if cached and time.time() - cached.saved_at < IMAGE_CACHE_TTL_SECONDS:
+                return cached
+            pending = image_inflight.get(url)
+            if pending is None:
+                pending = threading.Event()
+                image_inflight[url] = pending
+                break
+        pending.wait(timeout=30)
 
     headers = {
         "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
@@ -1828,27 +3891,35 @@ def _fetch_image(url: str) -> ImageCacheEntry:
         headers["Accept"] = "*/*"
         headers["User-Agent"] = "python-requests/2.32.5"
 
-    response = requests.get(
-        url,
-        timeout=20,
-        headers=headers,
-    )
-    response.raise_for_status()
-    media_type = response.headers.get("content-type", "image/jpeg").split(";")[0].strip()
-    if not media_type.startswith("image/"):
-        guessed_type = _guess_image_media_type(url, response.content, media_type)
-        if not guessed_type.startswith("image/"):
-            raise RuntimeError(f"URL nao retornou imagem: {media_type}")
-        media_type = guessed_type
+    try:
+        response = _image_http.get(
+            url,
+            timeout=(5, 20),
+            headers=headers,
+        )
+        response.raise_for_status()
+        content = response.content
+        media_type = response.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+        if not media_type.startswith("image/"):
+            guessed_type = _guess_image_media_type(url, content, media_type)
+            if not guessed_type.startswith("image/"):
+                raise RuntimeError(f"URL nao retornou imagem: {media_type}")
+            media_type = guessed_type
 
-    entry = ImageCacheEntry(
-        saved_at=time.time(),
-        content=response.content,
-        media_type=media_type,
-    )
-    image_cache[url] = entry
-    _prune_image_cache()
-    return entry
+        entry = ImageCacheEntry(
+            saved_at=time.time(),
+            content=content,
+            media_type=media_type,
+        )
+        with _image_cache_lock:
+            image_cache[url] = entry
+            _prune_image_cache()
+        return entry
+    finally:
+        with _image_cache_lock:
+            finished = image_inflight.pop(url, None)
+            if finished is not None:
+                finished.set()
 
 
 def _cover_extension(media_type: str, url: str) -> str:
@@ -1988,30 +4059,121 @@ def _recover_and_store_cover(item: dict) -> bool:
         return False
 
 
+def _chapter_audit_reader() -> MangaReader:
+    reader_instance = getattr(_chapter_audit_local, "reader", None)
+    if reader_instance is None:
+        reader_instance = MangaReader(reader.args)
+        _chapter_audit_local.reader = reader_instance
+    return reader_instance
+
+
 def _prewarm_chapters(items: list[dict], limit: int = 40, max_workers: int = 4) -> None:
     """Pre-busca a lista de capitulos das obras do catalogo (1x) e persiste em
     disco, para o PRIMEIRO clique do usuario ja vir do cache local (sem fetch).
+
+    Cada fonte tem timeout proprio: uma fonte que trava vira falha registrada
+    (card mostra "indisponivel" e reentra na fila depois) em vez de segurar o
+    worker e travar o audit inteiro.
     """
-    def warm(item: dict) -> None:
+    grouped: dict[tuple[str, str], list[dict]] = {}
+    for item in items:
         source_url = str(item.get("source_url") or "").strip()
         if not source_url:
-            return
-        lang = str(item.get("language") or "pt-br")
-        key = f"{source_url}|{normalize_match_text(lang)}"
-        if _cache_is_fresh(chapters_cache.get(key), CHAPTERS_DISK_TTL_SECONDS):
-            return
-        try:
-            payload = reader.list_chapters(source_url, lang=lang)
-            chapters_cache[key] = CacheEntry(time.time(), dict(payload))
-        except Exception:
-            pass  # falha de uma obra nao derruba o prewarm
-
-    targets = [it for it in items if it.get("source_url")][:limit]
-    if not targets:
+            continue
+        lang = _item_chapter_language(item)
+        grouped.setdefault((source_url, lang), []).append(item)
+        if len(grouped) >= limit:
+            break
+    if not grouped:
         return
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        list(executor.map(warm, targets))
+
+    def _record_failure(source_url: str, error: str) -> None:
+        chapter_audit_failures[source_url] = CacheEntry(time.time(), {"error": error})
+
+    def warm(target: tuple[str, str]) -> None:
+        source_url, lang = target
+        key = _chapters_cache_key(source_url, lang)
+        with _chapters_cache_lock:
+            cached = chapters_cache.get(key)
+        if _cache_is_fresh(cached, CHAPTERS_DISK_TTL_SECONDS):
+            payload = dict(cached.data)
+        else:
+            # Reader do thread externo (reusado pelo pool via thread-local); o
+            # future aninhado so o executa com timeout. list_chapters segura
+            # self.lock, mas so esta chamada o usa por vez.
+            audit_reader = _chapter_audit_reader()
+            fetch_executor = ThreadPoolExecutor(max_workers=1)
+            try:
+                future = fetch_executor.submit(audit_reader.list_chapters, source_url, lang=lang)
+                payload = future.result(timeout=CHAPTER_AUDIT_TARGET_TIMEOUT_SECONDS)
+            except FuturesTimeoutError:
+                # Fetch travado segura o self.lock do reader; abandona esse reader
+                # (a thread vazada morre com ele) e forca um novo no proximo target.
+                _chapter_audit_local.reader = None
+                _record_failure(source_url, "timeout")
+                return
+            except Exception as exc:  # noqa: BLE001 - rede/parse/fonte nao suportada
+                _record_failure(source_url, str(exc))
+                return
+            finally:
+                # wait=False: nao bloqueia esperando a thread travada terminar.
+                fetch_executor.shutdown(wait=False)
+
+        with _chapters_cache_lock:
+            chapters_cache[key] = CacheEntry(time.time(), dict(payload))
+        chapter_audit_failures.pop(source_url, None)
+        for item in grouped[target]:
+            _apply_verified_chapters(item, payload)
+
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    future_map = {executor.submit(warm, target): target for target in grouped}
+    try:
+        for _ in as_completed(future_map, timeout=CHAPTER_AUDIT_BATCH_TIMEOUT_SECONDS):
+            pass
+    except FuturesTimeoutError:
+        # Teto do lote estourado: marca os pendentes como falha p/ o card sair de
+        # "Verificando" e o proximo ciclo tentar de novo.
+        for future, target in future_map.items():
+            if not future.done():
+                _record_failure(target[0], "batch-timeout")
+    finally:
+        executor.shutdown(wait=False)
     _save_chapters_snapshot()
+
+
+def _schedule_home_chapter_audit(items: list[dict]) -> bool:
+    global _home_chapter_audit_running
+
+    targets: list[dict] = []
+    seen: set[str] = set()
+    for item in items:
+        source_url = str(item.get("source_url") or "").strip()
+        lang = _item_chapter_language(item)
+        if not source_url or source_url in seen:
+            continue
+        seen.add(source_url)
+        if _cached_chapters_payload(source_url, lang) is not None:
+            continue
+        failure = chapter_audit_failures.get(source_url)
+        if _cache_is_fresh(failure, CHAPTER_AUDIT_FAILURE_TTL_SECONDS):
+            continue
+        targets.append(item)
+
+    with _home_chapter_audit_lock:
+        if _home_chapter_audit_running or not targets:
+            return _home_chapter_audit_running
+        _home_chapter_audit_running = True
+
+    def run() -> None:
+        global _home_chapter_audit_running
+        try:
+            _prewarm_chapters(targets, limit=len(targets), max_workers=4)
+        finally:
+            with _home_chapter_audit_lock:
+                _home_chapter_audit_running = False
+
+    threading.Thread(target=run, daemon=True).start()
+    return True
 
 
 def _prefetch_cover_images(items: list[dict], limit: int = 48) -> None:
@@ -2038,46 +4200,105 @@ def _prefetch_cover_images(items: list[dict], limit: int = 48) -> None:
                 continue
 
 
+def _fill_visible_home_chapter_counts(data: dict, matches_genre, cap: int = 48) -> None:
+    seen: set[str] = set()
+    targets: list[dict] = []
+    pools = [data.get("items") or []]
+    pools.extend(section.get("items") or [] for section in data.get("sections") or [])
+    for pool in pools:
+        for item in pool:
+            source_url = str(item.get("source_url") or "").strip()
+            if not source_url or source_url in seen:
+                continue
+            seen.add(source_url)
+            if not matches_genre(item) or not _is_home_ready(item):
+                continue
+            try:
+                if int(item.get("chapter_count") or 0) > 0:
+                    continue
+            except (TypeError, ValueError):
+                pass
+            targets.append(item)
+            if len(targets) >= cap:
+                break
+        if len(targets) >= cap:
+            break
+    _fill_chapter_counts(targets, max_workers=8, cap=cap)
+
+
 def _search_mangas(query: str, limit: int) -> dict:
-    cache_key = f"{normalize_match_text(query)}:{limit}"
+    normalized_query = normalize_match_text(query)
+    if len(normalized_query) < 2:
+        return {
+            "items": [],
+            "sections": [{"title": "Resultados", "items": []}],
+            "total": 0,
+            "limit": limit,
+            "offset": 0,
+            "sources": [],
+            "errors": [],
+            "cached": False,
+        }
+
+    cache_key = f"v{SEARCH_CACHE_VERSION}:{normalized_query}:{limit}"
     cached = search_cache.get(cache_key)
     if _cache_is_fresh(cached, SEARCH_CACHE_TTL_SECONDS):
         return {**cached.data, "cached": True}
 
-    sources = SEARCH_SOURCES
+    sources = _search_sources()
+    source_limit = _search_source_limit(limit)
+    # Sakura sai do batch rapido (browser nao cabe em 4s) e vira passe dedicado.
+    sakura_live = "sakura" in sources
+    fast_sources = [source for source in sources if source != "sakura"]
     items, errors = _search_sources_with_timeout(
-        sources,
+        fast_sources,
         query,
-        limit,
+        source_limit,
         timeout=SOURCE_SEARCH_TIMEOUT_SECONDS,
     )
 
-    normalized_query = normalize_match_text(query)
-    items = _dedupe(items)
+    # Requisicao Sakura EM TEMPO REAL: so quando as fontes rapidas nao acharam a
+    # obra (nenhum match forte) -> caso "obra muito especifica que so tem no
+    # Sakura". Evita pagar a latencia do browser em toda busca.
+    if sakura_live:
+        best_match = max((_search_match_score(query, it) for it in items), default=0.0)
+        if best_match < 0.9:
+            sakura_items, sakura_errors = _search_sources_with_timeout(
+                ["sakura"],
+                query,
+                source_limit,
+                timeout=SAKURA_LIVE_SEARCH_TIMEOUT_SECONDS,
+            )
+            items.extend(sakura_items)
+            errors.extend(sakura_errors)
+
+    items = _dedupe_search_results(items)
     items = _apply_curated_source_overrides(items, query)
-    items = _dedupe(items)
+    items = _dedupe_search_results(items)
     relevant_items = []
     for item in items:
+        if not _title_contains_query_tokens(query, item):
+            continue
         score = _search_match_score(query, item)
-        title_norm = normalize_match_text(str(item.get("title") or ""))
-        query_tokens = [token for token in normalized_query.split() if len(token) >= 2]
-        title_has_query_token = any(token in title_norm for token in query_tokens)
-        if len(query_tokens) > 1 and not title_has_query_token and normalized_query not in title_norm:
-            score = 0.0
-        if score >= 0.45:
+        tier = _search_rank_tier(query, item)
+        if score > 0:
             item["relevance"] = round(score, 4)
+            item["_search_tier"] = tier
             relevant_items.append(item)
     items = relevant_items
     items.sort(
         key=lambda item: (
-            0 if normalize_match_text(item["title"]) == normalized_query else 1,
-            -int(item.get("chapter_count") or 0),
-            -SOURCE_RELIABILITY.get(str(item.get("provider") or "").lower(), 0.5),
+            int(item.get("_search_tier", 9)),
             -float(item.get("relevance") or 0),
+            -SOURCE_RELIABILITY.get(str(item.get("provider") or "").lower(), 0.5),
+            -int(item.get("chapter_count") or 0),
             item["title"].lower(),
         )
     )
-    _enrich_items_metadata(items[:limit], max_workers=6)
+    for item in items:
+        item.pop("_search_tier", None)
+    _share_search_covers_by_title(items)
+    _recover_missing_search_covers(items[:limit])
     data = {
         "items": items[:limit],
         "sections": [{"title": "Resultados", "items": items[:limit]}],
@@ -2095,6 +4316,669 @@ def _search_mangas(query: str, limit: int) -> dict:
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/api/profiles")
+def create_profile(request: ProfileCreateRequest) -> dict:
+    display_name = request.display_name.strip() or "Leitor"
+    now = time.time()
+    profile = {
+        "id": uuid4().hex,
+        "display_name": display_name,
+        "favorites": [],
+        "created_at": now,
+        "updated_at": now,
+    }
+    with _profiles_lock:
+        profiles = _load_profiles()
+        profiles[profile["id"]] = profile
+        _save_profiles(profiles)
+    return _profile_payload(profile)
+
+
+@app.get("/api/profiles/{profile_id}")
+def get_profile(profile_id: str) -> dict:
+    with _profiles_lock:
+        profile = _get_profile_or_404(profile_id, _load_profiles())
+        return _profile_payload(profile)
+
+
+@app.put("/api/profiles/{profile_id}")
+def update_profile(profile_id: str, request: ProfileUpdateRequest) -> dict:
+    display_name = request.display_name.strip()
+    if not display_name:
+        raise HTTPException(status_code=422, detail="Nome do perfil vazio.")
+    with _profiles_lock:
+        profiles = _load_profiles()
+        profile = _get_profile_or_404(profile_id, profiles)
+        profile["display_name"] = display_name
+        profile["updated_at"] = time.time()
+        profiles[profile_id] = profile
+        _save_profiles(profiles)
+    return _profile_payload(profile)
+
+
+@app.put("/api/profiles/{profile_id}/favorites")
+def update_profile_favorites(profile_id: str, request: ProfileFavoritesRequest) -> dict:
+    favorites: list[dict] = []
+    seen: set[str] = set()
+    for raw_item in request.favorites:
+        item = _profile_favorite(raw_item)
+        if not item:
+            continue
+        key = str(item.get("source_url") or item.get("id") or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        favorites.append(item)
+
+    with _profiles_lock:
+        profiles = _load_profiles()
+        profile = _get_profile_or_404(profile_id, profiles)
+        profile["favorites"] = favorites
+        profile["updated_at"] = time.time()
+        profiles[profile_id] = profile
+        _save_profiles(profiles)
+    return _profile_payload(profile)
+
+
+# ---------------------------------------------------------------------------
+# Aparencia do perfil: avatar (foto) e background (capa do painel).
+# ---------------------------------------------------------------------------
+@app.put("/api/profiles/{profile_id}/avatar")
+def set_profile_avatar(profile_id: str, request: ProfileImageRequest) -> dict:
+    with _profiles_lock:
+        profiles = _load_profiles()
+        profile = _get_profile_or_404(profile_id, profiles)
+        profile["avatar_url"] = _apply_profile_image(profile, "avatar", request)
+        profile["updated_at"] = time.time()
+        profiles[profile_id] = profile
+        _save_profiles(profiles)
+    return _profile_payload(profile)
+
+
+@app.put("/api/profiles/{profile_id}/background")
+def set_profile_background(profile_id: str, request: ProfileImageRequest) -> dict:
+    with _profiles_lock:
+        profiles = _load_profiles()
+        profile = _get_profile_or_404(profile_id, profiles)
+        profile["background_url"] = _apply_profile_image(profile, "background", request)
+        profile["updated_at"] = time.time()
+        profiles[profile_id] = profile
+        _save_profiles(profiles)
+    return _profile_payload(profile)
+
+
+@app.put("/api/profiles/{profile_id}/home-background")
+def set_profile_home_background(profile_id: str, request: ProfileImageRequest) -> dict:
+    """Imagem de fundo da HOME escolhida pelo leitor (customizacao de perfil)."""
+    with _profiles_lock:
+        profiles = _load_profiles()
+        profile = _get_profile_or_404(profile_id, profiles)
+        profile["home_background_url"] = _apply_profile_image(profile, "home_background", request)
+        profile["updated_at"] = time.time()
+        profiles[profile_id] = profile
+        _save_profiles(profiles)
+    return _profile_payload(profile)
+
+
+# ---------------------------------------------------------------------------
+# Vinculo de contas externas via OAuth2 (AniList / MyAnimeList).
+# ---------------------------------------------------------------------------
+_oauth_states: dict[str, dict] = {}
+_oauth_states_lock = threading.Lock()
+
+
+def _purge_oauth_states() -> None:
+    now = time.time()
+    expired = [key for key, value in _oauth_states.items() if value.get("expires", 0) < now]
+    for key in expired:
+        _oauth_states.pop(key, None)
+
+
+def _oauth_html(message: dict) -> Response:
+    """Pagina retornada no callback: avisa a janela que abriu (postMessage) e fecha.
+    Fallback: link de volta pro app se o popup nao tiver opener."""
+    payload = json.dumps({"source": "kari-oauth", **message})
+    frontend = json.dumps(FRONTEND_BASE_URL)
+    body = f"""<!doctype html><html lang="pt-br"><head><meta charset="utf-8">
+<title>Kari - Vinculo de conta</title>
+<style>body{{background:#0b0b0e;color:#e5e5e5;font-family:system-ui,sans-serif;
+display:grid;place-items:center;height:100vh;margin:0}}a{{color:#6ee7b7}}</style></head>
+<body><div><p>{html.escape(str(message.get('detail') or 'Pode fechar esta janela.'))}</p>
+<p><a href={frontend}>Voltar ao Kari</a></p></div>
+<script>
+(function(){{
+  var msg = {payload};
+  try {{ if (window.opener) {{ window.opener.postMessage(msg, {frontend}); }} }} catch (e) {{}}
+  setTimeout(function(){{ try {{ window.close(); }} catch (e) {{}} }}, 400);
+}})();
+</script></body></html>"""
+    return Response(content=body, media_type="text/html")
+
+
+def _fetch_anilist_viewer(access_token: str) -> dict:
+    query = "query{Viewer{id name avatar{large medium} siteUrl}}"
+    response = requests.post(
+        ANILIST_GRAPHQL_URL,
+        json={"query": query},
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        timeout=15,
+    )
+    response.raise_for_status()
+    viewer = (response.json().get("data") or {}).get("Viewer") or {}
+    avatar = viewer.get("avatar") or {}
+    return {
+        "id": viewer.get("id"),
+        "name": viewer.get("name") or "",
+        "avatar": avatar.get("large") or avatar.get("medium") or "",
+        "url": viewer.get("siteUrl") or "",
+    }
+
+
+def _fetch_mal_viewer(access_token: str) -> dict:
+    response = requests.get(
+        MAL_USER_URL,
+        params={"fields": "id,name,picture"},
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=15,
+    )
+    response.raise_for_status()
+    data = response.json()
+    name = data.get("name") or ""
+    return {
+        "id": data.get("id"),
+        "name": name,
+        "avatar": data.get("picture") or "",
+        "url": f"https://myanimelist.net/profile/{name}" if name else "",
+    }
+
+
+@app.post("/api/profiles/{profile_id}/link/{provider}")
+def start_account_link(profile_id: str, provider: str) -> dict:
+    if provider not in OAUTH_PROVIDERS:
+        raise HTTPException(status_code=404, detail="Provedor desconhecido.")
+    if not _oauth_provider_configured(provider):
+        raise HTTPException(
+            status_code=503,
+            detail=f"OAuth do {PROVIDER_LABELS.get(provider, provider)} nao configurado no servidor (.env).",
+        )
+    with _profiles_lock:
+        _get_profile_or_404(profile_id, _load_profiles())
+
+    state = secrets.token_urlsafe(24)
+    redirect_uri = _oauth_redirect_uri(provider)
+    entry = {
+        "profile_id": profile_id,
+        "provider": provider,
+        "expires": time.time() + OAUTH_STATE_TTL_SECONDS,
+    }
+
+    if provider == "anilist":
+        params = {
+            "client_id": ANILIST_CLIENT_ID,
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+            "state": state,
+        }
+        authorize_url = f"{ANILIST_AUTHORIZE_URL}?{urlencode(params)}"
+    else:  # myanimelist (PKCE plain: code_challenge == code_verifier)
+        verifier = secrets.token_urlsafe(64)[:128]
+        entry["code_verifier"] = verifier
+        params = {
+            "response_type": "code",
+            "client_id": MAL_CLIENT_ID,
+            "state": state,
+            "code_challenge": verifier,
+            "code_challenge_method": "plain",
+            "redirect_uri": redirect_uri,
+        }
+        authorize_url = f"{MAL_AUTHORIZE_URL}?{urlencode(params)}"
+
+    with _oauth_states_lock:
+        _purge_oauth_states()
+        _oauth_states[state] = entry
+    return {"authorize_url": authorize_url}
+
+
+@app.get("/api/oauth/{provider}/callback")
+def account_link_callback(
+    provider: str,
+    code: str = Query(default=""),
+    state: str = Query(default=""),
+    error: str = Query(default=""),
+) -> Response:
+    if provider not in OAUTH_PROVIDERS:
+        return _oauth_html({"ok": False, "detail": "Provedor desconhecido."})
+    if error:
+        return _oauth_html({"ok": False, "provider": provider, "detail": f"Autorizacao negada: {error}"})
+
+    with _oauth_states_lock:
+        _purge_oauth_states()
+        entry = _oauth_states.pop(state, None)
+    if not entry or entry.get("provider") != provider:
+        return _oauth_html({"ok": False, "provider": provider, "detail": "Sessao OAuth invalida ou expirada."})
+    if not code:
+        return _oauth_html({"ok": False, "provider": provider, "detail": "Codigo de autorizacao ausente."})
+
+    profile_id = entry["profile_id"]
+    redirect_uri = _oauth_redirect_uri(provider)
+    try:
+        if provider == "anilist":
+            token_response = requests.post(
+                ANILIST_TOKEN_URL,
+                json={
+                    "grant_type": "authorization_code",
+                    "client_id": ANILIST_CLIENT_ID,
+                    "client_secret": ANILIST_CLIENT_SECRET,
+                    "redirect_uri": redirect_uri,
+                    "code": code,
+                },
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+                timeout=15,
+            )
+            token_response.raise_for_status()
+            tokens = token_response.json()
+            viewer = _fetch_anilist_viewer(tokens.get("access_token", ""))
+        else:
+            form = {
+                "client_id": MAL_CLIENT_ID,
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "code_verifier": entry.get("code_verifier", ""),
+            }
+            if MAL_CLIENT_SECRET:
+                form["client_secret"] = MAL_CLIENT_SECRET
+            token_response = requests.post(MAL_TOKEN_URL, data=form, timeout=15)
+            token_response.raise_for_status()
+            tokens = token_response.json()
+            viewer = _fetch_mal_viewer(tokens.get("access_token", ""))
+    except requests.RequestException as exc:
+        logger.warning("OAuth %s falhou: %s", provider, exc)
+        return _oauth_html({"ok": False, "provider": provider, "detail": "Falha ao trocar o codigo por token."})
+
+    link_info = {**viewer, "linked_at": time.time()}
+    with _profiles_lock:
+        profiles = _load_profiles()
+        profile = profiles.get(profile_id)
+        if not isinstance(profile, dict):
+            return _oauth_html({"ok": False, "provider": provider, "detail": "Perfil nao encontrado."})
+        links = profile.get("links")
+        if not isinstance(links, dict):
+            links = {}
+        links[provider] = link_info
+        profile["links"] = links
+        stored_tokens = profile.get("_tokens")
+        if not isinstance(stored_tokens, dict):
+            stored_tokens = {}
+        stored_tokens[provider] = {
+            "access_token": tokens.get("access_token", ""),
+            "refresh_token": tokens.get("refresh_token", ""),
+            "expires_in": tokens.get("expires_in"),
+            "obtained_at": time.time(),
+        }
+        profile["_tokens"] = stored_tokens
+        profile["updated_at"] = time.time()
+        profiles[profile_id] = profile
+        _save_profiles(profiles)
+
+    return _oauth_html({
+        "ok": True,
+        "provider": provider,
+        "name": link_info.get("name") or "",
+        "detail": f"Conta {PROVIDER_LABELS.get(provider, provider)} vinculada!",
+    })
+
+
+@app.delete("/api/profiles/{profile_id}/link/{provider}")
+def unlink_account(profile_id: str, provider: str) -> dict:
+    if provider not in OAUTH_PROVIDERS:
+        raise HTTPException(status_code=404, detail="Provedor desconhecido.")
+    with _profiles_lock:
+        profiles = _load_profiles()
+        profile = _get_profile_or_404(profile_id, profiles)
+        links = profile.get("links")
+        if isinstance(links, dict):
+            links.pop(provider, None)
+        tokens = profile.get("_tokens")
+        if isinstance(tokens, dict):
+            tokens.pop(provider, None)
+        profile["updated_at"] = time.time()
+        profiles[profile_id] = profile
+        _save_profiles(profiles)
+    return _profile_payload(profile)
+
+
+@app.get("/api/profiles/{profile_id}/link/status")
+def account_link_status(profile_id: str) -> dict:
+    """Diz quais provedores estao CONFIGURADOS no servidor (habilita botoes no UI)."""
+    return {
+        "providers": {
+            provider: {
+                "configured": _oauth_provider_configured(provider),
+                "label": PROVIDER_LABELS.get(provider, provider),
+            }
+            for provider in OAUTH_PROVIDERS
+        }
+    }
+
+
+@app.get("/api/backgrounds")
+def list_preset_backgrounds() -> dict:
+    """Backgrounds pre-definidos disponiveis (static/backgrounds/*)."""
+    items: list[dict] = []
+    for path in sorted(BACKGROUNDS_DIR.glob("*")):
+        if not path.is_file():
+            continue
+        ext = path.suffix.lower()
+        if ext in BACKGROUND_VIDEO_EXTS:
+            kind = "video"
+        elif ext in BACKGROUND_IMAGE_EXTS:
+            kind = "image"
+        else:
+            continue
+        items.append({
+            "name": path.stem,
+            "url": f"/static/backgrounds/{path.name}",
+            "kind": kind,
+        })
+    return {"backgrounds": items}
+
+
+# ---------------------------------------------------------------------------
+# Cadastro / Login (contas locais). Senha com PBKDF2; sessao via token Bearer.
+# Auth local: sem HTTPS/rate-limit; adequado ao uso local do app.
+# ---------------------------------------------------------------------------
+_users_lock = threading.RLock()
+_tokens_lock = threading.RLock()
+_USERNAME_RE = re.compile(r"^[A-Za-z0-9_.]{3,32}$")
+
+
+def _load_json_store(path: Path) -> dict[str, dict]:
+    try:
+        if not path.exists():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_json_store(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _hash_password(password: str, salt: str) -> str:
+    return hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), bytes.fromhex(salt), PBKDF2_ITERATIONS
+    ).hex()
+
+
+def _issue_token(profile_id: str, username: str) -> str:
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    with _tokens_lock:
+        tokens = {
+            t: v for t, v in _load_json_store(AUTH_TOKENS_PATH).items()
+            if float(v.get("expires", 0)) > now
+        }
+        tokens[token] = {"profile_id": profile_id, "username": username, "expires": now + AUTH_TOKEN_TTL_SECONDS}
+        _save_json_store(AUTH_TOKENS_PATH, tokens)
+    return token
+
+
+def _token_from_header(authorization: str) -> str:
+    if authorization and authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+    return ""
+
+
+def _resolve_token(authorization: str) -> str | None:
+    """profile_id do token Bearer valido, ou None."""
+    token = _token_from_header(authorization)
+    if not token:
+        return None
+    with _tokens_lock:
+        entry = _load_json_store(AUTH_TOKENS_PATH).get(token)
+    if not entry or float(entry.get("expires", 0)) <= time.time():
+        return None
+    return str(entry.get("profile_id") or "")
+
+
+def _revoke_token(authorization: str) -> None:
+    token = _token_from_header(authorization)
+    if not token:
+        return
+    with _tokens_lock:
+        tokens = _load_json_store(AUTH_TOKENS_PATH)
+        if tokens.pop(token, None) is not None:
+            _save_json_store(AUTH_TOKENS_PATH, tokens)
+
+
+class RegisterRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=32)
+    password: str = Field(min_length=6, max_length=128)
+    email: str = Field(default="", max_length=120)
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=128)
+
+
+@app.post("/api/auth/register")
+def auth_register(request: RegisterRequest) -> dict:
+    username = request.username.strip()
+    if not _USERNAME_RE.match(username):
+        raise HTTPException(status_code=422, detail="Usuario invalido (3-32: letras, numeros, _ ou .).")
+    key = username.lower()
+    now = time.time()
+    salt = secrets.token_hex(16)
+    with _users_lock:
+        users = _load_json_store(USERS_STORE_PATH)
+        if key in users:
+            raise HTTPException(status_code=409, detail="Esse usuario ja existe.")
+        profile = {
+            "id": uuid4().hex,
+            "display_name": username,
+            "favorites": [],
+            "created_at": now,
+            "updated_at": now,
+        }
+        with _profiles_lock:
+            profiles = _load_profiles()
+            profiles[profile["id"]] = profile
+            _save_profiles(profiles)
+        users[key] = {
+            "username": username,
+            "email": request.email.strip(),
+            "salt": salt,
+            "password_hash": _hash_password(request.password, salt),
+            "profile_id": profile["id"],
+            "created_at": now,
+        }
+        _save_json_store(USERS_STORE_PATH, users)
+    token = _issue_token(profile["id"], username)
+    return {"token": token, "profile": _profile_payload(profile)}
+
+
+@app.post("/api/auth/login")
+def auth_login(request: LoginRequest) -> dict:
+    key = request.username.strip().lower()
+    with _users_lock:
+        user = _load_json_store(USERS_STORE_PATH).get(key)
+    if not user or _hash_password(request.password, user.get("salt", "")) != user.get("password_hash"):
+        raise HTTPException(status_code=401, detail="Usuario ou senha invalidos.")
+    with _profiles_lock:
+        profile = _load_profiles().get(user["profile_id"])
+    if not isinstance(profile, dict):
+        raise HTTPException(status_code=500, detail="Perfil da conta nao encontrado.")
+    token = _issue_token(user["profile_id"], user["username"])
+    return {"token": token, "profile": _profile_payload(profile)}
+
+
+@app.get("/api/auth/me")
+def auth_me(authorization: str = Header(default="")) -> dict:
+    profile_id = _resolve_token(authorization)
+    if not profile_id:
+        raise HTTPException(status_code=401, detail="Nao autenticado.")
+    with _profiles_lock:
+        profile = _load_profiles().get(profile_id)
+    if not isinstance(profile, dict):
+        raise HTTPException(status_code=401, detail="Sessao invalida.")
+    return {"profile": _profile_payload(profile)}
+
+
+@app.post("/api/auth/logout")
+def auth_logout(authorization: str = Header(default="")) -> dict:
+    _revoke_token(authorization)
+    return {"ok": True}
+
+
+@app.get("/api/auth/providers")
+def auth_providers() -> dict:
+    """Metodos de login externos configurados (habilita botoes no UI)."""
+    return {"discord": {"configured": _discord_configured()}}
+
+
+@app.get("/api/auth/discord/start")
+def auth_discord_start() -> dict:
+    if not _discord_configured():
+        raise HTTPException(status_code=503, detail="Login com Discord nao configurado no servidor (.env).")
+    state = secrets.token_urlsafe(24)
+    with _oauth_states_lock:
+        _purge_oauth_states()
+        _oauth_states[state] = {"purpose": "discord-login", "expires": time.time() + OAUTH_STATE_TTL_SECONDS}
+    params = {
+        "client_id": DISCORD_CLIENT_ID,
+        "redirect_uri": _discord_redirect_uri(),
+        "response_type": "code",
+        "scope": "identify email",
+        "state": state,
+        "prompt": "consent",
+    }
+    return {"authorize_url": f"{DISCORD_AUTHORIZE_URL}?{urlencode(params)}"}
+
+
+def _auth_html(message: dict) -> Response:
+    """Pagina do callback: envia token/erro pra janela que abriu e fecha."""
+    payload = json.dumps({"source": "kari-auth", **message})
+    frontend = json.dumps(FRONTEND_BASE_URL)
+    body = f"""<!doctype html><html lang="pt-br"><head><meta charset="utf-8">
+<title>Kari - Login</title>
+<style>body{{background:#0b0b0e;color:#e5e5e5;font-family:system-ui,sans-serif;
+display:grid;place-items:center;height:100vh;margin:0}}a{{color:#6ee7b7}}</style></head>
+<body><div><p>{html.escape(str(message.get('detail') or 'Pode fechar esta janela.'))}</p>
+<p><a href={frontend}>Voltar ao Kari</a></p></div>
+<script>
+(function(){{
+  var msg = {payload};
+  try {{ if (window.opener) {{ window.opener.postMessage(msg, {frontend}); }} }} catch (e) {{}}
+  setTimeout(function(){{ try {{ window.close(); }} catch (e) {{}} }}, 400);
+}})();
+</script></body></html>"""
+    return Response(content=body, media_type="text/html")
+
+
+@app.get("/api/auth/discord/callback")
+def auth_discord_callback(
+    code: str = Query(default=""),
+    state: str = Query(default=""),
+    error: str = Query(default=""),
+) -> Response:
+    if error:
+        return _auth_html({"ok": False, "detail": f"Autorizacao negada: {error}"})
+    with _oauth_states_lock:
+        _purge_oauth_states()
+        entry = _oauth_states.pop(state, None)
+    if not entry or entry.get("purpose") != "discord-login":
+        return _auth_html({"ok": False, "detail": "Sessao de login invalida ou expirada."})
+    if not code:
+        return _auth_html({"ok": False, "detail": "Codigo de autorizacao ausente."})
+
+    try:
+        token_resp = requests.post(
+            DISCORD_TOKEN_URL,
+            data={
+                "client_id": DISCORD_CLIENT_ID,
+                "client_secret": DISCORD_CLIENT_SECRET,
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": _discord_redirect_uri(),
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=15,
+        )
+        token_resp.raise_for_status()
+        access_token = token_resp.json().get("access_token", "")
+        user_resp = requests.get(
+            DISCORD_USER_URL,
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=15,
+        )
+        user_resp.raise_for_status()
+        duser = user_resp.json()
+    except requests.RequestException as exc:
+        logger.warning("Discord login falhou: %s", exc)
+        return _auth_html({"ok": False, "detail": "Falha ao autenticar com o Discord."})
+
+    discord_id = str(duser.get("id") or "")
+    if not discord_id:
+        return _auth_html({"ok": False, "detail": "Discord nao retornou o usuario."})
+    display = str(duser.get("global_name") or duser.get("username") or "Leitor").strip() or "Leitor"
+    avatar_hash = duser.get("avatar")
+    avatar_url = (
+        f"https://cdn.discordapp.com/avatars/{discord_id}/{avatar_hash}.png?size=256"
+        if avatar_hash else ""
+    )
+
+    key = f"discord:{discord_id}"
+    now = time.time()
+    with _users_lock:
+        users = _load_json_store(USERS_STORE_PATH)
+        user = users.get(key)
+        if user and isinstance(user.get("profile_id"), str):
+            profile_id = user["profile_id"]
+            with _profiles_lock:
+                profiles = _load_profiles()
+                profile = profiles.get(profile_id)
+                if not isinstance(profile, dict):
+                    profile = None
+        else:
+            profile = None
+        if profile is None:
+            profile = {
+                "id": uuid4().hex,
+                "display_name": display,
+                "avatar_url": avatar_url,
+                "favorites": [],
+                "created_at": now,
+                "updated_at": now,
+            }
+            with _profiles_lock:
+                profiles = _load_profiles()
+                profiles[profile["id"]] = profile
+                _save_profiles(profiles)
+            users[key] = {
+                "username": display,
+                "provider": "discord",
+                "discord_id": discord_id,
+                "email": duser.get("email") or "",
+                "profile_id": profile["id"],
+                "created_at": now,
+            }
+            _save_json_store(USERS_STORE_PATH, users)
+
+    token = _issue_token(profile["id"], display)
+    return _auth_html({"ok": True, "token": token, "detail": f"Conectado como {display}!"})
 
 
 @app.get("/api/mangas")
@@ -2136,6 +5020,21 @@ def home_catalog(
     return HomeResponse(**_build_home_payload(genre, limit, offset))
 
 
+@app.get("/api/authors/lookup")
+def author_lookup(
+    name: str = Query(..., min_length=1, description="Nome do autor no catalogo."),
+    title: str = Query(default="", description="Titulo da obra para casar staff no AniList."),
+) -> dict:
+    try:
+        return _lookup_author_profile(name, title)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"Fontes de autor indisponiveis: {exc}") from exc
+
+
 def _matches_genre_factory(genre: str):
     genre_filter = normalize_match_text(genre)
 
@@ -2165,7 +5064,7 @@ def _build_search_payload(q: str, genre: str, limit: int, offset: int) -> dict:
     paged = items[offset : offset + limit]
     result = {**data, "items": paged, "sections": sections,
               "total": len(items), "limit": limit, "offset": offset}
-    _finalize_payload_descriptions(result)  # traducao so na busca
+    _finalize_payload_descriptions(result, cap=0)  # search rapido: sem traducao remota
     return result
 
 
@@ -2174,10 +5073,26 @@ def _build_home_payload(genre: str, limit: int, offset: int) -> dict:
     _matches_genre = _matches_genre_factory(genre)
 
     data = _build_catalog(limit=max(limit + offset, limit))
-    items = [it for it in (data.get("items") or []) if _matches_genre(it) and _is_home_ready(it)]
-    sections_src = data.get("sections") or [{"title": "Destaques", "items": items}]
+    sections_src = _dedupe_cross_source_sections(
+        data.get("sections") or [{"title": "Destaques", "items": data.get("items") or []}]
+    )
+    items: list[dict] = []
+    seen: set[str] = set()
+    pools = [data.get("items") or []]
+    pools.extend(section.get("items") or [] for section in sections_src)
+    for pool in pools:
+        for item in pool:
+            if not _matches_genre(item) or not _is_home_ready(item):
+                continue
+            identity = _canonical_title_identity(str(item.get("title") or "")) or str(item.get("source_url") or "")
+            if not identity or identity in seen:
+                continue
+            seen.add(identity)
+            items.append(item)
 
-    paged = items[offset : offset + limit]
+    preferred_items = [_preferred_home_source(item) for item in items]
+    chapter_audit_running = _schedule_home_chapter_audit(preferred_items)
+    paged = preferred_items[offset : offset + limit]
     slim_items = [_home_item(it) for it in paged]
     slim_sections = []
     for sec in sections_src:
@@ -2200,14 +5115,21 @@ def _build_home_payload(genre: str, limit: int, offset: int) -> dict:
         "offset": offset,
         "sources": data.get("sources") or [],
         "cached": data.get("cached", False),
-        "refreshing": data.get("refreshing", False),
+        "refreshing": bool(data.get("refreshing", False) or chapter_audit_running),
     }
 
 
 def _find_catalog_item(source_url: str) -> dict | None:
     """Acha o item completo do catalogo (com descriptions_map/genres/autores) pelo source_url."""
+    global catalog_cache
     source_url = str(source_url or "").strip()
-    if not source_url or catalog_cache is None:
+    if not source_url:
+        return None
+    if catalog_cache is None:
+        snapshot = _read_catalog_snapshot()
+        if snapshot:
+            catalog_cache = CacheEntry(time.time(), snapshot)
+    if catalog_cache is None:
         return None
     data = catalog_cache.data or {}
     pools = [data.get("items") or []]
@@ -2220,7 +5142,32 @@ def _find_catalog_item(source_url: str) -> dict | None:
     return None
 
 
-def _build_manga_meta(item: dict | None, source_url: str) -> dict:
+def _manga_meta_payload(enriched: dict) -> dict:
+    return {
+        "description": enriched.get("description") or "",
+        "descriptions": enriched.get("descriptions") or [],
+        "cover_path": enriched.get("cover_path") or "",
+        "cover_url": enriched.get("cover_url") or "",
+        "cover_fallbacks": enriched.get("cover_fallbacks") or [],
+        "cover_original_url": enriched.get("cover_original_url") or "",
+        "cover_original_fallbacks": enriched.get("cover_original_fallbacks") or [],
+        "genres": enriched.get("genres") or [],
+        "authors": enriched.get("authors") or [],
+        "status": enriched.get("status") or "",
+        "rating": enriched.get("rating"),
+        "chapter_languages": enriched.get("chapter_languages") or [],
+        "alternative_titles": enriched.get("alternative_titles") or [],
+        "mangaupdates_url": enriched.get("mangaupdates_url") or "",
+    }
+
+
+def _build_manga_meta_fast(item: dict | None) -> dict:
+    enriched = dict(item or {})
+    _strip_descriptions_map(enriched)
+    return _manga_meta_payload(enriched)
+
+
+def _build_manga_meta(item: dict | None, source_url: str, title: str = "") -> dict:
     """Metadados ricos p/ o painel de detalhe: sinopse multi-idioma, generos,
     autores, status, rating e idiomas de capitulo. Vem do catalogo (preferido)
     ou, em ultimo caso, de uma consulta de metadata externa best-effort.
@@ -2228,6 +5175,32 @@ def _build_manga_meta(item: dict | None, source_url: str) -> dict:
     enriched: dict | None = None
     if item:
         enriched = dict(item)
+        if source_url and not _item_has_cover(enriched):
+            try:
+                md = reader.manga_metadata(source_url, include_chapters=False) or {}
+                mg = md.get("manga") or {}
+                poster = str(mg.get("poster") or "").strip()
+                if _is_remote_image_url(poster):
+                    enriched["cover_original_url"] = poster
+                    enriched.update(_refresh_cover_fields(enriched))
+                if mg.get("description") and not enriched.get("description"):
+                    enriched["description"] = mg["description"]
+                if mg.get("genres") and not enriched.get("genres"):
+                    enriched["genres"] = mg["genres"]
+                if mg.get("authors") and not enriched.get("authors"):
+                    enriched["authors"] = mg["authors"]
+                if md.get("available_translated_languages") and not enriched.get("chapter_languages"):
+                    enriched["chapter_languages"] = [
+                        str(l).lower() for l in (md.get("available_translated_languages") or [])
+                    ]
+            except Exception:
+                pass
+        if not _item_has_cover(enriched):
+            recovered = _recover_cover_url(str(enriched.get("title") or title or ""))
+            if _is_remote_image_url(recovered):
+                enriched["cover_original_url"] = recovered
+                enriched.update(_refresh_cover_fields(enriched))
+        _complete_with_mangaupdates(enriched, str(enriched.get("title") or title or ""))
         _finalize_descriptions(enriched)  # descriptions_map -> descriptions[] (PT/EN/...) + traducao
     else:
         try:
@@ -2246,19 +5219,50 @@ def _build_manga_meta(item: dict | None, source_url: str) -> dict:
                 "chapter_languages": [str(l).lower() for l in (md.get("available_translated_languages") or [])],
                 "alternative_titles": mg.get("alternative_titles") or [],
             }
+            poster = str(mg.get("poster") or "").strip()
+            if _is_remote_image_url(poster):
+                enriched["cover_original_url"] = poster
+                enriched.update(_refresh_cover_fields(enriched))
+            if not _item_has_cover(enriched):
+                recovered = _recover_cover_url(str(title or mg.get("title") or ""))
+                if _is_remote_image_url(recovered):
+                    enriched["cover_original_url"] = recovered
+                    enriched.update(_refresh_cover_fields(enriched))
+            _complete_with_mangaupdates(enriched, str(title or mg.get("title") or ""))
             _finalize_descriptions(enriched)
         except Exception:
-            return {}
-    return {
-        "description": enriched.get("description") or "",
-        "descriptions": enriched.get("descriptions") or [],
-        "genres": enriched.get("genres") or [],
-        "authors": enriched.get("authors") or [],
-        "status": enriched.get("status") or "",
-        "rating": enriched.get("rating"),
-        "chapter_languages": enriched.get("chapter_languages") or [],
-        "alternative_titles": enriched.get("alternative_titles") or [],
-    }
+            enriched = {
+                "description": "",
+                "descriptions_map": {},
+                "genres": [],
+                "authors": [],
+                "status": "",
+                "rating": None,
+                "chapter_languages": [],
+                "alternative_titles": [],
+            }
+            _complete_with_mangaupdates(enriched, title)
+            _finalize_descriptions(enriched)
+    return _manga_meta_payload(enriched)
+
+
+@app.get("/api/manga-meta")
+def manga_meta(
+    source_url: str = Query(..., description="URL ou source id da obra."),
+    title: str = Query(default=""),
+) -> dict:
+    source = unquote(source_url).strip()
+    if not source:
+        raise HTTPException(status_code=400, detail="source_url vazio.")
+    key = f"{source}|{normalize_match_text(title)}"
+    cached = manga_meta_cache.get(key)
+    if _cache_is_fresh(cached, MANGA_META_CACHE_TTL_SECONDS):
+        return copy.deepcopy(cached.data)
+
+    item = _find_catalog_item(source) or _current_source_item(title, source)
+    payload = _build_manga_meta(item, source, title)
+    manga_meta_cache[key] = CacheEntry(time.time(), copy.deepcopy(payload))
+    return payload
 
 
 @app.get("/api/chapters")
@@ -2277,45 +5281,93 @@ def list_chapters(
     # Auto-troca pra fonte PT-completa SÓ quando o usuario quer pt-br.
     # Pra EN/JP/etc, mantem a fonte (MangaDex) e puxa capitulos naquele idioma.
     if auto_source and title.strip() and requested_lang in ("", "pt-br", "pt"):
-        resolved_item = _resolve_best_source_for_title(title, source, lang)
+        resolved_item = _cached_source_resolution(title, source, lang)
+        if resolved_item is None and _cached_chapter_count(source, lang) > 0:
+            resolved_item = _current_source_item(title, source)
+            _schedule_source_resolution(title, source, lang)
+        elif resolved_item is None:
+            resolved_item = _resolve_best_source_for_title(title, source, lang)
         resolved_url = str((resolved_item or {}).get("source_url") or "").strip()
         if resolved_url:
             source = resolved_url
 
-    cache_key = f"{source}|{normalize_match_text(lang)}"
-    cached = chapters_cache.get(cache_key)
-    if _cache_is_fresh(cached, CHAPTERS_DISK_TTL_SECONDS):
-        payload = dict(cached.data)
-        payload["cached"] = True
-    else:
-        # MISS: tenta a fonte externa com RETRY+backoff+UA rotation.
-        try:
-            payload = _resilient_list_chapters(source, lang)
-            chapters_cache[cache_key] = CacheEntry(time.time(), dict(payload))
-            _save_chapters_snapshot()
-            payload["cached"] = False
-        except Exception as exc:
-            # ULTIMO RECURSO: se existe cache local (mesmo VELHO), serve ele e
-            # nao trava o front. So estoura 502 se nunca tivermos cacheado.
-            if cached is not None and isinstance(cached.data, dict) and cached.data:
-                logger.warning(
-                    "Fonte externa indisponivel p/ %s apos %d tentativas (%s); "
-                    "servindo cache STALE.", source, CHAPTERS_FETCH_ATTEMPTS, exc,
-                )
-                payload = dict(cached.data)
-                payload["cached"] = True
-                payload["stale"] = True
+    preferred_source = source
+    fallback_source = (
+        ONE_PIECE_MANGALIVRE_URL
+        if reader._is_pieceproject_source(preferred_source)
+        else ""
+    )
+    fallback_reason = ""
+    outage = source_outage_cache.get(preferred_source)
+    if fallback_source and _cache_is_fresh(outage, PIECEPROJECT_OUTAGE_TTL_SECONDS):
+        source = fallback_source
+        fallback_reason = str((outage.data if outage else {}).get("reason") or "piecePROJECT indisponivel")
+
+    try:
+        payload = _load_chapters_source_payload(source, lang)
+    except Exception as exc:
+        source_outage_cache[source] = CacheEntry(time.time(), {"reason": str(exc)})
+        chapter_audit_failures[source] = CacheEntry(time.time(), {"error": str(exc)})
+        source_resolution_cache.pop(_source_resolution_key(title, requested_source, lang), None)
+        if fallback_source and source != fallback_source:
+            source_outage_cache[preferred_source] = CacheEntry(time.time(), {"reason": str(exc)})
+            source = fallback_source
+            fallback_reason = str(exc)
+            try:
+                payload = _load_chapters_source_payload(source, lang)
+            except Exception as fallback_exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"piecePROJECT: {exc}; MangaLivre: {fallback_exc}",
+                ) from fallback_exc
+        elif title.strip():
+            # Fonte resolvida falhou (ex: yumo sem API key). Tenta achar fonte
+            # alternativa via alt titles do MangaDex ou busca direta pelo titulo.
+            alt_source = _fallback_source_via_alt_titles(title, requested_source, source, lang)
+            if alt_source:
+                fallback_reason = str(exc)
+                source = alt_source
+                try:
+                    payload = _load_chapters_source_payload(source, lang)
+                    chapter_audit_failures.pop(source, None)
+                    alt_item = _current_source_item(title, source)
+                    if alt_item:
+                        source_resolution_cache[_source_resolution_key(title, requested_source, lang)] = CacheEntry(
+                            time.time(),
+                            {"item": alt_item},
+                        )
+                except Exception as fallback_exc:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"Fonte primaria ({exc}); fallback ({fallback_exc})",
+                    ) from fallback_exc
             else:
                 raise HTTPException(status_code=502, detail=str(exc)) from exc
+        else:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+    else:
+        source_outage_cache.pop(source, None)
+        chapter_audit_failures.pop(source, None)
+
+    if fallback_reason:
+        payload["fallback"] = {
+            "from": preferred_source,
+            "to": source,
+            "reason": fallback_reason,
+        }
+    payload["preferred_source_url"] = preferred_source
+    if fallback_source:
+        payload["fallback_source_url"] = fallback_source
     payload["requested_source_url"] = requested_source
     payload["resolved_source_url"] = source
-    if resolved_item:
-        payload["resolved_source"] = _source_label(payload.get("provider") or resolved_item.get("provider"))
+    payload["resolved_source"] = _source_label(
+        payload.get("provider") or (resolved_item or {}).get("provider")
+    )
 
     # Metadados completos da obra (sinopse multi-idioma, generos, autores, status,
     # idiomas de capitulo) p/ o painel de detalhe — sem inchar a LISTA da home.
-    meta_item = resolved_item or _find_catalog_item(source) or _find_catalog_item(requested_source)
-    payload["manga"] = _build_manga_meta(meta_item, source)
+    meta_item = _find_catalog_item(source) or _find_catalog_item(requested_source) or resolved_item
+    payload["manga"] = _build_manga_meta_fast(meta_item)
     return payload
 
 
@@ -2323,29 +5375,216 @@ def _reader_image_url(index: int) -> str:
     return f"/api/reader-image/{index}?v={int(time.time())}"
 
 
+def _chapter_payload_cache_key(source: str, lang: str) -> str:
+    return f"{source.strip()}|{normalize_match_text(lang)}"
+
+
+def _cached_open_chapter(source: str, lang: str) -> dict | None:
+    key = _chapter_payload_cache_key(source, lang)
+    with _chapter_payload_cache_lock:
+        entry = chapter_payload_cache.get(key)
+        if not _cache_is_fresh(entry, CHAPTER_PAYLOAD_CACHE_TTL_SECONDS):
+            return None
+        return copy.deepcopy(entry.data)
+
+
+def _store_open_chapter(source: str, lang: str, payload: dict) -> None:
+    images = payload.get("images") or []
+    if payload.get("mode") != "text" and (
+        not images
+        or not all(_is_remote_image_url(str(image.get("source_url") or "")) for image in images)
+    ):
+        return
+    key = _chapter_payload_cache_key(source, lang)
+    with _chapter_payload_cache_lock:
+        chapter_payload_cache[key] = CacheEntry(time.time(), copy.deepcopy(payload))
+
+
+def _cached_chapter_neighbors(
+    manga_source: str,
+    lang: str,
+    current_url: str,
+    chapter_number: str,
+) -> tuple[str | None, str | None]:
+    payloads: list[tuple[dict, bool]] = []
+    direct = _cached_chapters_payload(manga_source, lang) if manga_source else None
+    if direct:
+        payloads.append((direct, True))
+    with _chapters_cache_lock:
+        cached_entries = list(chapters_cache.values())
+    for entry in cached_entries:
+        if isinstance(entry.data, dict) and entry.data is not direct:
+            payloads.append((entry.data, False))
+
+    wanted_number = _number_value(chapter_number)
+    for payload, allow_number_match in payloads:
+        chapters = [chapter for chapter in payload.get("chapters") or [] if chapter.get("url")]
+        if not chapters:
+            continue
+        current = next(
+            (
+                chapter for chapter in chapters
+                if str(chapter.get("url") or "").rstrip("/") == current_url.rstrip("/")
+            ),
+            None,
+        )
+        if current is None and allow_number_match and wanted_number is not None:
+            current = next(
+                (
+                    chapter for chapter in chapters
+                    if _number_value(chapter.get("number")) is not None
+                    and abs(float(chapter["number"]) - wanted_number) < 0.0001
+                ),
+                None,
+            )
+        if current is None:
+            continue
+        ordered = sorted(
+            chapters,
+            key=lambda chapter: (
+                _number_value(chapter.get("number")) is None,
+                _number_value(chapter.get("number")) or 0.0,
+            ),
+        )
+        index = ordered.index(current)
+        previous_url = str(ordered[index - 1].get("url") or "") if index > 0 else None
+        next_url = str(ordered[index + 1].get("url") or "") if index + 1 < len(ordered) else None
+        return previous_url or None, next_url or None
+    return None, None
+
+
+def _apply_cached_chapter_neighbors(
+    payload: dict,
+    manga_source: str,
+    lang: str,
+    current_url: str,
+    chapter_number: str,
+) -> None:
+    previous_url, next_url = _cached_chapter_neighbors(
+        manga_source,
+        lang,
+        current_url,
+        chapter_number,
+    )
+    if previous_url or next_url:
+        payload["previous"] = previous_url
+        payload["next"] = next_url
+        chapter = payload.get("chapter")
+        if isinstance(chapter, dict):
+            chapter["previous"] = previous_url
+            chapter["next"] = next_url
+
+
 @app.get("/api/chapter")
 def open_chapter(
     source_url: str = Query(..., description="URL do capitulo."),
     lang: str = Query(default="pt-br"),
+    fallback_source_url: str = Query(default="", description="Fonte original para fallback."),
+    chapter_number: str = Query(default="", description="Numero do capitulo para fallback."),
+    title: str = Query(default="", description="Titulo da obra p/ achar fonte alternativa quando a fonte cai."),
 ) -> dict:
     source = unquote(source_url).strip()
     if not source:
         raise HTTPException(status_code=400, detail="source_url vazio.")
-    try:
-        payload = reader.chapter_metadata(
-            source,
-            cache_pages=False,
-            include_source_urls=True,
+    pieceproject_source = reader._is_pieceproject_source(source)
+    manga_source = unquote(fallback_source_url or "").strip()
+    if not manga_source:
+        mangasbrasuka_parts = reader._mangasbrasuka_chapter_parts(source)
+        if mangasbrasuka_parts:
+            manga_source = reader._mangasbrasuka_manga_url(mangasbrasuka_parts[0])
+        elif pieceproject_source:
+            manga_source = ONE_PIECE_PIECEPROJECT_URL
+
+    payload = _cached_open_chapter(source, lang)
+    if payload is None:
+        try:
+            payload = reader.chapter_metadata(
+                source,
+                cache_pages=False,
+                include_source_urls=True,
+                include_neighbors=False,
+            )
+        except Exception as exc:
+            wanted = chapter_number.strip() or _yumo_chapter_number(source, lang)
+            if pieceproject_source and not wanted:
+                wanted = reader._pieceproject_chapter_number_from_source(source) or ""
+            if pieceproject_source:
+                effective_fallback = ONE_PIECE_MANGALIVRE_URL
+            else:
+                # Fonte caiu (ex.: mangalivre.blog fora do ar): marca outage e
+                # resolve outra fonte PT-completa (mangasbrasuka/yumo/sakura) com a
+                # MESMA obra, abrindo o capitulo equivalente por numero.
+                for outaged in {source, manga_source}:
+                    if outaged:
+                        source_outage_cache[outaged] = CacheEntry(time.time(), {"reason": str(exc)})
+                effective_fallback = ""
+                if title.strip():
+                    failed_ref = manga_source or source
+                    alt_source = _fallback_source_via_alt_titles(
+                        title.strip(), failed_ref, failed_ref, lang
+                    )
+                    if alt_source and alt_source not in {source, manga_source}:
+                        effective_fallback = alt_source
+                if not effective_fallback:
+                    effective_fallback = fallback_source_url
+            try:
+                payload = _open_fallback_chapter(
+                    effective_fallback,
+                    lang,
+                    wanted,
+                    source,
+                    exc,
+                )
+            except Exception:
+                payload = None
+            if payload is None:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+            if pieceproject_source and "encaminhou este capitulo" not in str(exc):
+                source_outage_cache[ONE_PIECE_PIECEPROJECT_URL] = CacheEntry(
+                    time.time(),
+                    {"reason": str(exc)},
+                )
+            # Fallback bem-sucedido p/ outra fonte: fixa a resolucao p/ que a LISTA
+            # de capitulos passe a vir da fonte nova nas proximas consultas.
+            elif not pieceproject_source and title.strip():
+                resolved_alt = str(payload.get("fallback", {}).get("to") or "").strip()
+                alt_item = _current_source_item(title.strip(), resolved_alt) if resolved_alt else None
+                if alt_item:
+                    source_resolution_cache[_source_resolution_key(title.strip(), manga_source or source, lang)] = CacheEntry(
+                        time.time(), {"item": alt_item}
+                    )
+
+        effective_number = str(
+            chapter_number
+            or payload.get("number_text")
+            or payload.get("number")
+            or (payload.get("chapter") or {}).get("number_text")
+            or (payload.get("chapter") or {}).get("number")
+            or ""
         )
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        _apply_cached_chapter_neighbors(
+            payload,
+            manga_source,
+            lang,
+            source,
+            effective_number,
+        )
+        _store_open_chapter(source, lang, payload)
+
+    if pieceproject_source and payload.get("provider") == "pieceproject":
+        source_outage_cache.pop(ONE_PIECE_PIECEPROJECT_URL, None)
 
     images = []
     for image in payload.get("images") or []:
         image = dict(image)
         source_image_url = str(image.get("source_url") or "").strip()
         if _is_remote_image_url(source_image_url):
-            image["src"] = _proxy_image_url(source_image_url)
+            # CDNs sem bloqueio de hotlink vao direto ao browser: HTTP/2, cache
+            # proprio e zero ocupacao dos workers do FastAPI.
+            if _can_load_image_directly(source_image_url):
+                image["src"] = source_image_url
+            else:
+                image["src"] = _proxy_image_url(source_image_url)
         else:
             image["src"] = _reader_image_url(int(image.get("index") or len(images) + 1))
         images.append(image)

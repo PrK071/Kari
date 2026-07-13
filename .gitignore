@@ -100,6 +100,10 @@ cf_clearance*
 .tmp-sakura-test/
 .cache/
 
+# Artefatos locais de debug e perfis de usuario
+frontend/debug_*.html
+backend/static/profiles/
+
 # OS / IDE
 .DS_Store
 Thumbs.db

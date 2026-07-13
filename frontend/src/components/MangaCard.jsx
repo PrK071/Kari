@@ -1,4 +1,5 @@
-import { memo, useEffect, useMemo, useState } from "react"
+import { memo, useEffect, useMemo, useRef, useState } from "react"
+import { BookOpen, Clock3, Globe2 } from "lucide-react"
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000"
 const PLACEHOLDER_URL = `${API_BASE_URL}/static/placeholder.svg`
@@ -8,54 +9,31 @@ function resolveImageUrl(url) {
   return url.startsWith("/") ? `${API_BASE_URL}${url}` : url
 }
 
-function relativeTime(iso) {
-  if (!iso) return ""
-  const then = new Date(iso).getTime()
-  if (Number.isNaN(then)) return ""
-  const diff = Math.max(0, Date.now() - then)
-  const min = Math.floor(diff / 60000)
-  if (min < 60) return `há ${min || 1}min`
-  const h = Math.floor(min / 60)
-  if (h < 24) return `há ${h}h`
-  const d = Math.floor(h / 24)
-  if (d < 30) return `há ${d}d`
-  const mo = Math.floor(d / 30)
-  if (mo < 12) return `há ${mo}mês`
-  return `há ${Math.floor(mo / 12)}a`
-}
-
-function Badge({ children }) {
-  return (
-    <span className="rounded-full border border-line bg-soft/80 px-2 py-0.5 text-[11px] text-muted backdrop-blur">
-      {children}
-    </span>
-  )
-}
-
 export function MangaCardSkeleton() {
   return (
-    <article className="h-[430px] overflow-hidden rounded-lg border border-line bg-panel">
-      <div className="h-[300px] animate-pulse bg-soft" />
-      <div className="p-3">
-        <div className="h-4 w-4/5 animate-pulse rounded bg-soft" />
-        <div className="mt-2 h-3 w-full animate-pulse rounded bg-soft" />
-        <div className="mt-2 h-3 w-5/6 animate-pulse rounded bg-soft" />
-        <div className="mt-3 flex gap-2">
-          <div className="h-5 w-14 animate-pulse rounded-full bg-soft" />
-          <div className="h-5 w-16 animate-pulse rounded-full bg-soft" />
-        </div>
+    <div className="flex min-h-[156px] gap-3 rounded-md border border-line bg-panel p-3 shadow-card">
+      <div className="h-32 w-[92px] shrink-0 animate-pulse rounded bg-soft" />
+      <div className="flex-1 space-y-2 py-1">
+        <div className="h-4 w-3/4 animate-pulse rounded bg-soft" />
+        <div className="h-3 w-full animate-pulse rounded bg-soft" />
+        <div className="h-3 w-2/3 animate-pulse rounded bg-soft" />
       </div>
-    </article>
+    </div>
   )
 }
 
-function MangaCard({ manga, priority = false, onSelect }) {
+function MangaCard({ manga, priority = false, compact = false, onSelect }) {
   const [loaded, setLoaded] = useState(false)
   const [srcIndex, setSrcIndex] = useState(0)
   const [broken, setBroken] = useState(false)
+  const imageRef = useRef(null)
+  // Chave estavel das capas: o repoll da home recria o objeto `manga` (e o array
+  // cover_fallbacks) a cada 2.5s. Depender do array cru resetava o estado da
+  // imagem -> capa piscava. Uma string derivada so muda quando a capa muda.
+  const coverFallbacksKey = (manga.cover_fallbacks ?? []).join("|")
   const coverUrls = useMemo(
     () => [manga.cover_path, manga.cover_url, ...(manga.cover_fallbacks ?? [])].filter(Boolean),
-    [manga.cover_path, manga.cover_url, manga.cover_fallbacks],
+    [manga.cover_path, manga.cover_url, coverFallbacksKey],
   )
   const currentCover =
     !broken && srcIndex < coverUrls.length
@@ -64,90 +42,144 @@ function MangaCard({ manga, priority = false, onSelect }) {
 
   const handleCoverError = () => {
     if (srcIndex + 1 < coverUrls.length) {
-      setSrcIndex((index) => index + 1) // tenta proxima fonte de capa
+      setSrcIndex((index) => index + 1)
     } else if (!broken) {
-      setBroken(true) // sem mais fontes -> placeholder "Sem Capa"
+      setBroken(true)
     } else {
-      setLoaded(true) // ate o placeholder falhou: garante visivel (sem opacity-0)
+      setLoaded(true)
     }
   }
-  const chapterText = Number.isFinite(Number(manga.chapter_count))
-    ? `${manga.chapter_count} caps`
-    : manga.source
-  const ratingValue = Number(manga.rating)
-  const ratingText = Number.isFinite(ratingValue) && ratingValue > 0
-    ? ratingValue.toFixed(1)
-    : null
-  const authors = Array.isArray(manga.authors) ? manga.authors.filter(Boolean) : []
+
+  const chapters = (manga.chapter_preview ?? [])
+    .map((chapter) => String(chapter).trim())
+    .filter(Boolean)
 
   useEffect(() => {
     setLoaded(false)
     setSrcIndex(0)
     setBroken(false)
-  }, [manga.id, manga.cover_path, manga.cover_url])
+  }, [manga.id, manga.cover_path, manga.cover_url, coverFallbacksKey])
+
+  useEffect(() => {
+    const image = imageRef.current
+    if (image?.complete && image.naturalWidth > 0) {
+      setLoaded(true)
+    }
+  }, [currentCover])
 
   return (
-    <button
-      type="button"
-      onClick={() => onSelect?.(manga)}
-      className="group relative flex h-[430px] w-full flex-col overflow-hidden rounded-lg border border-line bg-panel text-left shadow-card transition-all duration-200 hover:-translate-y-1 hover:border-zinc-600 hover:shadow-glow focus:outline-none focus:ring-1 focus:ring-accent/60"
+    <div
+      className="group flex min-h-[156px] w-full gap-3 rounded-md border border-line/70 bg-panel/55 p-3 shadow-card backdrop-blur-md transition-colors duration-200 hover:border-emerald-300/45 hover:bg-soft/70"
     >
-      <div className="relative h-[300px] overflow-hidden">
-        {!loaded && <div className="absolute inset-0 animate-pulse bg-zinc-800" />}
+      {/* Cover thumbnail - clickable */}
+      <button
+        type="button"
+        onClick={() => onSelect?.(manga)}
+        className="relative h-32 w-[92px] shrink-0 overflow-hidden rounded bg-soft focus:outline-none focus:ring-1 focus:ring-emerald-200/70"
+      >
+        {!loaded && <div className="absolute inset-0 animate-pulse bg-zinc-700/70" />}
         <img
+          ref={imageRef}
           src={currentCover}
-          alt={`Capa de ${manga.title}`}
+          alt={manga.title}
           loading={priority ? "eager" : "lazy"}
           decoding="async"
-          fetchPriority={priority ? "high" : "low"}
+          fetchPriority={priority ? "high" : "auto"}
           draggable="false"
           onLoad={() => setLoaded(true)}
           onError={handleCoverError}
-          className={`h-full w-full object-cover transition duration-300 group-hover:scale-105 ${
-            loaded ? "opacity-100" : "opacity-0"
-          }`}
+          className={`h-full w-full object-cover transition ${loaded ? "opacity-100" : "opacity-0"}`}
         />
+      </button>
 
-        {/* gradiente pra fundir a capa no card */}
-        <div className="pointer-events-none absolute inset-x-0 bottom-0 h-2/3 bg-fade-app" />
-
-        {/* rating chip (accent neutro) */}
-        {ratingText && (
-          <span className="absolute right-2 top-2 rounded-md bg-app/80 px-2 py-0.5 text-[11px] font-bold text-accent ring-1 ring-line backdrop-blur">
-            ★ {ratingText}
-          </span>
-        )}
-
-        {/* titulo sobre a capa */}
-        <div className="absolute inset-x-0 bottom-0 p-3">
-          <h3 className="line-clamp-2 text-sm font-bold leading-5 text-zinc-50 drop-shadow">
+      {/* Info */}
+      <div className="flex min-w-0 flex-1 flex-col justify-between py-0.5">
+        <div className="min-w-0">
+          {/* Title - clickable */}
+          <button
+            type="button"
+            onClick={() => onSelect?.(manga)}
+            title={manga.title}
+            className="block w-full max-w-full truncate text-left text-[13px] font-bold text-zinc-100 transition hover:text-emerald-100 focus:outline-none"
+          >
             {manga.title}
-          </h3>
-          <p className="mt-0.5 text-[11px] text-accent-dim">{chapterText}</p>
-        </div>
-      </div>
+          </button>
 
-      <div className="flex flex-1 flex-col p-3">
-        {(manga.latest_chapter || manga.updated_at) && (
-          <p className="text-[11px] font-semibold text-accent-dim">
-            {manga.latest_chapter ? `Cap ${manga.latest_chapter}` : "Novo cap"}
-            {manga.updated_at ? ` · ${relativeTime(manga.updated_at)}` : ""}
-          </p>
-        )}
-        {authors.length > 0 && (
-          <p className="truncate text-xs text-zinc-500">{authors.slice(0, 2).join(", ")}</p>
-        )}
-        {manga.description && (
-          <p className="mt-1 line-clamp-2 text-xs leading-4 text-muted">{manga.description}</p>
-        )}
-        <div className="mt-auto flex gap-1.5 overflow-hidden pt-2">
-          {manga.genres?.slice(0, 2).map((genre) => (
-            <Badge key={genre}>{genre}</Badge>
-          ))}
+          {/* Chapter list - each line is individually hoverable */}
+          <div className="mt-2 space-y-0.5">
+            {chapters.length > 0 ? chapters.map((ch, i) => (
+              <button
+                key={i}
+                type="button"
+                onClick={() => onSelect?.(manga)}
+                className="manga-chapter-row flex w-full items-center gap-1.5 rounded px-0.5 py-0.5 text-left text-xs text-zinc-400 transition-colors hover:bg-emerald-300/5 hover:text-zinc-100"
+              >
+                <span className="text-[10px] text-zinc-600">▊</span>
+                <BookOpen size={12} strokeWidth={1.8} className="shrink-0 text-emerald-300/80" aria-hidden="true" />
+                <span className="truncate">{/^[\d]/.test(String(ch)) ? `Cap. ${ch}` : ch}</span>
+                {i === 0 && manga.updated_at && (
+                  <span className="ml-auto flex items-center gap-1 text-[10px] text-zinc-500">
+                    <Clock3 size={11} strokeWidth={1.8} aria-hidden="true" />
+                    {_relativeShort(manga.updated_at)}
+                  </span>
+                )}
+              </button>
+            )) : (
+              <p className={`px-0.5 py-0.5 text-xs ${manga.chapter_status === "unavailable" ? "text-red-300/75" : "text-zinc-600"}`}>
+                {manga.chapter_status === "unavailable"
+                  ? "Capitulos indisponiveis"
+                  : "Verificando capitulos..."}
+              </p>
+            )}
+          </div>
         </div>
+
+        {manga.source && (
+          <div className="mt-2 flex items-center justify-between gap-2 text-[10px] text-zinc-500">
+            <p className="truncate">{manga.source}</p>
+            <span className="flex shrink-0 items-center gap-1 uppercase">
+              <Globe2 size={11} strokeWidth={1.8} aria-hidden="true" />
+              {String(manga.chapter_languages?.[0] || manga.language || "PT").replace("pt-br", "PT")}
+            </span>
+          </div>
+        )}
       </div>
-    </button>
+    </div>
   )
 }
 
-export default memo(MangaCard)
+function _relativeShort(iso) {
+  if (!iso) return ""
+  const then = new Date(iso).getTime()
+  if (Number.isNaN(then)) return ""
+  const diff = Math.max(0, Date.now() - then)
+  const min = Math.floor(diff / 60000)
+  if (min < 60) return `${min || 1}m`
+  const h = Math.floor(min / 60)
+  if (h < 24) return `${h}h`
+  const d = Math.floor(h / 24)
+  return `${d}d`
+}
+
+export default memo(MangaCard, (prev, next) => {
+  // Evita re-render quando o repoll da home traz um objeto novo com o MESMO
+  // conteudo relevante (identidade nova de array/objeto nao deve repintar o card).
+  const a = prev.manga
+  const b = next.manga
+  return (
+    prev.priority === next.priority
+    && prev.compact === next.compact
+    && prev.onSelect === next.onSelect
+    && a.id === b.id
+    && a.title === b.title
+    && a.cover_path === b.cover_path
+    && a.cover_url === b.cover_url
+    && (a.cover_fallbacks ?? []).join("|") === (b.cover_fallbacks ?? []).join("|")
+    && a.source === b.source
+    && a.chapter_status === b.chapter_status
+    && a.updated_at === b.updated_at
+    && (a.chapter_preview ?? []).join("|") === (b.chapter_preview ?? []).join("|")
+    && (a.chapter_languages ?? []).join("|") === (b.chapter_languages ?? []).join("|")
+    && (a.language ?? "") === (b.language ?? "")
+  )
+})

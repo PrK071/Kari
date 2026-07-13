@@ -269,13 +269,29 @@ async def download_images(
     concurrency: int,
 ) -> list[DownloadedImage]:
     semaphore = asyncio.Semaphore(max(1, concurrency))
+    indexed_urls = list(enumerate(urls))
+    images_by_index: list[DownloadedImage | None] = [None] * len(indexed_urls)
+
+    async def fetch_indexed(source_index: int, url: str) -> None:
+        images_by_index[source_index] = await fetch_image(
+            session,
+            semaphore,
+            source_index,
+            url,
+            chapter_url,
+        )
+
     async with curl_requests.AsyncSession(impersonate="firefox") as session:
         tasks = [
-            fetch_image(session, semaphore, index, url, chapter_url)
-            for index, url in enumerate(urls)
+            fetch_indexed(index, url)
+            for index, url in indexed_urls
         ]
-        images = await asyncio.gather(*tasks)
-    return sorted(images, key=lambda image: image.source_index)
+        await asyncio.gather(*tasks)
+
+    missing = [index for index, image in enumerate(images_by_index) if image is None]
+    if missing:
+        raise RuntimeError(f"Downloads incompletos nos indices: {missing}")
+    return [image for image in images_by_index if image is not None]
 
 
 def chapter_output(root: Path, chapter_url: str) -> Path:

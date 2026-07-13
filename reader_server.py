@@ -54,6 +54,7 @@ class Chapter:
     number_text: str | None = None
     chapter_id: str | None = None
     title: str | None = None
+    external_url: str | None = None
 
 
 DEFAULT_HEADERS = {
@@ -148,7 +149,7 @@ MANGADEX_UPLOADS_URL = "https://uploads.mangadex.org"
 ANILIST_GRAPHQL_URL = "https://graphql.anilist.co"
 DEFAULT_READFULL_API_URL = "https://readfullapi.herokuapp.com"
 DEFAULT_NOVELTOON_BASE_URL = "https://noveltoon.mobi"
-DEFAULT_PIECEPROJECT_URL = "https://scan.onepieceproject.com.br/"
+DEFAULT_PIECEPROJECT_URL = "https://www.pieceproject.xyz/"
 DEFAULT_DRAGONTEA_BASE_URL = "https://dragontea.ink"
 DEFAULT_TOOMICS_BASE_URL = "https://global.toomics.com"
 DEFAULT_MANGAKATANA_BASE_URL = "https://mangakatana.com"
@@ -164,6 +165,9 @@ SAKURA_BRAVE_PATHS = (
     Path.home() / "AppData/Local/BraveSoftware/Brave-Browser/Application/brave.exe",
 )
 MANGALIVRE_CACHE_SECONDS = 900
+PIECEPROJECT_CACHE_SECONDS = 30 * 60
+PIECEPROJECT_MAX_VOLUME_PAGES = 20
+PIECEPROJECT_MIN_CHAPTERS = 1000
 DRAGONTEA_IMAGE_SELECTOR = ".reading-content .page-break img"
 TOOMICS_IMAGE_SELECTOR = "#viewer-img img, .viewer-imgs img"
 TOOMICS_COMPOSITE_IMAGES_PER_CHUNK = 16
@@ -943,6 +947,99 @@ class ChapterState:
     source_image_chunks: list[list[str]] = field(default_factory=list)
 
 
+class CatalogListingParser(HTMLParser):
+    VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+
+    def __init__(self, base_url: str, item_class_sets: tuple[frozenset[str], ...]) -> None:
+        super().__init__(convert_charrefs=True)
+        self.base_url = base_url
+        self.item_class_sets = item_class_sets
+        self.items: list[dict] = []
+        self.current: dict | None = None
+        self.stack: list[str] = []
+        self.anchor: dict | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        values = {str(key).lower(): str(value or "") for key, value in attrs}
+        classes = frozenset(values.get("class", "").split())
+        if self.current is None:
+            if not any(required.issubset(classes) for required in self.item_class_sets):
+                return
+            self.current = {"title": "", "url": "", "poster": "", "latest_chapter": "", "updated_at": ""}
+            self.stack = [tag]
+            return
+
+        if tag not in self.VOID_TAGS:
+            self.stack.append(tag)
+        if tag == "a":
+            self.anchor = {
+                "href": values.get("href", ""),
+                "title": values.get("title", ""),
+                "parts": [],
+            }
+        elif tag == "img" and not self.current.get("poster"):
+            src = (
+                values.get("data-src")
+                or values.get("data-lazy-src")
+                or values.get("data-original")
+                or values.get("src")
+            )
+            self.current["poster"] = normalize_image_url(src, self.base_url)
+        elif tag == "time" and values.get("datetime"):
+            self.current["updated_at"] = values["datetime"]
+
+    def handle_data(self, data: str) -> None:
+        if self.anchor is not None:
+            self.anchor["parts"].append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if self.current is None:
+            return
+        if tag == "a" and self.anchor is not None:
+            self._finish_anchor()
+        if tag in self.VOID_TAGS or not self.stack:
+            return
+        if self.stack[-1] == tag:
+            self.stack.pop()
+        elif tag in self.stack:
+            self.stack = self.stack[: len(self.stack) - 1 - self.stack[::-1].index(tag)]
+        if not self.stack:
+            self._finish_item()
+
+    def _finish_anchor(self) -> None:
+        anchor = self.anchor or {}
+        self.anchor = None
+        href = normalize_image_url(anchor.get("href"), self.base_url)
+        text = normalize_text(" ".join(anchor.get("parts") or []))
+        if not href or self.current is None:
+            return
+        path_parts = [part for part in urlparse(href).path.split("/") if part]
+        is_manga = len(path_parts) == 2 and path_parts[0].lower() == "manga"
+        if is_manga:
+            title = normalize_text(anchor.get("title") or text)
+            if title and (not self.current.get("title") or anchor.get("title")):
+                self.current["title"] = title
+                self.current["url"] = href
+            return
+        if "capitulo" in href.lower() or "chapter" in href.lower():
+            number = first_match(
+                r"(?:capitulo|cap|chapter)\s*([\d.]+)",
+                normalize_match_text(text),
+                re.IGNORECASE,
+            )
+            if number and not self.current.get("latest_chapter"):
+                self.current["latest_chapter"] = number
+
+    def _finish_item(self) -> None:
+        if self.current and self.current.get("title") and self.current.get("url"):
+            self.items.append(self.current)
+        self.current = None
+        self.stack = []
+        self.anchor = None
+
+
 class TextExtractor(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -1205,6 +1302,7 @@ class MangaReader:
         self._toomics_chapters_cache: dict[tuple[str, str, str], tuple[float, list[Chapter], dict]] = {}
         self._mangalivre_chapters_cache: dict[str, tuple[float, list[Chapter]]] = {}
         self._mangasbrasuka_page_images_cache: dict[str, tuple[float, list[str]]] = {}
+        self._mangasbrasuka_chapter_images_cache: dict[str, tuple[float, list[str]]] = {}
         self._mangadex_tag_ids_cache: dict[str, str] | None = None
         self._cloudscraper: cloudscraper.CloudScraper | None = None
         self._sakura_browser_lock = threading.RLock()
@@ -1275,6 +1373,8 @@ class MangaReader:
             return total
 
         total = count(lang)
+        if total == 0 and lang:
+            total = count("")
         if total == 0 and lang != "en":
             total = count("en")
         return total
@@ -1702,6 +1802,13 @@ class MangaReader:
 
         def collect(page):
             page.wait_for_selector("img.capa, .chapter-list", state="attached", timeout=20_000)
+            # Os capitulos entram no .chapter-list via XHR DEPOIS do container
+            # renderizar. Sem esperar os itens, o evaluate rodava cedo e voltava 0
+            # capitulos. Tolerante a timeout p/ obras realmente sem capitulos.
+            try:
+                page.wait_for_selector(".chapter-item[data-url]", state="attached", timeout=15_000)
+            except PlaywrightTimeoutError:
+                pass
             if page.locator(".chapter-item[data-url]").count() > 0:
                 self._sakura_load_all_chapters(page)
             return page.evaluate(
@@ -2816,6 +2923,39 @@ class MangaReader:
             "results": results,
         }
 
+    def catalog_mangalivre(self, limit: int = 24) -> dict:
+        url = f"{self.mangalivre_base_url}/manga/?status=&type=&order=update"
+        html = self._mangalivre_get_html(url, self.mangalivre_base_url)
+        parser = CatalogListingParser(
+            self.mangalivre_base_url,
+            (frozenset({"manga-card-modern"}),),
+        )
+        parser.feed(html)
+        results: list[dict] = []
+        seen: set[str] = set()
+        for raw in parser.items:
+            source_url = str(raw.get("url") or "")
+            slug = self._mangalivre_manga_slug_from_source(source_url) or ""
+            if not slug or slug in seen:
+                continue
+            seen.add(slug)
+            results.append({
+                **raw,
+                "id": slug,
+                "source": "mangalivre",
+                "provider": "mangalivre",
+                "language": "pt-br",
+            })
+            if len(results) >= limit:
+                break
+        return {
+            "ok": True,
+            "provider": "mangalivre",
+            "api_url": self.mangalivre_base_url,
+            "count": len(results),
+            "results": results,
+        }
+
     def _mangalivre_extract_metadata(self, source_url: str, html: str) -> dict:
         slug = self._mangalivre_manga_slug_from_source(source_url) or slug_from_url(source_url) or "mangalivre"
         title = text_from_html(
@@ -3420,12 +3560,16 @@ class MangaReader:
 
     # ------------------------------------------------------------------
     # MangasBrasuka (mangasbrasuka.com.br) — WordPress Madara
-    # Cada "capitulo" no site = 1 pagina do manga.
-    # Imagens ficam no HTML dentro de um link de tracking:
+    # O HTML pode listar so a primeira pagina; demais paginas ficam como arquivos
+    # numericos irmaos na mesma pasta CDN (01.webp, 02.webp, ...).
+    # Primeira imagem fica no HTML dentro de um link de tracking:
     #   <a href="https://redenovax.com/jump/...?a=<URL_REAL>&...">
     # ------------------------------------------------------------------
 
     MANGASBRASUKA_BASE = "https://mangasbrasuka.com.br"
+    MANGASBRASUKA_SEQUENCE_MAX_IMAGES = 220
+    MANGASBRASUKA_SEQUENCE_MISS_LIMIT = 5
+    MANGASBRASUKA_SEQUENCE_BATCH = 24
 
     def _is_mangasbrasuka_source(self, source_url: str) -> bool:
         return bool(
@@ -3478,7 +3622,7 @@ class MangaReader:
         if match:
             return match.group(1), match.group(2)
         match = re.search(
-            r"mangasbrasuka\.com\.br/manga/([^/?#]+)/(capitulo-[\d.]+)/?",
+            r"mangasbrasuka\.com\.br/manga/([^/?#]+)/(?:[a-z]{2}(?:-[a-z]{2})?/)?(capitulo-\d+(?:[.-]\d+)?)/?",
             source_url,
             re.IGNORECASE,
         )
@@ -3488,11 +3632,13 @@ class MangaReader:
         return f"{self.MANGASBRASUKA_BASE}/manga/{slug.strip('/')}/"
 
     def _mangasbrasuka_chapter_url(self, manga_slug: str, chapter_slug: str) -> str:
-        return f"{self.MANGASBRASUKA_BASE}/manga/{manga_slug.strip('/')}/{chapter_slug.strip('/')}/"
+        return f"{self.MANGASBRASUKA_BASE}/manga/{manga_slug.strip('/')}/pt-br/{chapter_slug.strip('/')}/"
 
     def _mangasbrasuka_chapter_number(self, chapter_slug: str) -> str | None:
-        match = re.search(r"(\d+(?:\.\d+)?)$", chapter_slug)
-        return match.group(1) if match else None
+        match = re.search(r"capitulo-(\d+)(?:[.-](\d+))?$", chapter_slug or "", re.IGNORECASE)
+        if not match:
+            return None
+        return f"{match.group(1)}.{match.group(2)}" if match.group(2) else match.group(1)
 
     def _mangasbrasuka_page_ref(self, chapter_url: str) -> str:
         return f"mangasbrasuka-page://{quote(chapter_url, safe='')}"
@@ -3596,18 +3742,170 @@ class MangaReader:
         )
         return normalize_image_url(m2.group(0)) if m2 else None
 
-    def _mangasbrasuka_fetch_chapter_list_ajax(self, manga_url: str, manga_id: str) -> list[Chapter]:
-        """Busca lista completa de capitulos via AJAX do Madara (manga_get_chapters)."""
-        ajax_url = self.MANGASBRASUKA_BASE + "/wp-admin/admin-ajax.php"
+    def _mangasbrasuka_numeric_image_template(
+        self,
+        image_url: str,
+    ) -> tuple[str, str, int, str, int] | None:
+        clean_url = str(image_url or "").split("?", 1)[0].strip()
+        if "/" not in clean_url:
+            return None
+        folder, filename = clean_url.rsplit("/", 1)
+        match = re.match(
+            r"^(.*?)(\d+)(\.(?:avif|gif|jpe?g|png|webp))$",
+            filename,
+            re.IGNORECASE,
+        )
+        if not match:
+            return None
+        filename_prefix, number_text, extension = match.groups()
+        return folder + "/", filename_prefix, int(number_text), extension, len(number_text)
+
+    def _mangasbrasuka_image_url_exists(self, image_url: str, referer: str) -> bool:
+        headers = {
+            **DEFAULT_HEADERS,
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Referer": referer,
+        }
+        response: requests.Response | None = None
+        try:
+            if curl_requests is not None:
+                response = curl_requests.head(
+                    image_url,
+                    headers=headers,
+                    timeout=min(max(float(self.args.timeout), 8.0), 12.0),
+                    allow_redirects=True,
+                    impersonate="chrome",
+                )
+            else:
+                response = requests.head(
+                    image_url,
+                    headers=headers,
+                    timeout=(4.0, min(max(float(self.args.timeout), 8.0), 12.0)),
+                    allow_redirects=True,
+                )
+            content_type = str(response.headers.get("content-type") or "").lower()
+            return (
+                response.status_code in {200, 206}
+                and "xml" not in content_type
+                and "html" not in content_type
+            )
+        except Exception:
+            try:
+                if response is not None:
+                    response.close()
+                if curl_requests is not None:
+                    response = curl_requests.get(
+                        image_url,
+                        headers={**headers, "Range": "bytes=0-0"},
+                        timeout=min(max(float(self.args.timeout), 8.0), 12.0),
+                        stream=True,
+                        impersonate="chrome",
+                    )
+                else:
+                    response = requests.get(
+                        image_url,
+                        headers={**headers, "Range": "bytes=0-0"},
+                        timeout=(4.0, min(max(float(self.args.timeout), 8.0), 12.0)),
+                        stream=True,
+                    )
+                content_type = str(response.headers.get("content-type") or "").lower()
+                return (
+                    response.status_code in {200, 206}
+                    and "xml" not in content_type
+                    and "html" not in content_type
+                )
+            except Exception:
+                return False
+        finally:
+            if response is not None:
+                response.close()
+
+    def _mangasbrasuka_expand_numeric_image_sequence(self, image_url: str, referer: str) -> list[str]:
+        template = self._mangasbrasuka_numeric_image_template(image_url)
+        if not template:
+            return [image_url]
+
+        cached = self._mangasbrasuka_chapter_images_cache.get(image_url)
+        if cached and time.time() - cached[0] < MANGALIVRE_CACHE_SECONDS:
+            return list(cached[1])
+
+        folder, filename_prefix, first_number, extension, width = template
+
+        def make_url(number: int) -> str:
+            return f"{folder}{filename_prefix}{number:0{width}d}{extension}"
+
+        def probe(number: int) -> tuple[int, str | None]:
+            candidate = make_url(number)
+            if number == first_number:
+                return number, candidate
+            return number, candidate if self._mangasbrasuka_image_url_exists(candidate, referer) else None
+
+        hits: dict[int, str] = {}
+        last_hit = 0
+        max_images = self.MANGASBRASUKA_SEQUENCE_MAX_IMAGES
+        batch_size = self.MANGASBRASUKA_SEQUENCE_BATCH
+        miss_limit = self.MANGASBRASUKA_SEQUENCE_MISS_LIMIT
+
+        for batch_start in range(1, max_images + 1, batch_size):
+            batch_end = min(max_images, batch_start + batch_size - 1)
+            numbers = list(range(batch_start, batch_end + 1))
+            with ThreadPoolExecutor(max_workers=min(24, len(numbers))) as executor:
+                futures = [executor.submit(probe, number) for number in numbers]
+                for future in as_completed(futures):
+                    number, found_url = future.result()
+                    if found_url:
+                        hits[number] = found_url
+                        if number > last_hit:
+                            last_hit = number
+
+            tail_misses = batch_end - last_hit if last_hit else 0
+            if last_hit and (tail_misses >= miss_limit or (last_hit >= 30 and tail_misses >= 3)):
+                break
+
+        image_urls = [hits[number] for number in sorted(hits)]
+        image_urls = dedupe_image_urls(image_urls)
+        if not image_urls:
+            image_urls = [image_url]
+        self._mangasbrasuka_chapter_images_cache[image_url] = (time.time(), image_urls)
+        return list(image_urls)
+
+    def _mangasbrasuka_expand_chapter_images(self, image_urls: list[str], referer: str) -> list[str]:
+        if not image_urls:
+            return []
+        if len(image_urls) > 1:
+            return dedupe_image_urls(image_urls)
+        expanded: list[str] = []
+        for image_url in image_urls:
+            expanded.extend(self._mangasbrasuka_expand_numeric_image_sequence(image_url, referer))
+        return dedupe_image_urls(expanded)
+
+    def _mangasbrasuka_fetch_chapter_list_ajax(self, manga_url: str, manga_id: str | None = None) -> list[Chapter]:
+        """Busca lista completa de capitulos via AJAX do Madara."""
         headers = {
             **self._mangasbrasuka_headers(manga_url),
             "X-Requested-With": "XMLHttpRequest",
             "Content-Type": "application/x-www-form-urlencoded",
             "Origin": self.MANGASBRASUKA_BASE,
         }
+        ajax_url = manga_url.rstrip("/") + "/ajax/chapters/?t=1"
         try:
             response = requests.post(
                 ajax_url,
+                headers=headers,
+                timeout=self.args.timeout,
+            )
+            response.raise_for_status()
+            chapters = self._mangasbrasuka_parse_chapters(response.text, manga_url)
+            if chapters:
+                return chapters
+        except Exception:
+            pass
+
+        if not manga_id:
+            return []
+        try:
+            response = requests.post(
+                self.MANGASBRASUKA_BASE + "/wp-admin/admin-ajax.php",
                 data={"action": "manga_get_chapters", "manga": manga_id},
                 headers=headers,
                 timeout=self.args.timeout,
@@ -3624,10 +3922,12 @@ class MangaReader:
         seen: set[str] = set()
         chapters: list[Chapter] = []
         for href in re.findall(
-            r'href=["\'](' + re.escape(base) + r'/capitulo-[\d.]+/)["\']',
+            r'href=["\']([^"\']*' + re.escape(f"/manga/{slug}/")
+            + r'(?:[a-z]{2}(?:-[a-z]{2})?/)?capitulo-\d+(?:[.-]\d+)?/)["\']',
             html,
             re.IGNORECASE,
         ):
+            href = urljoin(base + "/", unescape(href))
             if href in seen:
                 continue
             seen.add(href)
@@ -3653,13 +3953,13 @@ class MangaReader:
 
         for btn_id, assign in (("btn-read-last", "first"), ("btn-read-first", "last")):
             match = re.search(
-                rf'href=["\']({re.escape(base)}/capitulo-[\d.]+/)["\'][^>]*\bid=["\']{btn_id}["\']',
+                rf'href=["\']({re.escape(base)}/(?:[a-z]{{2}}(?:-[a-z]{{2}})?/)?capitulo-\d+(?:[.-]\d+)?/)["\'][^>]*\bid=["\']{btn_id}["\']',
                 html,
                 re.IGNORECASE,
             )
             if not match:
                 match = re.search(
-                    rf'\bid=["\']{btn_id}["\'][^>]*href=["\']({re.escape(base)}/capitulo-[\d.]+/)["\']',
+                    rf'\bid=["\']{btn_id}["\'][^>]*href=["\']({re.escape(base)}/(?:[a-z]{{2}}(?:-[a-z]{{2}})?/)?capitulo-\d+(?:[.-]\d+)?/)["\']',
                     html,
                     re.IGNORECASE,
                 )
@@ -3677,7 +3977,8 @@ class MangaReader:
 
         page_numbers: list[float] = []
         for href in re.findall(
-            r'href=["\'](' + re.escape(base) + r'/capitulo-[\d.]+/)["\']',
+            r'href=["\'](' + re.escape(base)
+            + r'/(?:[a-z]{2}(?:-[a-z]{2})?/)?capitulo-\d+(?:[.-]\d+)?/)["\']',
             html,
             re.IGNORECASE,
         ):
@@ -3735,6 +4036,13 @@ class MangaReader:
         html = self._mangasbrasuka_get_html(manga_url)
 
         chapters = self._mangasbrasuka_parse_chapters(html, manga_url)
+        manga_id_m = re.search(r'"manga_id":"(\d+)"', html)
+        ajax_chapters = self._mangasbrasuka_fetch_chapter_list_ajax(
+            manga_url,
+            manga_id_m.group(1) if manga_id_m else None,
+        )
+        if len(ajax_chapters) > len(chapters):
+            chapters = ajax_chapters
 
         # Fallback: extrai do HTML estático
         bounds = self._mangasbrasuka_chapter_bounds_from_html(html, manga_url)
@@ -3744,7 +4052,6 @@ class MangaReader:
             if len(chapters) < expected:
                 chapters = self._mangasbrasuka_build_chapter_range(slug, low, high)
 
-        manga_id_m = re.search(r'"manga_id":"(\d+)"', html)
         if not chapters and manga_id_m:
             chapters = self._mangasbrasuka_fetch_chapter_list_ajax(manga_url, manga_id_m.group(1))
 
@@ -3861,6 +4168,39 @@ class MangaReader:
             "results": results,
         }
 
+    def catalog_mangasbrasuka(self, limit: int = 24) -> dict:
+        url = f"{self.MANGASBRASUKA_BASE}/manga/?status=&type=&order=update"
+        html = self._mangasbrasuka_get_html(url, self.MANGASBRASUKA_BASE)
+        parser = CatalogListingParser(
+            self.MANGASBRASUKA_BASE,
+            (frozenset({"page-item-detail", "manga"}),),
+        )
+        parser.feed(html)
+        results: list[dict] = []
+        seen: set[str] = set()
+        for raw in parser.items:
+            source_url = str(raw.get("url") or "")
+            slug = self._mangasbrasuka_manga_slug_from_source(source_url) or ""
+            if not slug or slug in seen:
+                continue
+            seen.add(slug)
+            results.append({
+                **raw,
+                "id": slug,
+                "source": "mangasbrasuka",
+                "provider": "mangasbrasuka",
+                "language": "pt-br",
+            })
+            if len(results) >= limit:
+                break
+        return {
+            "ok": True,
+            "provider": "mangasbrasuka",
+            "api_url": self.MANGASBRASUKA_BASE,
+            "count": len(results),
+            "results": results,
+        }
+
     def _mangasbrasuka_chapter_label(self, manga_slug: str, chapter_slug: str) -> str:
         number = self._mangasbrasuka_chapter_number(chapter_slug) or chapter_slug
         return clean_filename(f"mangasbrasuka-{manga_slug}-capitulo-{number}", fallback="mangasbrasuka-chapter")
@@ -3905,7 +4245,7 @@ class MangaReader:
         self._mangasbrasuka_page_images_cache[cache_key] = (time.time(), image_urls)
         return list(image_urls)
 
-    def _load_mangasbrasuka_chapter(self, url: str) -> dict:
+    def _load_mangasbrasuka_chapter(self, url: str, include_neighbors: bool = True) -> dict:
         with self.lock:
             parts = self._mangasbrasuka_chapter_parts(url)
             if not parts:
@@ -3923,10 +4263,13 @@ class MangaReader:
             manga_url = self._mangasbrasuka_manga_url(manga_slug)
 
             html = ""
-            img_url: str | None = None
+            direct_image_urls: list[str] = []
             try:
                 html = self._mangasbrasuka_get_html(chapter_url, manga_url)
-                img_url = self._mangasbrasuka_image_from_html(html, chapter_url)
+                direct_image_urls = self._mangasbrasuka_image_urls_from_html(html, chapter_url)
+                if not direct_image_urls:
+                    img_url = self._mangasbrasuka_image_from_html(html, chapter_url)
+                    direct_image_urls = [img_url] if img_url else []
             except Exception:
                 html = ""
 
@@ -3937,18 +4280,15 @@ class MangaReader:
             chapters: list[Chapter] = []
             previous_url: str | None = None
             next_url: str | None = None
-            try:
-                chapters = self._fetch_mangasbrasuka_chapters(manga_url)
-                previous_url, next_url = self._find_neighbors(chapters, chapter_url)
-            except Exception:
-                pass
+            if include_neighbors:
+                try:
+                    chapters = self._fetch_mangasbrasuka_chapters(manga_url)
+                    previous_url, next_url = self._find_neighbors(chapters, chapter_url)
+                except Exception:
+                    pass
 
-            image_urls = [
-                self._mangasbrasuka_page_ref(chapter.url)
-                for chapter in sorted(chapters, key=lambda chapter: (chapter.number is None, chapter.number or 0.0))
-            ] if chapters else []
-            if not image_urls and img_url:
-                image_urls = [img_url]
+            image_urls = direct_image_urls
+            image_urls = self._mangasbrasuka_expand_chapter_images(image_urls, chapter_url)
             if not image_urls:
                 raise RuntimeError("O MangasBrasuka nao retornou imagens para este capitulo.")
 
@@ -3993,20 +4333,42 @@ class MangaReader:
             }
 
     def _is_pieceproject_source(self, source_url: str) -> bool:
-        source_url = source_url.strip()
+        source_url = (source_url or "").strip()
         return bool(
             source_url.startswith("pieceproject://")
+            or re.search(r"(?:www\.)?pieceproject\.xyz", source_url, re.IGNORECASE)
             or re.search(r"(?:scan\.)?onepieceproject\.com\.br", source_url, re.IGNORECASE)
         )
 
     def _pieceproject_manga_url(self) -> str:
-        return "pieceproject://one-piece"
+        return DEFAULT_PIECEPROJECT_URL
 
-    def _pieceproject_chapter_url(self, number: str | int) -> str:
+    def _pieceproject_chapter_url(
+        self,
+        number: str | int,
+        web_url: str | None = None,
+    ) -> str:
+        slug_match = re.search(
+            r"(?:www\.)?pieceproject\.xyz/chapter/([^/?#]+)",
+            str(web_url or ""),
+            re.IGNORECASE,
+        )
+        if slug_match:
+            return f"pieceproject://chapter/{number}/{quote(unquote(slug_match.group(1)), safe='')}"
         return f"pieceproject://chapter/{number}"
 
-    def _pieceproject_web_chapter_url(self, number: str | int) -> str:
-        return f"{DEFAULT_PIECEPROJECT_URL}?Capitulo={number}"
+    def _pieceproject_web_chapter_url(self, source_or_number: str | int) -> str:
+        source = str(source_or_number or "").strip()
+        if source.startswith(("http://", "https://")) and "/chapter/" in source:
+            return source
+        match = re.search(
+            r"pieceproject://chapter/\d+/([^/?#]+)",
+            source,
+            re.IGNORECASE,
+        )
+        if match:
+            return urljoin(DEFAULT_PIECEPROJECT_URL, f"chapter/{unquote(match.group(1))}")
+        return urljoin(DEFAULT_PIECEPROJECT_URL, f"chapter/{source}")
 
     def _pieceproject_chapter_number_from_source(self, source_url: str) -> str | None:
         match = re.search(r"pieceproject://chapter/(\d+)", source_url, re.IGNORECASE)
@@ -4021,19 +4383,38 @@ class MangaReader:
                 return number if number.isdigit() else None
         return None
 
-    def _pieceproject_get_html(self) -> str:
-        response = requests.get(
-            DEFAULT_PIECEPROJECT_URL,
-            timeout=self.args.timeout,
-            headers={
-                **DEFAULT_HEADERS,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Referer": "https://www.pieceproject.xyz/",
-            },
-        )
-        response.raise_for_status()
-        response.encoding = "utf-8"
-        return response.text
+    def _pieceproject_get_html(
+        self,
+        url: str | None = None,
+        referer: str | None = None,
+    ) -> str:
+        target = urljoin(DEFAULT_PIECEPROJECT_URL, url or "")
+        last_error: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                response = requests.get(
+                    target,
+                    timeout=(5.0, min(max(float(self.args.timeout), 10.0), 20.0)),
+                    headers={
+                        **DEFAULT_HEADERS,
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Referer": referer or DEFAULT_PIECEPROJECT_URL,
+                    },
+                    allow_redirects=True,
+                )
+                if response.status_code in {429, 500, 502, 503, 504} and attempt < 3:
+                    time.sleep(0.5 * attempt)
+                    continue
+                response.raise_for_status()
+                response.encoding = "utf-8"
+                return response.text
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt < 3:
+                    time.sleep(0.5 * attempt)
+                    continue
+                raise
+        raise RuntimeError(f"Falha ao carregar piecePROJECT: {last_error}")
 
     def _pieceproject_clean_chapter_title(self, number: str | int, title: str | None) -> str | None:
         title = normalize_text(title or "")
@@ -4048,54 +4429,179 @@ class MangaReader:
         ).strip()
         return title or None
 
-    def _pieceproject_chapters_from_html(self, html: str) -> list[dict]:
-        script_match = re.search(
-            r"const\s+chapters\s*=\s*\{(.*?)^\s*\};",
-            html,
-            re.IGNORECASE | re.DOTALL | re.MULTILINE,
-        )
-        if not script_match:
-            raise RuntimeError("Nao encontrei o objeto chapters na pagina do piecePROJECT.")
+    def _pieceproject_volume_links(self, html: str) -> list[str]:
+        links: list[str] = []
+        for href in re.findall(r'href=["\']([^"\']+)["\']', html, re.IGNORECASE):
+            url = urljoin(DEFAULT_PIECEPROJECT_URL, unescape(href))
+            parsed = urlparse(url)
+            if parsed.netloc.lower() not in {"pieceproject.xyz", "www.pieceproject.xyz"}:
+                continue
+            if not re.fullmatch(r"/volume/[^/]+", parsed.path.rstrip("/"), re.IGNORECASE):
+                continue
+            if url not in links:
+                links.append(url)
+        return links
 
-        script = script_match.group(1)
-        starts = list(re.finditer(r"^\s*(\d+)\s*:\s*\{", script, re.MULTILINE))
+    def _pieceproject_volume_page_count(self, html: str) -> int:
+        pages = [1]
+        for href in re.findall(r'href=["\']([^"\']+)["\']', html, re.IGNORECASE):
+            parsed = urlparse(unescape(href))
+            values = parse_qs(parsed.query).get("page") or []
+            if values and str(values[0]).isdigit():
+                pages.append(int(values[0]))
+        return min(max(pages), PIECEPROJECT_MAX_VOLUME_PAGES)
+
+    def _pieceproject_chapters_from_volume_html(self, html: str) -> list[dict]:
         chapters: list[dict] = []
-
-        for index, start in enumerate(starts):
-            number = start.group(1)
-            end = starts[index + 1].start() if index + 1 < len(starts) else len(script)
-            body = script[start.end():end]
-            title = text_from_html(first_match(r"title\s*:\s*[\"']([^\"']+)", body) or "")
-            pages_match = re.search(r"pages\s*:\s*\[(.*?)\]", body, re.IGNORECASE | re.DOTALL)
-            if not pages_match:
+        seen: set[str] = set()
+        for href, body in re.findall(
+            r'<a\b[^>]*href=["\']([^"\']*/chapter/[^"\']+)["\'][^>]*>(.*?)</a>',
+            html,
+            re.IGNORECASE | re.DOTALL,
+        ):
+            web_url = urljoin(DEFAULT_PIECEPROJECT_URL, unescape(href))
+            parsed = urlparse(web_url)
+            if parsed.netloc.lower() not in {"pieceproject.xyz", "www.pieceproject.xyz"}:
                 continue
-            pages = [
-                normalize_text(url).strip()
-                for url in re.findall(r"[\"'](https?://[^\"']+)[\"']", pages_match.group(1))
-            ]
-            pages = [page for page in pages if page.startswith(("http://", "https://"))]
-            if not pages:
+            label = text_from_html(body)
+            number_match = re.search(r"Cap\S*tulo\s+(\d+)", label, re.IGNORECASE)
+            if not number_match:
                 continue
-            chapters.append(
-                {
-                    "number": number,
-                    "title": self._pieceproject_clean_chapter_title(number, title) or f"Capitulo {number}",
-                    "raw_title": title,
-                    "pages": pages,
-                }
-            )
-
-        chapters.sort(key=lambda item: int(item["number"]), reverse=True)
-        if not chapters:
-            raise RuntimeError("Nao encontrei paginas de capitulos no piecePROJECT.")
+            number = number_match.group(1)
+            if number in seen:
+                continue
+            seen.add(number)
+            title = text_from_html(first_match(r"<h[1-6]\b[^>]*>(.*?)</h[1-6]>", body) or "")
+            title = self._pieceproject_clean_chapter_title(number, title) or f"Capitulo {number}"
+            chapters.append({"number": number, "title": title, "url": web_url})
         return chapters
+
+    def _pieceproject_reader_links(self, html: str, chapter_url: str) -> tuple[str | None, str | None]:
+        internal: str | None = None
+        external: str | None = None
+        for tag, _body in re.findall(
+            r'(<a\b[^>]*>)(.*?)</a>',
+            html,
+            re.IGNORECASE | re.DOTALL,
+        ):
+            href = first_match(r'href=["\']([^"\']+)', tag)
+            if not href or "btn-read" not in tag.lower():
+                continue
+            url = urljoin(chapter_url, unescape(href))
+            host = urlparse(url).netloc.lower()
+            if host in {"pieceproject.xyz", "www.pieceproject.xyz"} and urlparse(url).path.endswith("/reader"):
+                internal = internal or url
+            elif url.startswith(("http://", "https://")):
+                external = external or url
+        return internal, external
+
+    def _pieceproject_pages_from_reader_html(self, html: str) -> list[str]:
+        match = re.search(
+            r"const\s+pages\s*=\s*(\[.*?\])\s*;",
+            html,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            return []
+        try:
+            payload = json.loads(unescape(match.group(1)))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+        pages = [
+            normalize_image_url(str(item.get("url") or ""), DEFAULT_PIECEPROJECT_URL)
+            for item in payload
+            if isinstance(item, dict)
+        ]
+        return dedupe_image_urls([page for page in pages if page.startswith(("http://", "https://"))])
+
+    def _pieceproject_neighbors_from_html(
+        self,
+        html: str,
+        number: str,
+    ) -> tuple[str | None, str | None]:
+        previous: str | None = None
+        next_url: str | None = None
+        current = int(number)
+        for href, body in re.findall(
+            r'<a\b[^>]*href=["\']([^"\']*/chapter/[^"\']+)["\'][^>]*>(.*?)</a>',
+            html,
+            re.IGNORECASE | re.DOTALL,
+        ):
+            label = text_from_html(body).lower()
+            web_url = urljoin(DEFAULT_PIECEPROJECT_URL, unescape(href))
+            if "anterior" in label:
+                previous = self._pieceproject_chapter_url(current - 1, web_url)
+            elif "proximo" in normalize_match_text(label):
+                next_url = self._pieceproject_chapter_url(current + 1, web_url)
+        return previous, next_url
 
     def _pieceproject_catalog(self, force: bool = False) -> list[dict]:
         now = time.time()
-        if not force and self._pieceproject_cache and now - self._pieceproject_cache[0] < 600:
+        if not force and self._pieceproject_cache and now - self._pieceproject_cache[0] < PIECEPROJECT_CACHE_SECONDS:
             return self._pieceproject_cache[1]
 
-        chapters = self._pieceproject_chapters_from_html(self._pieceproject_get_html())
+        volume_index_url = urljoin(DEFAULT_PIECEPROJECT_URL, "volume")
+        first_html = self._pieceproject_get_html(volume_index_url)
+        page_count = self._pieceproject_volume_page_count(first_html)
+        index_pages = {1: first_html}
+        failures: list[str] = []
+
+        if page_count > 1:
+            with ThreadPoolExecutor(max_workers=min(10, page_count - 1)) as executor:
+                futures = {
+                    executor.submit(
+                        self._pieceproject_get_html,
+                        f"{volume_index_url}?page={page}",
+                        volume_index_url,
+                    ): page
+                    for page in range(2, page_count + 1)
+                }
+                for future in as_completed(futures):
+                    page = futures[future]
+                    try:
+                        index_pages[page] = future.result()
+                    except Exception as exc:
+                        failures.append(f"pagina {page}: {exc}")
+        if failures:
+            raise RuntimeError(f"Catalogo de volumes do piecePROJECT incompleto: {failures[0]}")
+
+        volume_urls: list[str] = []
+        for page in sorted(index_pages):
+            for url in self._pieceproject_volume_links(index_pages[page]):
+                if url not in volume_urls:
+                    volume_urls.append(url)
+        if not volume_urls:
+            raise RuntimeError("Nao encontrei volumes no piecePROJECT.")
+
+        chapters_by_number: dict[str, dict] = {}
+        failures = []
+        with ThreadPoolExecutor(max_workers=min(16, len(volume_urls))) as executor:
+            futures = {
+                executor.submit(self._pieceproject_get_html, url, volume_index_url): url
+                for url in volume_urls
+            }
+            for future in as_completed(futures):
+                volume_url = futures[future]
+                try:
+                    volume_chapters = self._pieceproject_chapters_from_volume_html(future.result())
+                    if not volume_chapters:
+                        raise RuntimeError("nenhum capitulo encontrado")
+                    for chapter in volume_chapters:
+                        chapters_by_number[str(chapter["number"])] = chapter
+                except Exception as exc:
+                    failures.append(f"{volume_url}: {exc}")
+        if failures:
+            raise RuntimeError(f"Catalogo do piecePROJECT incompleto: {failures[0]}")
+
+        chapters = sorted(
+            chapters_by_number.values(),
+            key=lambda item: int(item["number"]),
+            reverse=True,
+        )
+        if len(chapters) < PIECEPROJECT_MIN_CHAPTERS:
+            raise RuntimeError(
+                f"Catalogo do piecePROJECT incompleto: somente {len(chapters)} capitulos."
+            )
         self._pieceproject_cache = (now, chapters)
         return chapters
 
@@ -4109,7 +4615,7 @@ class MangaReader:
             "One Piece",
             "OnePiece",
             "piecePROJECT",
-            "scan.onepieceproject.com.br",
+            "pieceproject.xyz",
             "Luffy",
         )
         results: list[dict] = []
@@ -4123,7 +4629,7 @@ class MangaReader:
                 pass
             results.append(
                 {
-                    "title": "One Piece - piecePROJECT",
+                    "title": "One Piece",
                     "url": self._pieceproject_manga_url(),
                     "id": "one-piece",
                     "poster": poster,
@@ -4150,7 +4656,7 @@ class MangaReader:
             number_text = str(item["number"])
             chapters.append(
                 Chapter(
-                    url=self._pieceproject_chapter_url(number_text),
+                    url=self._pieceproject_chapter_url(number_text, item.get("url")),
                     number=parse_float(number_text),
                     number_text=number_text,
                     chapter_id=f"pieceproject:{number_text}",
@@ -4418,11 +4924,20 @@ class MangaReader:
     def _yumo_normalize_result(self, raw) -> dict | None:
         if not isinstance(raw, dict):
             return None
+        if raw.get("nsfw") or raw.get("hentai") or raw.get("visible") is False:
+            return None
         manga_id = self._yumo_first(raw, ("id", "slug", "manga_id", "_id", "uuid"))
         title = self._yumo_first(raw, ("title", "name", "manga_title", "titulo"))
         if manga_id is None or not title:
             return None
         poster = self._yumo_first(raw, ("cover", "poster", "thumbnail", "image", "cover_url", "capa"))
+        chapter_info = raw.get("chapters") if isinstance(raw.get("chapters"), dict) else {}
+        last_chapter = chapter_info.get("last") if isinstance(chapter_info.get("last"), dict) else {}
+        genres = [
+            str(value.get("name") or value.get("title") or "").strip()
+            for value in (raw.get("genres") or [])
+            if isinstance(value, dict) and str(value.get("name") or value.get("title") or "").strip()
+        ]
         return {
             "title": str(title).strip(),
             "url": self._yumo_manga_url(manga_id),
@@ -4432,6 +4947,12 @@ class MangaReader:
             "language": "pt-br",
             "poster": self._yumo_resolve_asset(poster),
             "description": self._yumo_first(raw, ("description", "synopsis", "sinopse", "resumo")),
+            "genres": genres,
+            "authors": [str(value).strip() for value in (raw.get("authors") or []) if str(value).strip()],
+            "chapter_count": chapter_info.get("total"),
+            "latest_chapter": str(last_chapter.get("chapter") or ""),
+            "updated_at": self._yumo_first(raw, ("last_update", "updated_at", "released_at")),
+            "status": raw.get("status") or "",
         }
 
     def search_yumo(self, keyword: str, limit: int = 12) -> dict:
@@ -4468,6 +4989,50 @@ class MangaReader:
             "provider": "yumo",
             "api_url": self.yumo_api_base,
             "keyword": keyword,
+            "count": len(results),
+            "results": results,
+        }
+
+    def catalog_yumo(self, limit: int = 24) -> dict:
+        queries = ("a", "e", "i", "o", "s")
+        raw_by_id: dict[str, dict] = {}
+
+        def fetch(query: str) -> list[dict]:
+            payload = self._yumo_get_json("mangas", {"query": query})
+            return [value for value in self._yumo_listing(payload) if isinstance(value, dict)]
+
+        with ThreadPoolExecutor(max_workers=len(queries)) as executor:
+            futures = [executor.submit(fetch, query) for query in queries]
+            for future in as_completed(futures):
+                try:
+                    for raw in future.result():
+                        manga_id = self._yumo_first(raw, ("id", "slug", "manga_id", "_id", "uuid"))
+                        if manga_id is not None and not raw.get("nsfw") and not raw.get("hentai"):
+                            raw_by_id.setdefault(str(manga_id), raw)
+                except Exception:
+                    continue
+
+        selected = list(raw_by_id.items())[: limit + 12]
+
+        def enrich(entry: tuple[str, dict]) -> dict | None:
+            manga_id, raw = entry
+            try:
+                detail = self._yumo_fetch_manga_payload(manga_id)
+            except Exception:
+                detail = {}
+            return self._yumo_normalize_result({**raw, **detail})
+
+        results: list[dict] = []
+        with ThreadPoolExecutor(max_workers=min(4, max(1, len(selected)))) as executor:
+            for item in executor.map(enrich, selected):
+                if item and item.get("poster") and item.get("latest_chapter"):
+                    results.append(item)
+                    if len(results) >= limit:
+                        break
+        return {
+            "ok": True,
+            "provider": "yumo",
+            "api_url": self.yumo_api_base,
             "count": len(results),
             "results": results,
         }
@@ -5723,6 +6288,7 @@ class MangaReader:
                         number_text=str(number_text) if number_text else None,
                         chapter_id=chapter_id,
                         title=attrs.get("title") or None,
+                        external_url=str(attrs.get("externalUrl") or "").strip() or None,
                     )
                 )
 
@@ -6109,15 +6675,17 @@ class MangaReader:
         chapter_url: str,
         cache_pages: bool = False,
         include_source_urls: bool = False,
+        include_neighbors: bool = True,
     ) -> dict:
-        loaded = self.load_chapter(chapter_url)
-        if loaded.get("mode") == "text":
-            return {"ok": True, **loaded}
-        return self.current_chapter_metadata(
-            cache_pages=cache_pages,
-            include_source_urls=include_source_urls,
-            loaded=loaded,
-        )
+        with self.lock:
+            loaded = self.load_chapter(chapter_url, include_neighbors=include_neighbors)
+            if loaded.get("mode") == "text":
+                return {"ok": True, **loaded}
+            return self.current_chapter_metadata(
+                cache_pages=cache_pages,
+                include_source_urls=include_source_urls,
+                loaded=loaded,
+            )
 
     def current_chapter_metadata(
         self,
@@ -6310,7 +6878,7 @@ class MangaReader:
             raise RuntimeError("Nenhum capitulo foi selecionado automaticamente.")
         return self.load_chapter(selected_url)
 
-    def load_chapter(self, url: str) -> dict:
+    def load_chapter(self, url: str, include_neighbors: bool = True) -> dict:
         if self._is_toomics_source(url):
             return self._load_toomics_chapter(url)
 
@@ -6318,7 +6886,7 @@ class MangaReader:
             return self._load_mangalivre_chapter(url)
 
         if self._is_mangasbrasuka_source(url):
-            return self._load_mangasbrasuka_chapter(url)
+            return self._load_mangasbrasuka_chapter(url, include_neighbors=include_neighbors)
 
         if self._is_mangakatana_source(url):
             return self._load_mangakatana_chapter(url)
@@ -6339,7 +6907,7 @@ class MangaReader:
             return self._load_sakura_chapter(url)
 
         if self._is_mangadex_source(url) and self._mangadex_chapter_id_from_source(url):
-            return self._load_mangadex_chapter(url)
+            return self._load_mangadex_chapter(url, include_neighbors=include_neighbors)
 
         if self._is_pieceproject_source(url):
             return self._load_pieceproject_chapter(url)
@@ -6351,40 +6919,63 @@ class MangaReader:
         )
 
     def _load_pieceproject_chapter(self, url: str) -> dict:
-        catalog = self._pieceproject_catalog()
         wanted_number = self._pieceproject_chapter_number_from_source(url)
-        selected = None
-        if wanted_number:
-            selected = next((item for item in catalog if str(item["number"]) == wanted_number), None)
-        else:
-            selected = catalog[0] if catalog else None
-
-        if not selected:
-            raise ValueError("Capitulo do piecePROJECT nao encontrado.")
-
-        number_text = str(selected["number"])
-        image_urls = dedupe_image_urls(
-            [str(page).strip() for page in selected.get("pages") or [] if str(page).strip()]
+        web_url = self._pieceproject_web_chapter_url(url)
+        selected: dict | None = None
+        has_embedded_web_url = bool(
+            re.search(r"pieceproject://chapter/\d+/[^/?#]+", url, re.IGNORECASE)
+            or (
+                url.startswith(("http://", "https://"))
+                and re.search(r"(?:www\.)?pieceproject\.xyz/chapter/", url, re.IGNORECASE)
+            )
         )
+
+        if not wanted_number or not has_embedded_web_url:
+            catalog = self._pieceproject_catalog()
+            selected = (
+                next((item for item in catalog if str(item["number"]) == wanted_number), None)
+                if wanted_number
+                else (catalog[0] if catalog else None)
+            )
+            if not selected:
+                raise ValueError("Capitulo do piecePROJECT nao encontrado.")
+            wanted_number = str(selected["number"])
+            web_url = str(selected.get("url") or "").strip()
+
+        if not wanted_number or not web_url.startswith(("http://", "https://")):
+            raise ValueError("URL do capitulo do piecePROJECT invalida.")
+
+        number_text = str(wanted_number)
+        chapter_html = self._pieceproject_get_html(web_url, DEFAULT_PIECEPROJECT_URL)
+        title_raw = first_match(r'<h1\b[^>]*class=["\'][^"\']*chapter-title[^"\']*["\'][^>]*>(.*?)</h1>', chapter_html)
+        title = self._pieceproject_clean_chapter_title(number_text, text_from_html(title_raw or ""))
+        internal_reader, external_reader = self._pieceproject_reader_links(chapter_html, web_url)
+
+        image_urls: list[str] = []
+        if internal_reader:
+            reader_html = self._pieceproject_get_html(internal_reader, web_url)
+            image_urls = self._pieceproject_pages_from_reader_html(reader_html)
         if not image_urls:
+            if external_reader:
+                raise RuntimeError(
+                    "O piecePROJECT encaminhou este capitulo para leitor externo; usando fallback."
+                )
             raise RuntimeError("O piecePROJECT nao retornou imagens para este capitulo.")
 
-        selected_url = self._pieceproject_chapter_url(number_text)
-        chapters = self._fetch_pieceproject_chapters(self._pieceproject_manga_url())
-        previous_url, next_url = self._find_neighbors(chapters, selected_url)
+        selected_url = self._pieceproject_chapter_url(number_text, web_url)
+        previous_url, next_url = self._pieceproject_neighbors_from_html(chapter_html, number_text)
 
         session = requests.Session()
         session.headers.update(
             {
                 **DEFAULT_HEADERS,
-                "Referer": DEFAULT_PIECEPROJECT_URL,
-                "Origin": "https://scan.onepieceproject.com.br",
+                "Referer": internal_reader or web_url,
+                "Origin": "https://www.pieceproject.xyz",
             }
         )
 
         label = clean_filename(f"pieceproject-one-piece-chapter-{number_text}", fallback="pieceproject-chapter")
         cache_dir = self.cache.new_chapter_dir(label)
-        web_url = self._pieceproject_web_chapter_url(number_text)
         self.state = ChapterState(
             url=web_url,
             label=label,
@@ -6403,7 +6994,7 @@ class MangaReader:
             "source_url": web_url,
             "chapter_id": f"pieceproject:{number_text}",
             "label": label,
-            "title": selected.get("title"),
+            "title": title or (selected or {}).get("title"),
             "number": parse_float(number_text),
             "number_text": number_text,
             "language": "pt-br",
@@ -6416,7 +7007,7 @@ class MangaReader:
             ],
         }
 
-    def _load_mangadex_chapter(self, url: str) -> dict:
+    def _load_mangadex_chapter(self, url: str, include_neighbors: bool = True) -> dict:
         chapter_id = self._mangadex_chapter_id_from_source(url)
         if not chapter_id:
             raise ValueError("Informe uma URL de capitulo do MangaDex.")
@@ -6426,6 +7017,29 @@ class MangaReader:
         attrs = chapter_item.get("attributes") or {}
         manga_id = self._mangadex_related_id(chapter_item, "manga")
         lang = attrs.get("translatedLanguage") or "pt-br"
+
+        # Capitulo licenciado/hospedado fora (ex.: MangaPlus): o MangaDex nao
+        # serve as paginas (pages=0, externalUrl setado). Devolve um payload
+        # "externo" p/ o front oferecer o link oficial em vez de erro.
+        external_url = str(attrs.get("externalUrl") or "").strip()
+        if external_url and not (attrs.get("pages") or 0):
+            number_text = attrs.get("chapter")
+            return {
+                "ok": True,
+                "provider": "mangadex",
+                "url": url,
+                "chapter_id": chapter_id,
+                "label": attrs.get("title") or "Capitulo",
+                "title": attrs.get("title"),
+                "number": parse_float(number_text) if number_text else None,
+                "number_text": str(number_text) if number_text else None,
+                "language": lang,
+                "external_url": external_url,
+                "count": 0,
+                "previous": None,
+                "next": None,
+                "images": [],
+            }
 
         at_home = self._mangadex_get(f"/at-home/server/{chapter_id}")
         base_url = at_home.get("baseUrl")
@@ -6446,7 +7060,7 @@ class MangaReader:
         chapters: list[Chapter] = []
         previous_url: str | None = None
         next_url: str | None = None
-        if manga_id:
+        if manga_id and include_neighbors:
             try:
                 chapters = self._fetch_mangadex_chapters(self._mangadex_manga_url(manga_id), lang)
                 previous_url, next_url = self._find_neighbors(chapters, url)
@@ -6805,6 +7419,7 @@ class MangaReader:
             "number_text": number_text,
             "chapter_id": chapter.chapter_id,
             "title": chapter.title,
+            "external_url": chapter.external_url,
         }
 
     def _is_chapter_url(self, url: str) -> bool:

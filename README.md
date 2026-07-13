@@ -42,6 +42,26 @@ Abra `http://127.0.0.1:5173`.
 - `GET /api/chapter?url=...`
 - `GET /api/image/{index}`
 
+## Perfil (foto, background e contas)
+
+O perfil e local (id salvo no navegador, dados em `backend/.cache/profiles.json`).
+
+- Foto e background: enviados no painel de Perfil (arquivo ou URL). Uploads sao
+  validados/normalizados via Pillow e salvos em `backend/static/profiles/<id>/`.
+- Contas AniList/MyAnimeList: vinculo via OAuth2. Preencha as credenciais no
+  `.env` da raiz (veja `.env.example`) e cadastre os apps com o redirect:
+  - AniList: `http://127.0.0.1:8000/api/oauth/anilist/callback`
+  - MyAnimeList: `http://127.0.0.1:8000/api/oauth/myanimelist/callback`
+
+  Sem credenciais, o botao "Vincular" fica desabilitado. Tokens ficam so no
+  servidor (`profiles.json`), nunca no payload da API.
+
+Rotas: `PUT /api/profiles/{id}/avatar`, `PUT /api/profiles/{id}/background`
+(corpo `{"url": ...}` ou `{"data": "data:image/...;base64,..."}`, corpo vazio
+limpa), `POST /api/profiles/{id}/link/{provider}`,
+`GET /api/oauth/{provider}/callback`, `DELETE /api/profiles/{id}/link/{provider}`,
+`GET /api/profiles/{id}/link/status`.
+
 ## Notas
 
 - Capas e imagens de personagens ficam remotas/proxy, sem salvar permanente no PC.
