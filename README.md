@@ -72,6 +72,44 @@ limpa), `POST /api/profiles/{id}/link/{provider}`,
 
 ## Sakura Mangas (`blob:`)
 
+### Configuracao e diagnostico
+
+Sakura usa navegador Chromium dedicado porque leitor entrega paginas como
+`blob:` e pode exigir Cloudflare. Navegador fica em `http://127.0.0.1:9333`;
+nao exponha esse endpoint na rede.
+
+Opcionalmente, crie `.env` a partir de `.env.example`:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+- `SAKURA_PROXY`: proxy usado por navegador, requisicoes HTTP e solver. Use o
+  mesmo IP durante toda sessao; `cf_clearance` fica vinculado ao IP.
+- `CAPSOLVER_API_KEY` ou `TWOCAPTCHA_API_KEY`: resolucao automatica opcional.
+  Sem chave, conclua desafio manualmente na janela do navegador.
+- `SAKURA_BASE_URL`, `SAKURA_CDP_URL`, `SAKURA_PROFILE_DIR` e
+  `SAKURA_CHALLENGE_TIMEOUT`: sobrescrevem valores padrao quando necessario.
+
+Para adicionar obra Sakura na home:
+
+```powershell
+python tools/add_sakura_manga.py "nome da obra"
+python tools/add_sakura_manga.py --show
+python tools/add_sakura_manga.py --remove "https://sakuramangas.org/obras/slug-da-obra"
+```
+
+Diagnostico de proxy e acesso:
+
+```powershell
+python tools/sakura_requisitor.py --preflight --proxy "http://usuario:senha@host:porta"
+```
+
+Se aparecer `1020`, `403` ou desafio Cloudflare, confirme que bridge esta
+aberto, resolva desafio no navegador e mantenha mesmo proxy/IP. Nunca coloque
+proxy, API key, cookies ou perfil navegador no Git; `.env`,
+`.sakura-browser-profile/`, caches e credenciais ja estao ignorados.
+
 Antes do backend, abra navegador normal dedicado e conclua Cloudflare
 manualmente na primeira execução:
 
