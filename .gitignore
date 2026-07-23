@@ -11,6 +11,8 @@ debug_brasuka_last.html
 # Node (nunca versionar dependencias)
 node_modules/
 dist/
+release/
+build/
 
 # ===========================================================================
 # CONFIDENCIAL / RISCO DE EXPOSICAO  (nunca versionar)

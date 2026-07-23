@@ -1,7 +1,9 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react"
 import { BookOpen, Clock3, Globe2 } from "lucide-react"
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000"
+const API_BASE_URL = import.meta.env.VITE_DESKTOP_BUILD === "1"
+  ? window.location.origin
+  : (import.meta.env.VITE_API_BASE_URL || window.location.origin)
 const PLACEHOLDER_URL = `${API_BASE_URL}/static/placeholder.svg`
 
 function resolveImageUrl(url) {
@@ -12,11 +14,12 @@ function resolveImageUrl(url) {
 export function MangaCardSkeleton() {
   return (
     <div className="flex min-h-[156px] gap-3 rounded-md border border-line bg-panel p-3 shadow-card">
-      <div className="h-32 w-[92px] shrink-0 animate-pulse rounded bg-soft" />
+      <div className="kari-skeleton h-32 w-[92px] shrink-0 rounded" />
       <div className="flex-1 space-y-2 py-1">
-        <div className="h-4 w-3/4 animate-pulse rounded bg-soft" />
-        <div className="h-3 w-full animate-pulse rounded bg-soft" />
-        <div className="h-3 w-2/3 animate-pulse rounded bg-soft" />
+        <div className="kari-skeleton h-4 w-3/4 rounded" />
+        <div className="kari-skeleton h-3 w-full rounded" />
+        <div className="kari-skeleton h-3 w-2/3 rounded" />
+        <div className="mt-5 flex gap-2"><span className="kari-skeleton h-3 w-16 rounded" /><span className="kari-skeleton h-3 w-10 rounded" /></div>
       </div>
     </div>
   )
@@ -53,6 +56,7 @@ function MangaCard({ manga, priority = false, compact = false, onSelect }) {
   const chapters = (manga.chapter_preview ?? [])
     .map((chapter) => String(chapter).trim())
     .filter(Boolean)
+  const detailsMissing = !String(manga?.title || "").trim() || !String(manga?.source || "").trim()
 
   useEffect(() => {
     setLoaded(false)
@@ -67,6 +71,8 @@ function MangaCard({ manga, priority = false, compact = false, onSelect }) {
     }
   }, [currentCover])
 
+  if (detailsMissing) return <MangaCardSkeleton />
+
   return (
     <div
       className="group flex min-h-[156px] w-full gap-3 rounded-md border border-line/70 bg-panel/55 p-3 shadow-card backdrop-blur-md transition-colors duration-200 hover:border-emerald-300/45 hover:bg-soft/70"
@@ -77,7 +83,7 @@ function MangaCard({ manga, priority = false, compact = false, onSelect }) {
         onClick={() => onSelect?.(manga)}
         className="relative h-32 w-[92px] shrink-0 overflow-hidden rounded bg-soft focus:outline-none focus:ring-1 focus:ring-emerald-200/70"
       >
-        {!loaded && <div className="absolute inset-0 animate-pulse bg-zinc-700/70" />}
+        {!loaded && <div className="kari-skeleton absolute inset-0" />}
         <img
           ref={imageRef}
           src={currentCover}
@@ -124,11 +130,15 @@ function MangaCard({ manga, priority = false, compact = false, onSelect }) {
                   </span>
                 )}
               </button>
-            )) : (
-              <p className={`px-0.5 py-0.5 text-xs ${manga.chapter_status === "unavailable" ? "text-red-300/75" : "text-zinc-600"}`}>
-                {manga.chapter_status === "unavailable"
-                  ? "Capitulos indisponiveis"
-                  : "Verificando capitulos..."}
+            )) : manga.chapter_status === "loading" || manga.chapter_status === "pending" ? (
+              <div className="space-y-2 px-0.5 py-1" aria-label="Carregando capítulos">
+                <div className="kari-skeleton h-3 w-full rounded" />
+                <div className="kari-skeleton h-3 w-4/5 rounded" />
+                <div className="kari-skeleton h-3 w-3/5 rounded" />
+              </div>
+            ) : (
+              <p className="px-0.5 py-0.5 text-xs text-zinc-500">
+                Nenhum capitulo encontrado nesta fonte
               </p>
             )}
           </div>

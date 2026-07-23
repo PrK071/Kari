@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useQuery } from "@tanstack/react-query"
 import { FixedSizeGrid as Grid } from "react-window"
-import { BookOpen, Camera, ExternalLink, Grid2X2, Heart, History, Home, ImagePlus, LibraryBig, Link2, Loader2, PanelLeftClose, PanelLeftOpen, Search, Trash2, Unlink, UserRound, X } from "lucide-react"
+import { ArrowUpDown, BookOpen, BookText, Camera, ExternalLink, FileArchive, Grid2X2, Heart, History, Home, ImagePlus, LibraryBig, Link2, Loader2, PanelLeftClose, PanelLeftOpen, Puzzle, Search, Trash2, Unlink, Upload, UserRound, X } from "lucide-react"
 import MangaCard, { MangaCardSkeleton } from "./components/MangaCard.jsx"
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000"
+const API_BASE_URL = import.meta.env.VITE_DESKTOP_BUILD === "1"
+  ? window.location.origin
+  : (import.meta.env.VITE_API_BASE_URL || window.location.origin)
 const CARD_WIDTH = 380
 const CARD_HEIGHT = 180
 const GRID_GAP = 8
@@ -19,6 +21,7 @@ const FAVORITES_STORAGE_KEY = "kari:favorites:v1"
 const HISTORY_STORAGE_KEY = "kari:history:v1"
 const PROFILE_STORAGE_KEY = "kari:profile-id:v1"
 const AUTH_TOKEN_KEY = "kari:auth-token:v1"
+const READER_SESSION_STORAGE_KEY = "kari:reader-session:v1"
 
 const HERO_GENRE_STYLES = [
   "border-emerald-300/30 bg-emerald-300/10 text-emerald-100",
@@ -30,6 +33,14 @@ const HERO_GENRE_STYLES = [
 function resolveApiUrl(url) {
   if (!url) return ""
   return url.startsWith("/") ? `${API_BASE_URL}${url}` : url
+}
+
+function resolveReaderContentImage(url) {
+  if (!url) return ""
+  if (/^https?:\/\//i.test(url)) {
+    return `${API_BASE_URL}/api/image?url=${encodeURIComponent(url)}`
+  }
+  return resolveApiUrl(url)
 }
 
 function isVideoUrl(url) {
@@ -71,6 +82,24 @@ function mangaStorageKey(manga) {
   return String(manga?.source_url || manga?.id || manga?.title || "")
 }
 
+function mangaTitleKey(manga) {
+  return String(manga?.title || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+}
+
+function mangaTitleAliasKey(manga) {
+  // AniList pode omitir "Part 2" enquanto MangaDex inclui. O subtitulo (ex:
+  // Sentou Chouryuu) permanece, entao nao mistura partes diferentes de JoJo.
+  return mangaTitleKey(manga)
+    .replace(/\b(?:part|parte)\s*(?:\d+|[ivxlcdm]+)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
 function readStoredMangaList(key) {
   try {
     const value = JSON.parse(window.localStorage.getItem(key) || "[]")
@@ -94,16 +123,42 @@ function mergeMangaLists(...lists) {
   return result
 }
 
-function Header({ query, onQueryChange, onHome, onCatalog, onHistory, onFavorites, onProfile, profile, libraryView, activeGenre, onClearGenre, total, isSearching, collapsed }) {
+function Header({ query, onQueryChange, onHome, onCatalog, onPluginSelect, onHistory, onFavorites, onProfile, profile, libraryView, pluginView, activeGenre, onClearGenre, total, isSearching, collapsed, hidden, onReveal, onRequestHide }) {
+  const [pluginsOpen, setPluginsOpen] = useState(false)
+  const pluginsRef = useRef(null)
+  const pluginActive = pluginView === "hq" || pluginView === "hq-local" || pluginView === "novels"
+
+  useEffect(() => {
+    const closeMenu = (event) => {
+      if (!pluginsRef.current?.contains(event.target)) setPluginsOpen(false)
+    }
+    document.addEventListener("pointerdown", closeMenu)
+    return () => document.removeEventListener("pointerdown", closeMenu)
+  }, [])
+
+  useEffect(() => setPluginsOpen(false), [pluginView])
+
   const countLabel = libraryView === "history"
     ? `${total} obras no historico`
     : libraryView === "favorites"
       ? `${total} favoritos`
+      : libraryView === "library"
+        ? `${total} obras na minha lista`
+      : pluginView === "hq"
+        ? "HQ Now"
+        : pluginView === "hq-local"
+          ? "Biblioteca local de HQs"
+        : pluginView === "novels"
+          ? "Biblioteca de Web Novels"
       : activeGenre
     ? `${total} obras em ${activeGenre}`
     : isSearching ? `${total} resultados` : `${total} obras no catalogo`
   return (
-    <header className={`sticky top-0 z-10 border-b border-line/40 bg-app/40 px-4 backdrop-blur-md transition-all duration-[450ms] ease-[cubic-bezier(0.16,1,0.3,1)] ${collapsed ? "py-1.5" : "py-3"}`}>
+    <header
+      onMouseEnter={onReveal}
+      onMouseLeave={onRequestHide}
+      className={`sticky top-0 z-30 border-b border-line/40 bg-app/40 px-4 backdrop-blur-md transition-[transform,opacity,padding] duration-[450ms] ease-[cubic-bezier(0.16,1,0.3,1)] ${collapsed ? "py-1.5" : "py-3"} ${hidden ? "pointer-events-none -translate-y-full opacity-0" : "translate-y-0 opacity-100"}`}
+    >
       <div className="mx-auto w-full max-w-[1600px]">
         <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-3">
           <nav aria-label="Navegacao principal" className="flex items-center gap-1.5">
@@ -127,6 +182,42 @@ function Header({ query, onQueryChange, onHome, onCatalog, onHistory, onFavorite
               <LibraryBig size={18} strokeWidth={1.8} aria-hidden="true" />
               <span className={`hidden overflow-hidden whitespace-nowrap align-middle transition-all duration-[450ms] ease-[cubic-bezier(0.16,1,0.3,1)] lg:inline-block ${collapsed ? "max-w-0 opacity-0" : "max-w-[80px] opacity-100"}`}>Catalogo</span>
             </button>
+            <div ref={pluginsRef} className="relative">
+              <button
+                type="button"
+                aria-label="Plugins"
+                aria-expanded={pluginsOpen}
+                aria-haspopup="menu"
+                title="Plugins"
+                onClick={() => setPluginsOpen((open) => !open)}
+                className={`flex h-9 items-center gap-2 rounded-md px-2 text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent ${
+                  pluginActive ? "bg-soft text-accent" : "text-zinc-400 hover:bg-soft hover:text-accent"
+                }`}
+              >
+                <Puzzle size={18} strokeWidth={1.8} aria-hidden="true" />
+                <span className={`hidden overflow-hidden whitespace-nowrap align-middle transition-all duration-[450ms] ease-[cubic-bezier(0.16,1,0.3,1)] lg:inline-block ${collapsed ? "max-w-0 opacity-0" : "max-w-[80px] opacity-100"}`}>Plugins</span>
+              </button>
+              {pluginsOpen && (
+                <div role="menu" className="absolute left-0 top-11 z-30 w-52 rounded-md border border-line bg-panel p-1 shadow-2xl">
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => onPluginSelect("hq")}
+                    className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm font-semibold text-zinc-200 transition hover:bg-soft hover:text-accent"
+                  >
+                    <FileArchive size={16} aria-hidden="true" /> HQs
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => onPluginSelect("novels")}
+                    className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm font-semibold text-zinc-200 transition hover:bg-soft hover:text-accent"
+                  >
+                    <BookText size={16} aria-hidden="true" /> Web Novels
+                  </button>
+                </div>
+              )}
+            </div>
             <button
               type="button"
               aria-label="Historico de leitura"
@@ -281,6 +372,83 @@ function VirtualMangaGrid({ mangas, onSelect, onLoadMore, canLoadMore = false, l
           </button>
         </div>
       )}
+    </main>
+  )
+}
+
+const SOURCE_DOMAINS = {
+  "MangaDex": "mangadex.org",
+  "MangaLivre": "mangalivre.net",
+  "MangasBrasuka": "mangasbrasuka.com.br",
+  "MangaGeek": "geekstations.com.br",
+  "MangaKatana": "mangakatana.com",
+  "Nexus Mangas": "nexusmangas.com",
+  "Fliptru": "fliptru.com.br",
+  "AniList": "anilist.co",
+}
+
+const SOURCE_LOGOS = {
+  "MangaGeek": "/source-mangageek.png",
+  "MangaLivre": "/source-mangalivre.png",
+}
+
+function sourceLogoUrl(source) {
+  const localLogo = SOURCE_LOGOS[String(source || "")]
+  if (localLogo) return localLogo
+  const domain = SOURCE_DOMAINS[String(source || "")]
+  return domain ? `https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain)}&sz=64` : ""
+}
+
+function SearchSourceColumns({ mangas, onSelect }) {
+  const groups = useMemo(() => {
+    const grouped = new Map()
+    for (const manga of mangas) {
+      const source = String(manga.source || "Fonte desconhecida")
+      const current = grouped.get(source) ?? []
+      current.push(manga)
+      grouped.set(source, current)
+    }
+    return [...grouped.entries()].sort(([a], [b]) => a.localeCompare(b, "pt-BR"))
+  }, [mangas])
+
+  return (
+    <main className="h-[calc(100vh-124px)] px-5 py-5">
+      <div className="mx-auto h-full w-full max-w-[1600px] overflow-x-auto pb-3 scrollbar-thin scrollbar-thumb-zinc-700 scrollbar-track-app">
+        <div className="flex min-h-full w-max min-w-full items-start gap-4">
+          {groups.map(([source, items]) => (
+            <section key={source} className="w-[380px] shrink-0">
+              <div className="mb-3 flex items-center gap-2 border-b border-line/70 px-1 pb-2">
+                {sourceLogoUrl(source) ? (
+                  <img
+                    src={sourceLogoUrl(source)}
+                    alt=""
+                    width="24"
+                    height="24"
+                    className="h-6 w-6 rounded object-contain"
+                    loading="eager"
+                  />
+                ) : (
+                  <span className="grid h-6 w-6 place-items-center rounded bg-soft text-xs font-black text-emerald-200">
+                    {source.slice(0, 1).toUpperCase()}
+                  </span>
+                )}
+                <h2 className="truncate text-sm font-bold text-zinc-100">{source}</h2>
+                <span className="ml-auto text-xs text-zinc-500">{items.length}</span>
+              </div>
+              <div className="space-y-2">
+                {items.map((manga, index) => (
+                  <MangaCard
+                    key={`${source}-${manga.source_url ?? manga.id ?? manga.title}-${index}`}
+                    manga={manga}
+                    priority={index < 3}
+                    onSelect={onSelect}
+                  />
+                ))}
+              </div>
+            </section>
+          ))}
+        </div>
+      </div>
     </main>
   )
 }
@@ -464,7 +632,7 @@ function SectionedCatalog({ sections, items, onSelect }) {
     if (!items?.length) return []
     const grouped = new Map()
     for (const item of items) {
-      const sec = item.section || "Destaques"
+      const sec = item.section || "Catálogo"
       if (!grouped.has(sec)) grouped.set(sec, [])
       grouped.get(sec).push(item)
     }
@@ -575,10 +743,11 @@ function AuthorInfoModal({ panel, onClose }) {
     ? data.source_links
     : (data.site_url ? [{ label: data.source || "Fonte", url: data.site_url }] : [])
   const socialLinks = [
+    ...(data.social_links || []),
     data.official_site ? { label: "Site oficial", url: data.official_site } : null,
     data.twitter ? { label: "Twitter", url: data.twitter } : null,
     data.facebook ? { label: "Facebook", url: data.facebook } : null,
-  ].filter(Boolean)
+  ].filter((link, index, links) => link?.url && links.findIndex((candidate) => candidate?.url === link.url) === index)
 
   return (
     <div
@@ -696,7 +865,9 @@ function AuthorInfoModal({ panel, onClose }) {
               )}
 
               {socialLinks.length > 0 && (
-                <div className="mt-5 flex flex-wrap gap-2">
+                <div className="mt-5 border-t border-line/70 pt-4">
+                  <h3 className="text-xs font-bold uppercase text-muted">Redes do autor</h3>
+                  <div className="mt-2 flex flex-wrap gap-2">
                   {socialLinks.map((link) => (
                     <a
                       key={`${link.label}-${link.url}`}
@@ -708,6 +879,7 @@ function AuthorInfoModal({ panel, onClose }) {
                       {link.label}
                     </a>
                   ))}
+                  </div>
                 </div>
               )}
             </>
@@ -715,6 +887,557 @@ function AuthorInfoModal({ panel, onClose }) {
         </div>
       </section>
     </div>
+  )
+}
+
+const LOCAL_LIBRARY_CONFIG = {
+  hq: {
+    endpoint: "hq",
+    title: "Biblioteca de HQs",
+    source: "HQ Local",
+    accept: ".cbz,.zip,.cbr,.pdf",
+    formats: "CBZ, ZIP, CBR ou PDF",
+    secondaryLabel: "Edicao",
+    secondaryKey: "issue_number",
+    secondaryPlaceholder: "#",
+    Icon: FileArchive,
+  },
+  novels: {
+    endpoint: "light-novels",
+    title: "Biblioteca de Web Novels",
+    source: "Web Novel Local",
+    accept: ".epub,.txt,.md",
+    formats: "EPUB, TXT ou MD",
+    secondaryLabel: "Autor",
+    secondaryKey: "author",
+    secondaryPlaceholder: "Opcional",
+    Icon: BookText,
+  },
+}
+
+function readReaderSession() {
+  try {
+    const value = JSON.parse(window.localStorage.getItem(READER_SESSION_STORAGE_KEY) || "null")
+    if (!value?.manga || !mangaStorageKey(value.manga) || !value.chapter_url) return null
+    return value
+  } catch {
+    return null
+  }
+}
+
+function clearReaderSession() {
+  window.localStorage.removeItem(READER_SESSION_STORAGE_KEY)
+}
+
+function chapterTextBlocks(content) {
+  let text = String(content || "")
+  if (/<[a-z][\s\S]*>/i.test(text)) {
+    text = text
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<\/(p|div|section|article|blockquote|h[1-6]|li)>/gi, "\n\n")
+    const documentValue = new DOMParser().parseFromString(text, "text/html")
+    text = documentValue.body.textContent || ""
+  }
+  return text
+    .replace(/\r\n?/g, "\n")
+    .split(/\n\s*\n+/)
+    .map((block) => block.replace(/[ \t]+/g, " ").trim())
+    .filter(Boolean)
+}
+
+function HQNowPluginPage({ onOpen }) {
+  const [tab, setTab] = useState("remote")
+  const [query, setQuery] = useState("")
+  const [activeQuery, setActiveQuery] = useState("")
+  const [limit, setLimit] = useState(32)
+  const [items, setItems] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState("")
+
+  const loadHQs = useCallback(async () => {
+    setLoading(true)
+    setError("")
+    try {
+      const params = new URLSearchParams({ limit: String(limit) })
+      if (activeQuery) params.set("q", activeQuery)
+      const response = await fetch(`${API_BASE_URL}/api/plugins/hq-now?${params}`)
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
+      setItems(data.items ?? [])
+    } catch (cause) {
+      setError(cause.message || "Nao consegui carregar HQ Now.")
+    } finally {
+      setLoading(false)
+    }
+  }, [activeQuery, limit])
+
+  useEffect(() => {
+    void loadHQs()
+  }, [loadHQs])
+
+  const submitSearch = (event) => {
+    event.preventDefault()
+    setLimit(32)
+    setActiveQuery(query.trim())
+  }
+
+  return (
+    <>
+    <div className="mx-auto flex w-full max-w-[1600px] gap-1 px-4 pt-5" role="tablist" aria-label="Fontes de HQ">
+      <button
+        type="button"
+        role="tab"
+        aria-selected={tab === "remote"}
+        onClick={() => setTab("remote")}
+        className={`flex h-9 items-center gap-2 rounded px-3 text-xs font-bold transition ${tab === "remote" ? "bg-accent text-black" : "border border-line bg-panel text-zinc-300 hover:border-accent"}`}
+      >
+        <FileArchive size={15} aria-hidden="true" /> HQ Now
+      </button>
+      <button
+        type="button"
+        role="tab"
+        aria-selected={tab === "local"}
+        onClick={() => setTab("local")}
+        className={`flex h-9 items-center gap-2 rounded px-3 text-xs font-bold transition ${tab === "local" ? "bg-accent text-black" : "border border-line bg-panel text-zinc-300 hover:border-accent"}`}
+      >
+        <Upload size={15} aria-hidden="true" /> Minha biblioteca
+      </button>
+    </div>
+    {tab === "local" ? (
+      <PluginLibraryPage kind="hq" onOpen={onOpen} />
+    ) : (
+    <main className="mx-auto min-h-[calc(100vh-72px)] w-full max-w-[1600px] px-4 py-6">
+      <section aria-labelledby="hq-now-title">
+        <header className="flex flex-wrap items-center justify-between gap-3 border-b border-line pb-4">
+          <div className="flex items-center gap-3">
+            <FileArchive size={22} className="text-accent" aria-hidden="true" />
+            <div>
+              <h1 id="hq-now-title" className="text-xl font-black text-zinc-50">HQs</h1>
+              <p className="text-xs text-muted">{items.length} {items.length === 1 ? "obra" : "obras"}</p>
+            </div>
+          </div>
+          <span className="rounded border border-accent/25 bg-accent/10 px-2 py-1 text-[11px] font-semibold text-accent">HQ Now</span>
+        </header>
+
+        <form onSubmit={submitSearch} className="relative mx-auto mt-5 max-w-3xl">
+          <Search size={18} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500" aria-hidden="true" />
+          <input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Buscar HQ"
+            aria-label="Buscar HQ no HQ Now"
+            className="h-11 w-full rounded border border-line bg-panel pl-10 pr-24 text-sm text-zinc-100 outline-none transition focus:border-accent"
+          />
+          <button
+            type="submit"
+            className="absolute right-1.5 top-1.5 h-8 rounded bg-accent px-4 text-xs font-bold text-black transition hover:bg-accent-dim"
+          >
+            Buscar
+          </button>
+        </form>
+
+        {activeQuery && (
+          <div className="mt-3 flex items-center justify-center gap-2 text-xs text-muted">
+            Resultados para “{activeQuery}”
+            <button
+              type="button"
+              onClick={() => { setQuery(""); setActiveQuery(""); setLimit(32) }}
+              className="grid h-6 w-6 place-items-center rounded text-zinc-400 hover:bg-soft hover:text-zinc-100"
+              aria-label="Limpar busca"
+              title="Limpar busca"
+            >
+              <X size={14} aria-hidden="true" />
+            </button>
+          </div>
+        )}
+
+        {error && <p className="mt-4 rounded border border-red-900 bg-red-950/30 px-3 py-2 text-sm text-red-200">{error}</p>}
+
+        <div className="py-5">
+          {loading ? (
+            <div className="grid grid-cols-1 gap-2 lg:grid-cols-2">
+              {Array.from({ length: 8 }, (_, index) => <MangaCardSkeleton key={index} />)}
+            </div>
+          ) : items.length ? (
+            <>
+              <div className="grid grid-cols-1 gap-2 lg:grid-cols-2">
+                {items.map((manga, index) => (
+                  <MangaCard key={mangaStorageKey(manga)} manga={manga} priority={index < 6} onSelect={onOpen} />
+                ))}
+              </div>
+              {items.length >= limit && limit < 60 && (
+                <div className="mt-5 flex justify-center">
+                  <button
+                    type="button"
+                    onClick={() => setLimit((current) => Math.min(60, current + 16))}
+                    className="h-9 rounded border border-line bg-panel px-4 text-xs font-bold text-zinc-200 transition hover:border-accent hover:text-accent"
+                  >
+                    Carregar mais
+                  </button>
+                </div>
+              )}
+            </>
+          ) : (
+            <div className="grid min-h-52 place-items-center text-center">
+              <div>
+                <FileArchive size={30} className="mx-auto text-zinc-600" aria-hidden="true" />
+                <p className="mt-3 text-sm font-semibold text-zinc-300">Nenhuma HQ encontrada</p>
+              </div>
+            </div>
+          )}
+        </div>
+      </section>
+    </main>
+    )}
+    </>
+  )
+}
+
+const REMOTE_NOVEL_PLUGINS = {
+  "novel-mania": { label: "Novel Mania", endpoint: "novel-mania" },
+  "central-novel": { label: "Central Novel", endpoint: "central-novel" },
+  "tensura-fan": { label: "Tensura Fan", endpoint: "tensura-fan" },
+  "pleiades-translations": { label: "Pleiades Translations", endpoint: "pleiades-translations" },
+}
+
+function RemoteNovelsPluginPage({ source, onOpen }) {
+  const config = REMOTE_NOVEL_PLUGINS[source] ?? REMOTE_NOVEL_PLUGINS["novel-mania"]
+  const [query, setQuery] = useState("")
+  const [activeQuery, setActiveQuery] = useState("")
+  const [items, setItems] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState("")
+
+  const loadNovels = useCallback(async () => {
+    setLoading(true)
+    setError("")
+    try {
+      const params = new URLSearchParams({ limit: "24" })
+      if (activeQuery) params.set("q", activeQuery)
+      const response = await fetch(`${API_BASE_URL}/api/plugins/${config.endpoint}?${params}`)
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
+      setItems(data.items ?? [])
+    } catch (cause) {
+      setError(cause.message || `Nao consegui carregar o ${config.label}.`)
+    } finally {
+      setLoading(false)
+    }
+  }, [activeQuery, config.endpoint, config.label])
+
+  useEffect(() => {
+    void loadNovels()
+  }, [loadNovels])
+
+  const submitSearch = (event) => {
+    event.preventDefault()
+    setActiveQuery(query.trim())
+  }
+
+  return (
+    <main className="mx-auto min-h-[calc(100vh-120px)] w-full max-w-[1600px] px-4 py-6">
+      <section aria-labelledby={`${config.endpoint}-title`}>
+        <header className="flex flex-wrap items-center justify-between gap-3 border-b border-line pb-4">
+          <div className="flex items-center gap-3">
+            <BookText size={22} className="text-accent" aria-hidden="true" />
+            <div>
+              <h1 id={`${config.endpoint}-title`} className="text-xl font-black text-zinc-50">Web Novels</h1>
+              <p className="text-xs text-muted">{items.length} {items.length === 1 ? "obra" : "obras"}</p>
+            </div>
+          </div>
+          <span className="rounded border border-accent/25 bg-accent/10 px-2 py-1 text-[11px] font-semibold text-accent">{config.label}</span>
+        </header>
+
+        <form onSubmit={submitSearch} className="relative mx-auto mt-5 max-w-3xl">
+          <Search size={18} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500" aria-hidden="true" />
+          <input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Buscar web novel"
+            aria-label={`Buscar web novel no ${config.label}`}
+            className="h-11 w-full rounded border border-line bg-panel pl-10 pr-24 text-sm text-zinc-100 outline-none transition focus:border-accent"
+          />
+          <button type="submit" className="absolute right-1.5 top-1.5 h-8 rounded bg-accent px-4 text-xs font-bold text-black transition hover:bg-accent-dim">
+            Buscar
+          </button>
+        </form>
+
+        {activeQuery && (
+          <div className="mt-3 flex items-center justify-center gap-2 text-xs text-muted">
+            Resultados para "{activeQuery}"
+            <button
+              type="button"
+              onClick={() => { setQuery(""); setActiveQuery("") }}
+              className="grid h-6 w-6 place-items-center rounded text-zinc-400 hover:bg-soft hover:text-zinc-100"
+              aria-label="Limpar busca"
+              title="Limpar busca"
+            >
+              <X size={14} aria-hidden="true" />
+            </button>
+          </div>
+        )}
+
+        {error && <p className="mt-4 rounded border border-red-900 bg-red-950/30 px-3 py-2 text-sm text-red-200">{error}</p>}
+
+        <div className="py-5">
+          {loading ? (
+            <div className="grid grid-cols-1 gap-2 lg:grid-cols-2">
+              {Array.from({ length: 8 }, (_, index) => <MangaCardSkeleton key={index} />)}
+            </div>
+          ) : items.length ? (
+            <div className="grid grid-cols-1 gap-2 lg:grid-cols-2">
+              {items.map((manga, index) => (
+                <MangaCard key={mangaStorageKey(manga)} manga={manga} priority={index < 6} onSelect={onOpen} />
+              ))}
+            </div>
+          ) : (
+            <div className="grid min-h-52 place-items-center text-center">
+              <div>
+                <BookText size={30} className="mx-auto text-zinc-600" aria-hidden="true" />
+                <p className="mt-3 text-sm font-semibold text-zinc-300">Nenhuma web novel encontrada</p>
+              </div>
+            </div>
+          )}
+        </div>
+      </section>
+    </main>
+  )
+}
+
+function WebNovelsPluginPage({ onOpen, onChanged }) {
+  const [tab, setTab] = useState("novel-mania")
+  return (
+    <>
+      <div className="mx-auto flex w-full max-w-[1600px] gap-1 px-4 pt-5" role="tablist" aria-label="Fontes de web novel">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "novel-mania"}
+          onClick={() => setTab("novel-mania")}
+          className={`flex h-9 items-center gap-2 rounded px-3 text-xs font-bold transition ${tab === "novel-mania" ? "bg-accent text-black" : "border border-line bg-panel text-zinc-300 hover:border-accent"}`}
+        >
+          <BookText size={15} aria-hidden="true" /> Novel Mania
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "central-novel"}
+          onClick={() => setTab("central-novel")}
+          className={`flex h-9 items-center gap-2 rounded px-3 text-xs font-bold transition ${tab === "central-novel" ? "bg-accent text-black" : "border border-line bg-panel text-zinc-300 hover:border-accent"}`}
+        >
+          <BookOpen size={15} aria-hidden="true" /> Central Novel
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "tensura-fan"}
+          onClick={() => setTab("tensura-fan")}
+          className={`flex h-9 items-center gap-2 rounded px-3 text-xs font-bold transition ${tab === "tensura-fan" ? "bg-accent text-black" : "border border-line bg-panel text-zinc-300 hover:border-accent"}`}
+        >
+          <BookOpen size={15} aria-hidden="true" /> Tensura Fan
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "pleiades-translations"}
+          onClick={() => setTab("pleiades-translations")}
+          className={`flex h-9 items-center gap-2 rounded px-3 text-xs font-bold transition ${tab === "pleiades-translations" ? "bg-accent text-black" : "border border-line bg-panel text-zinc-300 hover:border-accent"}`}
+        >
+          <BookOpen size={15} aria-hidden="true" /> Pleiades
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "local"}
+          onClick={() => setTab("local")}
+          className={`flex h-9 items-center gap-2 rounded px-3 text-xs font-bold transition ${tab === "local" ? "bg-accent text-black" : "border border-line bg-panel text-zinc-300 hover:border-accent"}`}
+        >
+          <Upload size={15} aria-hidden="true" /> Minha biblioteca
+        </button>
+      </div>
+      {tab !== "local" ? (
+        <RemoteNovelsPluginPage source={tab} onOpen={onOpen} />
+      ) : (
+        <PluginLibraryPage kind="novels" onOpen={onOpen} onChanged={onChanged} />
+      )}
+    </>
+  )
+}
+
+function PluginLibraryPage({ kind, onOpen, onChanged }) {
+  const config = LOCAL_LIBRARY_CONFIG[kind] ?? LOCAL_LIBRARY_CONFIG.hq
+  const Icon = config.Icon
+  const [items, setItems] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [uploading, setUploading] = useState(false)
+  const [error, setError] = useState("")
+  const [title, setTitle] = useState("")
+  const [secondary, setSecondary] = useState("")
+  const [file, setFile] = useState(null)
+  const fileInputRef = useRef(null)
+
+  const loadLibrary = useCallback(async () => {
+    setLoading(true)
+    setError("")
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/${config.endpoint}/library`)
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
+      setItems(data.items ?? [])
+    } catch (cause) {
+      setError(cause.message || `Nao consegui carregar ${config.title.toLowerCase()}.`)
+    } finally {
+      setLoading(false)
+    }
+  }, [config.endpoint, config.title])
+
+  useEffect(() => {
+    setItems([])
+    setTitle("")
+    setSecondary("")
+    setFile(null)
+    if (fileInputRef.current) fileInputRef.current.value = ""
+    void loadLibrary()
+  }, [kind, loadLibrary])
+
+  const importItem = async (event) => {
+    event.preventDefault()
+    if (!file || uploading) return
+    const body = new FormData()
+    body.append("file", file)
+    if (title.trim()) body.append("title", title.trim())
+    if (secondary.trim()) body.append(config.secondaryKey, secondary.trim())
+    setUploading(true)
+    setError("")
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/${config.endpoint}/import`, { method: "POST", body })
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
+      setFile(null)
+      setTitle("")
+      setSecondary("")
+      if (fileInputRef.current) fileInputRef.current.value = ""
+      await loadLibrary()
+      onChanged?.()
+    } catch (cause) {
+      setError(cause.message || `Nao consegui importar em ${config.title.toLowerCase()}.`)
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  const removeItem = async (manga) => {
+    const itemId = String(manga.source_url || "").split("/").filter(Boolean).at(-1)
+    if (!itemId) return
+    if (!window.confirm(`Remover "${manga.title}" da biblioteca local?`)) return
+    setError("")
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/${config.endpoint}/${encodeURIComponent(itemId)}`, {
+        method: "DELETE",
+      })
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
+      setItems((current) => current.filter((item) => mangaStorageKey(item) !== mangaStorageKey(manga)))
+      onChanged?.()
+    } catch (cause) {
+      setError(cause.message || "Nao consegui remover obra.")
+    }
+  }
+
+  return (
+    <main className="mx-auto min-h-[calc(100vh-72px)] w-full max-w-[1600px] px-4 py-6">
+      <section aria-labelledby={`${kind}-library-title`}>
+        <header className="flex items-center justify-between border-b border-line pb-4">
+          <div className="flex items-center gap-3">
+            <Icon size={22} className="text-accent" aria-hidden="true" />
+            <div>
+              <h1 id={`${kind}-library-title`} className="text-xl font-black text-zinc-50">{config.title}</h1>
+              <p className="text-xs text-muted">{items.length} {items.length === 1 ? "obra" : "obras"}</p>
+            </div>
+          </div>
+          <span className="rounded border border-accent/25 bg-accent/10 px-2 py-1 text-[11px] font-semibold text-accent">{config.source}</span>
+        </header>
+
+        <form onSubmit={importItem} className="mt-4 grid gap-3 border-b border-line/70 pb-5 md:grid-cols-[1fr_180px_1.4fr_auto] md:items-end">
+          <label className="text-xs font-semibold text-zinc-300">
+            Titulo
+            <input
+              value={title}
+              maxLength={180}
+              onChange={(event) => setTitle(event.target.value)}
+              placeholder="Detectar pelo arquivo"
+              className="mt-1.5 h-10 w-full rounded border border-line bg-app px-3 text-sm text-zinc-100 outline-none focus:border-accent"
+            />
+          </label>
+          <label className="text-xs font-semibold text-zinc-300">
+            {config.secondaryLabel}
+            <input
+              value={secondary}
+              maxLength={180}
+              onChange={(event) => setSecondary(event.target.value)}
+              placeholder={config.secondaryPlaceholder}
+              className="mt-1.5 h-10 w-full rounded border border-line bg-app px-3 text-sm text-zinc-100 outline-none focus:border-accent"
+            />
+          </label>
+          <label className="text-xs font-semibold text-zinc-300">
+            Arquivo
+            <input
+              ref={fileInputRef}
+              type="file"
+              required
+              accept={config.accept}
+              onChange={(event) => setFile(event.target.files?.[0] ?? null)}
+              className="mt-1.5 block h-10 w-full rounded border border-line bg-app text-xs text-zinc-300 file:mr-3 file:h-full file:border-0 file:border-r file:border-line file:bg-soft file:px-3 file:text-xs file:font-semibold file:text-zinc-100"
+            />
+          </label>
+          <button
+            type="submit"
+            disabled={!file || uploading}
+            className="flex h-10 items-center justify-center gap-2 rounded bg-accent px-4 text-sm font-bold text-black transition hover:bg-accent-dim disabled:cursor-wait disabled:opacity-50"
+          >
+            {uploading ? <Loader2 size={16} className="animate-spin" /> : <Upload size={16} />}
+            Importar
+          </button>
+        </form>
+
+        {error && <p className="mt-4 rounded border border-red-900 bg-red-950/30 px-3 py-2 text-sm text-red-200">{error}</p>}
+
+        <div className="py-5">
+          {loading ? (
+            <div className="grid min-h-52 place-items-center text-muted"><Loader2 size={24} className="animate-spin" /></div>
+          ) : items.length ? (
+            <div className="grid grid-cols-1 gap-2 lg:grid-cols-2">
+              {items.map((manga, index) => (
+                <div key={mangaStorageKey(manga)} className="relative">
+                  <MangaCard
+                    manga={manga}
+                    priority={index < 4}
+                    onSelect={onOpen}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => removeItem(manga)}
+                    aria-label={`Remover ${manga.title}`}
+                    title="Remover da biblioteca"
+                    className="absolute bottom-2 right-2 grid h-7 w-7 place-items-center rounded border border-red-900/70 bg-app/90 text-red-300 transition hover:border-red-500 hover:text-red-100"
+                  >
+                    <Trash2 size={13} aria-hidden="true" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="grid min-h-52 place-items-center text-center">
+              <div>
+                <Icon size={30} className="mx-auto text-zinc-600" aria-hidden="true" />
+                <p className="mt-3 text-sm font-semibold text-zinc-300">Biblioteca vazia</p>
+                <p className="mt-1 text-xs text-muted">Importe {config.formats}.</p>
+              </div>
+            </div>
+          )}
+        </div>
+      </section>
+    </main>
   )
 }
 
@@ -732,7 +1455,7 @@ function fileToDataUrl(file) {
   })
 }
 
-function ProfilePanel({ profile, historyCount, onClose, onSave, onProfileChange, authed, onOpenAuth, onLogout }) {
+function ProfilePanel({ profile, historyCount, onClose, onSave, onProfileChange, onShowHistory, onShowFavorites, onShowLibrary, authed, onOpenAuth, onLogout }) {
   const [name, setName] = useState(profile?.display_name || "Leitor")
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState("")
@@ -901,6 +1624,28 @@ function ProfilePanel({ profile, historyCount, onClose, onSave, onProfileChange,
     }
   }
 
+  const syncAccount = async (provider, label) => {
+    if (!profile?.id) return
+    setLinking(`sync:${provider}`)
+    setError("")
+    setNotice("")
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/profiles/${encodeURIComponent(profile.id)}/sync/${provider}`, { method: "POST" })
+      const data = await response.json().catch(() => null)
+      if (!response.ok) {
+        setError((data && data.detail) || `Nao consegui sincronizar ${label}.`)
+        return
+      }
+      onProfileChange?.(data.profile)
+      const sync = data.sync || {}
+      setNotice(`${label}: ${sync.matched_count || 0}/${sync.list_count || 0} obras no Kari, ${sync.added_count || 0} novas na lista.`)
+    } catch {
+      setError(`Nao consegui sincronizar ${label}.`)
+    } finally {
+      setLinking("")
+    }
+  }
+
   const avatarSrc = resolveApiUrl(profile.avatar_url)
   const backgroundSrc = resolveApiUrl(profile.background_url || profile.home_background_url)
   const links = profile.links || {}
@@ -1021,15 +1766,31 @@ function ProfilePanel({ profile, historyCount, onClose, onSave, onProfileChange,
             className="mt-2 h-10 w-full rounded border border-line/70 bg-app/50 px-3 text-sm text-zinc-100 outline-none backdrop-blur focus:border-accent"
           />
 
-          <div className="mt-4 grid grid-cols-2 gap-2">
-            <div className="rounded border border-line/70 bg-soft/40 px-3 py-2 backdrop-blur">
+          <div className="mt-4 grid grid-cols-3 gap-2">
+            <button
+              type="button"
+              onClick={onShowFavorites}
+              className="rounded border border-line/70 bg-soft/40 px-3 py-2 text-left backdrop-blur transition hover:border-accent/60 hover:bg-accent/10 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+            >
               <p className="text-[10px] uppercase text-muted">Favoritos</p>
               <p className="mt-1 text-lg font-black text-zinc-100">{profile.favorites?.length || 0}</p>
-            </div>
-            <div className="rounded border border-line/70 bg-soft/40 px-3 py-2 backdrop-blur">
+            </button>
+            <button
+              type="button"
+              onClick={onShowHistory}
+              className="rounded border border-line/70 bg-soft/40 px-3 py-2 text-left backdrop-blur transition hover:border-accent/60 hover:bg-accent/10 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+            >
               <p className="text-[10px] uppercase text-muted">Historico</p>
               <p className="mt-1 text-lg font-black text-zinc-100">{historyCount}</p>
-            </div>
+            </button>
+            <button
+              type="button"
+              onClick={onShowLibrary}
+              className="rounded border border-line/70 bg-soft/40 px-3 py-2 text-left backdrop-blur transition hover:border-accent/60 hover:bg-accent/10 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+            >
+              <p className="text-[10px] uppercase text-muted">Minha lista</p>
+              <p className="mt-1 text-lg font-black text-zinc-100">{profile.library?.length || 0}</p>
+            </button>
           </div>
 
           {/* Conta (cadastro/login) */}
@@ -1127,7 +1888,8 @@ function ProfilePanel({ profile, historyCount, onClose, onSave, onProfileChange,
               {PROFILE_PROVIDERS.map(({ key, label }) => {
                 const link = links[key]
                 const configured = providerConfig[key]?.configured
-                const busy = linking === key
+                const busy = linking === key || linking === `sync:${key}`
+                const syncBusy = linking === `sync:${key}`
                 return (
                   <div key={key} className="flex items-center justify-between gap-2 rounded border border-line/70 bg-soft/40 px-3 py-2 backdrop-blur">
                     <div className="flex min-w-0 items-center gap-2">
@@ -1138,23 +1900,42 @@ function ProfilePanel({ profile, historyCount, onClose, onSave, onProfileChange,
                         <p className="truncate text-xs font-semibold text-zinc-100">{label}</p>
                         {link
                           ? (
-                            <a href={link.url || "#"} target="_blank" rel="noreferrer" className="flex items-center gap-1 truncate text-[11px] text-accent hover:underline">
-                              {link.name || "vinculado"} <ExternalLink size={10} />
-                            </a>
+                            <>
+                              <a href={link.url || "#"} target="_blank" rel="noreferrer" className="flex items-center gap-1 truncate text-[11px] text-accent hover:underline">
+                                {link.name || "vinculado"} <ExternalLink size={10} />
+                              </a>
+                              {link.synced_at > 0 && (
+                                <p className="truncate text-[10px] text-muted">
+                                  {link.matched_count}/{link.list_count} obras sincronizadas
+                                </p>
+                              )}
+                            </>
                           )
                           : <p className="truncate text-[11px] text-muted">{configured ? "nao vinculado" : "indisponivel no servidor"}</p>}
                       </div>
                     </div>
                     {link
                       ? (
-                        <button
-                          type="button"
-                          onClick={() => unlinkAccount(key)}
-                          disabled={busy}
-                          className="flex shrink-0 items-center gap-1 rounded border border-line px-2 py-1 text-[11px] font-semibold text-red-300 hover:border-red-400/50 disabled:opacity-60"
-                        >
-                          {busy ? <Loader2 size={12} className="animate-spin" /> : <Unlink size={12} />} Desvincular
-                        </button>
+                        <div className="flex shrink-0 items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => syncAccount(key, label)}
+                            disabled={busy}
+                            className="flex items-center gap-1 rounded border border-accent/40 bg-accent/10 px-2 py-1 text-[11px] font-semibold text-accent hover:bg-accent/20 disabled:opacity-60"
+                          >
+                            {syncBusy ? <Loader2 size={12} className="animate-spin" /> : <Link2 size={12} />} Sincronizar
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => unlinkAccount(key)}
+                            disabled={busy}
+                            aria-label={`Desvincular ${label}`}
+                            title={`Desvincular ${label}`}
+                            className="grid h-7 w-7 place-items-center rounded border border-line text-red-300 hover:border-red-400/50 disabled:opacity-60"
+                          >
+                            <Unlink size={12} />
+                          </button>
+                        </div>
                       )
                       : (
                         <button
@@ -1185,7 +1966,7 @@ function ProfilePanel({ profile, historyCount, onClose, onSave, onProfileChange,
   )
 }
 
-function MangaDetailPanel({ manga, onClose, onHome, onGenreSelect, isFavorite, onToggleFavorite, onRead }) {
+function MangaDetailPanel({ manga, onClose, onGenreSelect, isFavorite, onToggleFavorite, onRead, libraryEntry, onSaveLibrary, onDeleteLibrary }) {
   const [chapters, setChapters] = useState([])
   const [loadingChapters, setLoadingChapters] = useState(false)
   const [showChaptersLoader, setShowChaptersLoader] = useState(false)
@@ -1203,7 +1984,55 @@ function MangaDetailPanel({ manga, onClose, onHome, onGenreSelect, isFavorite, o
   const [readerSidebarCollapsed, setReaderSidebarCollapsed] = useState(false)
   const [readerBrightness, setReaderBrightness] = useState(100)
   const [readerZoom, setReaderZoom] = useState(100)
+  const [chaptersDescending, setChaptersDescending] = useState(false)
+  const [libraryStatus, setLibraryStatus] = useState("COMPLETED")
+  const [libraryScore, setLibraryScore] = useState("")
+  const [libraryReview, setLibraryReview] = useState("")
+  const [savingLibrary, setSavingLibrary] = useState(false)
+  const [deletingLibrary, setDeletingLibrary] = useState(false)
+  const [libraryMessage, setLibraryMessage] = useState("")
   const readerSwipeStart = useRef(null)
+  const restoredReaderKey = useRef("")
+
+  useEffect(() => {
+    setLibraryStatus(libraryEntry?.status || "COMPLETED")
+    setLibraryScore(libraryEntry?.score == null ? "" : String(libraryEntry.score))
+    setLibraryReview(libraryEntry?.review || "")
+  }, [manga?.id, manga?.source_url, libraryEntry?.score, libraryEntry?.status, libraryEntry?.review])
+
+  const saveLibrary = async () => {
+    if (!manga || !onSaveLibrary) return
+    setSavingLibrary(true)
+    setLibraryMessage("")
+    try {
+      const result = await onSaveLibrary(manga, {
+        status: libraryStatus,
+        score: libraryScore === "" ? null : Number(libraryScore),
+        review: libraryReview,
+      })
+      const remoteScore = result?.anilist?.score
+      setLibraryMessage(
+        result?.anilist?.state === "updated"
+          ? (remoteScore == null ? "Lista atualizada no AniList." : `Nota ${remoteScore} salva no AniList.`)
+          : "Obra salva na sua lista.",
+      )
+    } finally {
+      setSavingLibrary(false)
+    }
+  }
+
+  const deleteLibrary = async () => {
+    if (!manga || !libraryEntry || !onDeleteLibrary) return
+    if (!window.confirm("Remover esta obra da sua lista?")) return
+    setDeletingLibrary(true)
+    setLibraryMessage("")
+    try {
+      const result = await onDeleteLibrary(libraryEntry)
+      setLibraryMessage(result?.anilist?.state === "deleted" ? "Removida da lista e do AniList." : "Obra removida da sua lista.")
+    } finally {
+      setDeletingLibrary(false)
+    }
+  }
 
   useEffect(() => {
     if (!loadingChapters) {
@@ -1345,6 +2174,17 @@ function MangaDetailPanel({ manga, onClose, onHome, onGenreSelect, isFavorite, o
     }
     return String(a.label ?? "").localeCompare(String(b.label ?? ""), "pt-BR", { numeric: true })
   })
+  if (chaptersDescending) orderedChapters.reverse()
+  const textBlocks = useMemo(
+    () => chapterTextBlocks(openedChapter?.content),
+    [openedChapter?.content],
+  )
+  const richTextBlocks = useMemo(
+    () => Array.isArray(openedChapter?.blocks)
+      ? openedChapter.blocks.filter((block) => block?.type === "text" || (block?.type === "image" && block?.src))
+      : [],
+    [openedChapter?.blocks],
+  )
 
   const openChapter = useCallback(async (chapter) => {
     if (!chapter?.url) return
@@ -1353,6 +2193,16 @@ function MangaDetailPanel({ manga, onClose, onHome, onGenreSelect, isFavorite, o
     if (chapter.external_url) {
       window.open(chapter.external_url, "_blank", "noopener,noreferrer")
       return
+    }
+    try {
+      window.localStorage.setItem(READER_SESSION_STORAGE_KEY, JSON.stringify({
+        manga,
+        manga_key: mangaStorageKey(manga),
+        chapter_url: chapter.url,
+        chapter_lang: chapterLang,
+      }))
+    } catch {
+      // Leitor continua funcionando caso armazenamento local esteja indisponivel.
     }
     setLoadingChapter(true)
     setLoaderTick((t) => t + 1)
@@ -1389,6 +2239,19 @@ function MangaDetailPanel({ manga, onClose, onHome, onGenreSelect, isFavorite, o
     }
   }, [chapterLang, manga, onRead])
 
+  useEffect(() => {
+    const session = readReaderSession()
+    if (!session || session.manga_key !== mangaStorageKey(manga)) return
+    if (session.chapter_lang && session.chapter_lang !== chapterLang) {
+      setChapterLang(session.chapter_lang)
+      return
+    }
+    const restoreKey = `${session.manga_key}:${session.chapter_url}:${session.chapter_lang || chapterLang}`
+    if (restoredReaderKey.current === restoreKey) return
+    restoredReaderKey.current = restoreKey
+    void openChapter({ url: session.chapter_url })
+  }, [chapterLang, manga, openChapter])
+
   const openAuthor = useCallback(async (name) => {
     const cleanName = authorName(name)
     if (!cleanName) return
@@ -1405,6 +2268,7 @@ function MangaDetailPanel({ manga, onClose, onHome, onGenreSelect, isFavorite, o
       const params = new URLSearchParams({
         name: cleanName,
         title: detail?.title || manga?.title || "",
+        source_url: manga?.source_url || "",
       })
       const response = await fetch(`${API_BASE_URL}/api/authors/lookup?${params}`, {
         headers: { Accept: "application/json" },
@@ -1436,6 +2300,15 @@ function MangaDetailPanel({ manga, onClose, onHome, onGenreSelect, isFavorite, o
     const target = direction < 0 ? openedChapter.previous : openedChapter.next
     if (target) openChapter({ url: target })
   }, [loadingChapter, openChapter, openedChapter])
+
+  const closeReader = useCallback(() => {
+    // Fecha so leitor fullscreen. Painel da obra continua aberto com capitulos.
+    clearReaderSession()
+    setOpenedChapter(null)
+    setLoadingChapter(false)
+    setFirstChapterPageLoaded(false)
+    setOpenChapterError("")
+  }, [])
 
   useEffect(() => {
     if (!openedChapter) return undefined
@@ -1588,11 +2461,60 @@ function MangaDetailPanel({ manga, onClose, onHome, onGenreSelect, isFavorite, o
             </div>
           </div>
 
+          <section className="mt-5 border-y border-line/70 py-4" aria-label="Minha lista">
+            <div className="flex items-center justify-between gap-3">
+              <h3 className="text-sm font-bold text-zinc-100">Minha lista</h3>
+              {libraryEntry && <span className="text-[10px] font-semibold uppercase text-accent">Salvo</span>}
+            </div>
+            <div className="mt-3 grid grid-cols-[1fr_84px] gap-2">
+              <label className="text-xs text-muted">
+                Status
+                <select value={libraryStatus} onChange={(event) => setLibraryStatus(event.target.value)} className="mt-1 h-9 w-full rounded border border-line bg-soft px-2 text-xs text-zinc-100 outline-none focus:border-accent">
+                  <option value="COMPLETED">Concluido</option>
+                  <option value="CURRENT">Lendo</option>
+                  <option value="PLANNING">Planejo ler</option>
+                  <option value="PAUSED">Pausado</option>
+                  <option value="REPEATING">Relendo</option>
+                  <option value="DROPPED">Abandonado</option>
+                </select>
+              </label>
+              <label className="text-xs text-muted">
+                Nota
+                <input type="number" min="0" max="10" step="0.5" value={libraryScore} onChange={(event) => setLibraryScore(event.target.value)} placeholder="0-10" className="mt-1 h-9 w-full rounded border border-line bg-soft px-2 text-xs text-zinc-100 outline-none focus:border-accent" />
+              </label>
+            </div>
+            <label className="mt-3 block text-xs text-muted">
+              Resenha
+              <textarea value={libraryReview} onChange={(event) => setLibraryReview(event.target.value)} maxLength={4000} rows={3} placeholder="O que voce achou desta obra?" className="mt-1 w-full resize-y rounded border border-line bg-soft px-2 py-2 text-xs text-zinc-100 outline-none focus:border-accent" />
+            </label>
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <button type="button" onClick={saveLibrary} disabled={savingLibrary || deletingLibrary} className="flex h-9 items-center gap-1 rounded border border-accent/40 bg-accent/10 px-3 text-xs font-bold text-accent hover:bg-accent/20 disabled:opacity-60">
+                {savingLibrary ? <Loader2 size={13} className="animate-spin" /> : <BookText size={13} />} {libraryEntry ? "Atualizar lista" : "Salvar na minha lista"}
+              </button>
+              {libraryEntry && (
+                <button type="button" onClick={deleteLibrary} disabled={savingLibrary || deletingLibrary} title="Remover da minha lista" className="grid h-9 w-9 place-items-center rounded border border-rose-300/40 bg-rose-300/10 text-rose-200 transition hover:bg-rose-300/20 disabled:opacity-60">
+                  {deletingLibrary ? <Loader2 size={14} className="animate-spin" /> : <Trash2 size={14} aria-hidden="true" />}
+                </button>
+              )}
+            </div>
+            {libraryMessage && <p className="mt-2 text-xs text-accent">{libraryMessage}</p>}
+          </section>
+
           <div className="mt-6">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <h3 className="text-base font-bold text-zinc-100">Capitulos</h3>
-              {chapterLangs.length > 1 && (
-                <div className="flex flex-wrap items-center gap-1.5">
+              <div className="flex flex-wrap items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setChaptersDescending((current) => !current)}
+                  title={chaptersDescending ? "Mostrar primeiro capítulo no topo" : "Mostrar último capítulo no topo"}
+                  aria-label={chaptersDescending ? "Mostrar primeiro capítulo no topo" : "Mostrar último capítulo no topo"}
+                  className="grid h-7 w-7 place-items-center rounded border border-line bg-soft text-muted transition hover:border-zinc-500 hover:text-zinc-100"
+                >
+                  <ArrowUpDown size={14} aria-hidden="true" />
+                </button>
+                {chapterLangs.length > 1 && (
+                  <>
                   <span className="text-xs text-muted">Idioma:</span>
                   {chapterLangs.map((l) => (
                     <button
@@ -1608,8 +2530,9 @@ function MangaDetailPanel({ manga, onClose, onHome, onGenreSelect, isFavorite, o
                       {langLabel(l)}
                     </button>
                   ))}
-                </div>
-              )}
+                  </>
+                )}
+              </div>
             </div>
             {loadingChapters ? (
               <div
@@ -1684,14 +2607,9 @@ function MangaDetailPanel({ manga, onClose, onHome, onGenreSelect, isFavorite, o
           <header className="sticky top-0 z-30 flex min-h-14 items-center justify-between border-b border-line bg-app/95 px-3 backdrop-blur sm:px-5">
             <button
               type="button"
-              onClick={() => {
-                setOpenedChapter(null)
-                setLoadingChapter(false)
-                setFirstChapterPageLoaded(false)
-                onHome?.()
-              }}
-              aria-label="Voltar ao catalogo"
-              title="Catalogo"
+              onClick={closeReader}
+              aria-label="Fechar leitor"
+              title="Fechar leitor"
               className="grid h-9 w-9 shrink-0 place-items-center text-xl font-black text-accent transition-all duration-200 hover:text-emerald-300 hover:drop-shadow-[0_0_10px_rgba(52,211,153,0.95)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
             >
               K
@@ -1717,13 +2635,8 @@ function MangaDetailPanel({ manga, onClose, onHome, onGenreSelect, isFavorite, o
               </button>
               <button
                 type="button"
-                onClick={() => {
-                  setOpenedChapter(null)
-                  setLoadingChapter(false)
-                  setFirstChapterPageLoaded(false)
-                  onHome?.()
-                }}
-                aria-label="Fechar leitor e voltar ao catalogo"
+                onClick={closeReader}
+                aria-label="Fechar leitor"
                 title="Fechar leitor"
                 className="grid h-9 w-9 place-items-center rounded border border-line bg-soft text-zinc-100 transition hover:border-zinc-500 hover:bg-zinc-800"
               >
@@ -1753,7 +2666,11 @@ function MangaDetailPanel({ manga, onClose, onHome, onGenreSelect, isFavorite, o
                   {openedChapter?.chapter?.label || "Carregando capitulo"}
                 </p>
                 <p className="mt-1 text-xs text-muted">
-                  {openedChapter?.count ? `${openedChapter.count} paginas` : openedChapter?.provider || sourceLabel}
+                  {openedChapter?.mode === "text"
+                    ? "Texto"
+                    : openedChapter?.count
+                      ? `${openedChapter.count} paginas`
+                      : openedChapter?.provider || sourceLabel}
                 </p>
               </div>
               <button
@@ -1827,13 +2744,13 @@ function MangaDetailPanel({ manga, onClose, onHome, onGenreSelect, isFavorite, o
 
               <div>
                 <div className="mb-2 flex items-center justify-between text-xs font-semibold text-zinc-300">
-                  <label htmlFor="reader-zoom">Zoom</label>
+                  <label htmlFor="reader-zoom">{openedChapter?.mode === "text" ? "Fonte" : "Zoom"}</label>
                   <output htmlFor="reader-zoom">{readerZoom}%</output>
                 </div>
                 <input
                   id="reader-zoom"
                   type="range"
-                  min="70"
+                  min="35"
                   max="180"
                   step="5"
                   value={readerZoom}
@@ -1912,6 +2829,42 @@ function MangaDetailPanel({ manga, onClose, onHome, onGenreSelect, isFavorite, o
                 <p className="mt-3 text-sm text-muted">Carregando capitulo...</p>
               </div>
             )}
+            {openedChapter?.mode === "text" && (
+              <article
+                className="mx-auto w-full max-w-[820px] px-4 pb-24 pt-8 text-zinc-200 sm:px-8"
+                style={{
+                  fontSize: `${Math.max(14, Math.round(readerZoom * 0.18))}px`,
+                  lineHeight: 1.85,
+                  filter: `brightness(${readerBrightness}%)`,
+                }}
+              >
+                <h1 className="mb-10 text-2xl font-black text-zinc-50">
+                  {openedChapter?.chapter?.label || openedChapter?.title || "Capitulo"}
+                </h1>
+                {richTextBlocks.length ? richTextBlocks.map((block, index) => (
+                  block.type === "image" ? (
+                    <figure key={`${index}-${block.src}`} className="mb-8 overflow-hidden rounded border border-line/70 bg-panel">
+                      <img
+                        src={resolveReaderContentImage(block.src)}
+                        alt={block.alt || "Ilustracao do capitulo"}
+                        loading="lazy"
+                        decoding="async"
+                        className="mx-auto h-auto max-h-[85vh] max-w-full object-contain"
+                      />
+                    </figure>
+                  ) : (
+                    <p key={`${index}-${String(block.text || "").slice(0, 24)}`} className="mb-6 whitespace-pre-line">
+                      {block.text}
+                    </p>
+                  )
+                )) : textBlocks.map((block, index) => (
+                  <p key={`${index}-${block.slice(0, 24)}`} className="mb-6 whitespace-pre-line">
+                    {block}
+                  </p>
+                ))}
+                {!richTextBlocks.length && !textBlocks.length && <p className="text-muted">Capitulo sem texto.</p>}
+              </article>
+            )}
             {openedChapter?.images?.length > 0 && (
               <div
                 className="mx-auto flex flex-col items-center"
@@ -1958,26 +2911,31 @@ function AuthPanel({ onClose, onSubmit }) {
   const [error, setError] = useState("")
   const [busy, setBusy] = useState(false)
   const [discordOn, setDiscordOn] = useState(false)
+  const [googleOn, setGoogleOn] = useState(false)
 
   useEffect(() => {
     let cancelled = false
     fetch(`${API_BASE_URL}/api/auth/providers`)
       .then((r) => (r.ok ? r.json() : null))
-      .then((d) => { if (d && !cancelled) setDiscordOn(Boolean(d.discord?.configured)) })
+      .then((d) => {
+        if (!d || cancelled) return
+        setDiscordOn(Boolean(d.discord?.configured))
+        setGoogleOn(Boolean(d.google?.configured))
+      })
       .catch(() => {})
     return () => { cancelled = true }
   }, [])
 
-  const loginDiscord = async () => {
+  const loginExternal = async (provider, label) => {
     setError("")
     try {
-      const r = await fetch(`${API_BASE_URL}/api/auth/discord/start`)
+      const r = await fetch(`${API_BASE_URL}/api/auth/${provider}/start`)
       const d = await r.json().catch(() => ({}))
-      if (!r.ok) { setError(d.detail || "Login com Discord indisponivel."); return }
-      const popup = window.open(d.authorize_url, "kari-discord", "width=520,height=760")
-      if (!popup) setError("Habilite popups para entrar com o Discord.")
+      if (!r.ok) { setError(d.detail || `Login com ${label} indisponivel.`); return }
+      const popup = window.open(d.authorize_url, `kari-${provider}`, "width=520,height=760")
+      if (!popup) setError(`Habilite popups para entrar com o ${label}.`)
     } catch {
-      setError("Nao consegui abrir o Discord.")
+      setError(`Nao consegui abrir o ${label}.`)
     }
   }
 
@@ -2063,22 +3021,41 @@ function AuthPanel({ onClose, onSubmit }) {
           {mode === "register" ? "Criar conta" : "Entrar"}
         </button>
 
-        {discordOn && (
+        {(discordOn || googleOn) && (
           <>
             <div className="my-4 flex items-center gap-3 text-[11px] text-muted">
               <span className="h-px flex-1 bg-line" /> ou <span className="h-px flex-1 bg-line" />
             </div>
-            <button
-              type="button"
-              onClick={loginDiscord}
-              className="flex h-10 w-full items-center justify-center gap-2 rounded text-sm font-bold text-white transition hover:brightness-110"
-              style={{ backgroundColor: "#5865F2" }}
-            >
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-                <path d="M20.317 4.369a19.79 19.79 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.211.375-.445.865-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.6 12.6 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.369a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028c.462-.63.874-1.295 1.226-1.994a.076.076 0 0 0-.041-.106 13.1 13.1 0 0 1-1.872-.892.077.077 0 0 1-.008-.128c.126-.094.252-.192.371-.291a.074.074 0 0 1 .078-.01c3.927 1.793 8.18 1.793 12.061 0a.074.074 0 0 1 .079.009c.12.099.245.198.372.292a.077.077 0 0 1-.006.127c-.598.35-1.22.645-1.873.891a.076.076 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.84 19.84 0 0 0 6.002-3.03.077.077 0 0 0 .032-.056c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.028zM8.02 15.331c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.211 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.211 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/>
-              </svg>
-              Continuar com Discord
-            </button>
+            <div className="grid gap-2">
+              {googleOn && (
+                <button
+                  type="button"
+                  onClick={() => loginExternal("google", "Google")}
+                  className="flex h-10 w-full items-center justify-center gap-2 rounded border border-zinc-300 bg-white text-sm font-bold text-zinc-800 transition hover:bg-zinc-100"
+                >
+                  <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true">
+                    <path fill="#4285F4" d="M21.6 12.23c0-.71-.06-1.4-.18-2.07H12v3.91h5.38a4.6 4.6 0 0 1-2 3.02v2.54h3.24c1.9-1.75 2.98-4.33 2.98-7.4Z" />
+                    <path fill="#34A853" d="M12 22c2.7 0 4.98-.9 6.63-2.37l-3.24-2.54c-.9.6-2.05.96-3.39.96-2.61 0-4.82-1.76-5.61-4.13H3.04v2.62A10 10 0 0 0 12 22Z" />
+                    <path fill="#FBBC05" d="M6.39 13.92A6 6 0 0 1 6.08 12c0-.67.11-1.32.31-1.92V7.46H3.04A10 10 0 0 0 2 12c0 1.63.39 3.17 1.04 4.54l3.35-2.62Z" />
+                    <path fill="#EA4335" d="M12 5.95c1.47 0 2.79.5 3.82 1.5l2.88-2.88A9.65 9.65 0 0 0 12 2a10 10 0 0 0-8.96 5.46l3.35 2.62C7.18 7.71 9.39 5.95 12 5.95Z" />
+                  </svg>
+                  Continuar com Google
+                </button>
+              )}
+              {discordOn && (
+                <button
+                  type="button"
+                  onClick={() => loginExternal("discord", "Discord")}
+                  className="flex h-10 w-full items-center justify-center gap-2 rounded text-sm font-bold text-white transition hover:brightness-110"
+                  style={{ backgroundColor: "#5865F2" }}
+                >
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                    <path d="M20.317 4.369a19.79 19.79 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.211.375-.445.865-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.6 12.6 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.369a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028c.462-.63.874-1.295 1.226-1.994a.076.076 0 0 0-.041-.106 13.1 13.1 0 0 1-1.872-.892.077.077 0 0 1-.008-.128c.126-.094.252-.192.371-.291a.074.074 0 0 1 .078-.01c3.927 1.793 8.18 1.793 12.061 0a.074.074 0 0 1 .079.009c.12.099.245.198.372.292a.077.077 0 0 1-.006.127c-.598.35-1.22.645-1.873.891a.076.076 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.84 19.84 0 0 0 6.002-3.03.077.077 0 0 0 .032-.056c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.028zM8.02 15.331c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.211 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.211 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/>
+                  </svg>
+                  Continuar com Discord
+                </button>
+              )}
+            </div>
           </>
         )}
       </form>
@@ -2090,7 +3067,7 @@ function AuthPanel({ onClose, onSubmit }) {
 export default function App() {
   const [query, setQuery] = useState("")
   const [debouncedQuery, setDebouncedQuery] = useState("")
-  const [selectedManga, setSelectedManga] = useState(null)
+  const [selectedManga, setSelectedManga] = useState(() => readReaderSession()?.manga ?? null)
   const [catalogView, setCatalogView] = useState(false)
   const [libraryView, setLibraryView] = useState("")
   const [genreFilter, setGenreFilter] = useState("")
@@ -2098,39 +3075,87 @@ export default function App() {
   const [catalogPages, setCatalogPages] = useState([])
   const [favorites, setFavorites] = useState(() => readStoredMangaList(FAVORITES_STORAGE_KEY))
   const [history, setHistory] = useState(() => readStoredMangaList(HISTORY_STORAGE_KEY))
+  const [historyChapterUpdates, setHistoryChapterUpdates] = useState({})
   const [profile, setProfile] = useState(null)
   const [profileReady, setProfileReady] = useState(false)
   const [profilePanelOpen, setProfilePanelOpen] = useState(false)
+  const [pluginView, setPluginView] = useState("")
   const [headerCollapsed, setHeaderCollapsed] = useState(false)
+  const [headerHidden, setHeaderHidden] = useState(false)
   const [authToken, setAuthToken] = useState(() => window.localStorage.getItem(AUTH_TOKEN_KEY) || "")
   const [authOpen, setAuthOpen] = useState(false)
   const authed = Boolean(authToken)
 
-  // Minimiza a navbar ao rolar pra baixo (mostra so icones + Kari + perfil).
-  // Histerese (colapsa >90, expande <40) evita o flicker perto do limite.
+  const headerHideTimer = useRef(null)
+  const headerScrolled = useRef(false)
+
+  const revealHeader = useCallback(() => {
+    if (headerHideTimer.current) window.clearTimeout(headerHideTimer.current)
+    setHeaderHidden(false)
+  }, [])
+
+  const requestHeaderHide = useCallback(() => {
+    // Painel de obra ocupa viewport; navbar so reaparece enquanto mouse fica no topo.
+    if (!selectedManga && window.scrollY <= 90) return
+    if (headerHideTimer.current) window.clearTimeout(headerHideTimer.current)
+    headerHideTimer.current = window.setTimeout(() => setHeaderHidden(true), 650)
+  }, [selectedManga])
+
+  const updateHeaderForScroll = useCallback((y) => {
+    if (!headerScrolled.current && y > 90) {
+      headerScrolled.current = true
+      setHeaderCollapsed(true)
+      setHeaderHidden(true)
+    } else if (headerScrolled.current && y < 40) {
+      headerScrolled.current = false
+      setHeaderCollapsed(false)
+      setHeaderHidden(false)
+    }
+  }, [])
+
+  // Home usa scroll da janela; catalogo, busca e listas usam containers.
+  // Captura ambos para navbar manter mesmo gesto em toda sessao.
   useEffect(() => {
-    let collapsedNow = false
     let ticking = false
+    let pendingY = window.scrollY
     const evaluate = () => {
       ticking = false
-      const y = window.scrollY
-      if (!collapsedNow && y > 90) {
-        collapsedNow = true
-        setHeaderCollapsed(true)
-      } else if (collapsedNow && y < 40) {
-        collapsedNow = false
-        setHeaderCollapsed(false)
-      }
+      updateHeaderForScroll(pendingY)
     }
-    const onScroll = () => {
+    const schedule = (y) => {
+      pendingY = y
       if (ticking) return
       ticking = true
       window.requestAnimationFrame(evaluate)
     }
-    window.addEventListener("scroll", onScroll, { passive: true })
-    evaluate()
-    return () => window.removeEventListener("scroll", onScroll)
-  }, [])
+    const onWindowScroll = () => schedule(window.scrollY)
+    const onContainerScroll = (event) => {
+      const target = event.target
+      if (target instanceof Element && target !== document.documentElement) {
+        schedule(target.scrollTop)
+      }
+    }
+    window.addEventListener("scroll", onWindowScroll, { passive: true })
+    document.addEventListener("scroll", onContainerScroll, { capture: true, passive: true })
+    schedule(window.scrollY)
+    return () => {
+      window.removeEventListener("scroll", onWindowScroll)
+      document.removeEventListener("scroll", onContainerScroll, true)
+      if (headerHideTimer.current) window.clearTimeout(headerHideTimer.current)
+    }
+  }, [updateHeaderForScroll])
+
+  useEffect(() => {
+    if (selectedManga) {
+      if (headerHideTimer.current) window.clearTimeout(headerHideTimer.current)
+      setHeaderCollapsed(true)
+      setHeaderHidden(true)
+      return
+    }
+    const scrolled = headerScrolled.current || window.scrollY > 90
+    setHeaderCollapsed(scrolled)
+    setHeaderHidden(scrolled)
+  }, [selectedManga])
   const profileBootstrapStarted = useRef(false)
 
   useEffect(() => {
@@ -2280,7 +3305,39 @@ export default function App() {
   const payload = catalogQuery.data
   const mangas = payload?.items ?? []
   const sections = payload?.sections ?? []
-  const libraryItems = libraryView === "favorites" ? favorites : history
+  const hydratedHistory = useMemo(() => {
+    const profileByTitle = new Map()
+    for (const item of profile?.library ?? []) {
+      const key = mangaTitleKey(item)
+      if (key) profileByTitle.set(key, item)
+      const aliasKey = mangaTitleAliasKey(item)
+      if (aliasKey) profileByTitle.set(aliasKey, item)
+    }
+    const catalogBySource = new Map()
+    for (const item of [...mangas, ...sections.flatMap((section) => section.items ?? [])]) {
+      const key = mangaStorageKey(item)
+      if (key) catalogBySource.set(key, item)
+    }
+    return history.map((item) => {
+      const currentProfileItem = profileByTitle.get(mangaTitleKey(item))
+        ?? profileByTitle.get(mangaTitleAliasKey(item))
+      const currentCatalogItem = catalogBySource.get(mangaStorageKey(item))
+      return currentProfileItem
+        ? { ...item, ...currentProfileItem }
+        : currentCatalogItem
+          ? { ...item, ...currentCatalogItem }
+          : item
+    })
+  }, [history, mangas, profile?.library, sections])
+  const refreshedHistory = useMemo(() => hydratedHistory.map((item) => ({
+    ...item,
+    ...(historyChapterUpdates[mangaStorageKey(item)] ?? {}),
+  })), [historyChapterUpdates, hydratedHistory])
+  const libraryItems = libraryView === "favorites"
+    ? favorites
+    : libraryView === "library"
+      ? (profile?.library ?? [])
+      : refreshedHistory
   const visibleMangas = libraryView ? libraryItems : pagedCatalog ? catalogPages : mangas
   const total = libraryView ? libraryItems.length : (payload?.total ?? mangas.length)
   // Skeleton SO no primeiro carregamento (sem dado em cache). Voltar do modal
@@ -2315,10 +3372,12 @@ export default function App() {
   }, [catalogQuery.isPlaceholderData, pagedCatalog, payload, requestOffset])
 
   const handleHome = useCallback(() => {
+    clearReaderSession()
     setQuery("")
     setDebouncedQuery("")
     setCatalogView(false)
     setLibraryView("")
+    setPluginView("")
     setGenreFilter("")
     setSelectedManga(null)
     window.scrollTo({ top: 0, behavior: "smooth" })
@@ -2329,6 +3388,7 @@ export default function App() {
     setDebouncedQuery("")
     setCatalogView(true)
     setLibraryView("")
+    setPluginView("")
     setGenreFilter("")
     setSelectedManga(null)
     window.scrollTo({ top: 0, behavior: "smooth" })
@@ -2340,14 +3400,18 @@ export default function App() {
     setGenreFilter(String(genre || ""))
     setCatalogView(true)
     setLibraryView("")
+    setPluginView("")
     setSelectedManga(null)
     window.scrollTo({ top: 0, behavior: "smooth" })
   }, [])
 
   const handleQueryChange = useCallback((value) => {
     setQuery(value)
-    if (String(value || "").trim()) setLibraryView("")
-    if (String(value || "").trim()) setGenreFilter("")
+    if (String(value || "").trim()) {
+      setLibraryView("")
+      setPluginView("")
+      setGenreFilter("")
+    }
   }, [])
 
   const showLibrary = useCallback((view) => {
@@ -2355,7 +3419,62 @@ export default function App() {
     setDebouncedQuery("")
     setCatalogView(false)
     setGenreFilter("")
+    setPluginView("")
     setLibraryView(view)
+    setSelectedManga(null)
+    if ((view === "library" || view === "favorites" || view === "history") && profile?.id) {
+      void fetch(`${API_BASE_URL}/api/profiles/${encodeURIComponent(profile.id)}`)
+        .then((response) => response.ok ? response.json() : null)
+        .then((data) => {
+          if (!data) return
+          setProfile(data)
+          if (Array.isArray(data.favorites)) setFavorites(data.favorites)
+        })
+        .catch(() => {})
+    }
+    window.scrollTo({ top: 0, behavior: "smooth" })
+  }, [profile?.id])
+
+  useEffect(() => {
+    if (libraryView !== "history" || !hydratedHistory.length) return undefined
+    let cancelled = false
+    let retryTimer = null
+    let attempts = 0
+
+    const refreshCards = async () => {
+      try {
+        const response = await fetch(`${API_BASE_URL}/api/chapter-cards/refresh`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ items: hydratedHistory.slice(0, 80) }),
+        })
+        if (!response.ok || cancelled) return
+        const data = await response.json()
+        if (data?.items) setHistoryChapterUpdates((current) => ({ ...current, ...data.items }))
+        // Auditoria roda em fila compartilhada com home. Continua consultando sem
+        // bloquear UI; antes parava apos 20s e deixava skeleton congelado.
+        if (data?.refreshing && attempts++ < 40 && !cancelled) {
+          retryTimer = window.setTimeout(refreshCards, 1500)
+        }
+      } catch {
+        // Mantem ultimo snapshot; nova abertura tenta novamente.
+      }
+    }
+
+    void refreshCards()
+    return () => {
+      cancelled = true
+      if (retryTimer) window.clearTimeout(retryTimer)
+    }
+  }, [hydratedHistory, libraryView])
+
+  const showPlugin = useCallback((view) => {
+    setQuery("")
+    setDebouncedQuery("")
+    setCatalogView(false)
+    setGenreFilter("")
+    setLibraryView("")
+    setPluginView(view)
     setSelectedManga(null)
     window.scrollTo({ top: 0, behavior: "smooth" })
   }, [])
@@ -2437,6 +3556,19 @@ export default function App() {
     setProfile(await response.json())
   }, [profile?.id])
 
+  const applyProfileChange = useCallback((nextProfile) => {
+    if (!nextProfile) return
+    setProfile(nextProfile)
+    if (Array.isArray(nextProfile.favorites)) setFavorites(nextProfile.favorites)
+  }, [])
+
+  const refreshProfile = useCallback(async () => {
+    if (!profile?.id) return
+    const response = await fetch(`${API_BASE_URL}/api/profiles/${encodeURIComponent(profile.id)}`)
+    if (!response.ok) return
+    applyProfileChange(await response.json())
+  }, [applyProfileChange, profile?.id])
+
   const rememberRead = useCallback((manga) => {
     const key = mangaStorageKey(manga)
     if (!key) return
@@ -2453,14 +3585,42 @@ export default function App() {
     ))
   }, [])
 
+  const saveLibraryEntry = useCallback(async (manga, entry) => {
+    if (!profile?.id) throw new Error("profile")
+    const response = await fetch(`${API_BASE_URL}/api/profiles/${encodeURIComponent(profile.id)}/library`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ item: manga, ...entry }),
+    })
+    const data = await response.json().catch(() => null)
+    if (!response.ok) throw new Error(data?.detail || "Nao consegui salvar na lista.")
+    applyProfileChange(data?.profile ?? data)
+    return data
+  }, [applyProfileChange, profile?.id])
+
+  const deleteLibraryEntry = useCallback(async (entry) => {
+    if (!profile?.id) throw new Error("profile")
+    const response = await fetch(`${API_BASE_URL}/api/profiles/${encodeURIComponent(profile.id)}/library`, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ item: entry }),
+    })
+    const data = await response.json().catch(() => null)
+    if (!response.ok) throw new Error(data?.detail || "Nao consegui remover da lista.")
+    applyProfileChange(data?.profile ?? data)
+    return data
+  }, [applyProfileChange, profile?.id])
+
   const selectedIsFavorite = Boolean(selectedManga && favorites.some(
     (item) => mangaStorageKey(item) === mangaStorageKey(selectedManga),
   ))
 
   const handleDetailClose = useCallback(() => {
+    clearReaderSession()
     setSelectedManga(null)
+    void refreshProfile()
     void catalogQuery.refetch()
-  }, [catalogQuery])
+  }, [catalogQuery, refreshProfile])
 
   const homeBackground = profile?.home_background_url
     ? resolveApiUrl(profile.home_background_url)
@@ -2496,38 +3656,69 @@ export default function App() {
         onQueryChange={handleQueryChange}
         onHome={handleHome}
         onCatalog={handleCatalog}
+        onPluginSelect={showPlugin}
         onHistory={() => showLibrary("history")}
         onFavorites={() => showLibrary("favorites")}
         onProfile={openProfile}
         profile={profile}
         libraryView={libraryView}
+        pluginView={pluginView}
         activeGenre={genreFilter}
         onClearGenre={handleCatalog}
         total={total}
         isSearching={isSearching}
         collapsed={headerCollapsed}
+        hidden={headerHidden}
+        onReveal={revealHeader}
+        onRequestHide={requestHeaderHide}
       />
-      {error && (
+      {headerHidden && (
+        <div
+          className="fixed inset-x-0 top-0 z-20 h-3"
+          onMouseEnter={revealHeader}
+          aria-hidden="true"
+        />
+      )}
+      {!pluginView && error && (
         <div className="mx-5 mt-4 rounded-md border border-red-900 bg-red-950/30 px-4 py-3 text-sm text-red-200">
           {error}
         </div>
       )}
-      {loading ? (
+      {pluginView ? (
+        pluginView === "hq" ? (
+          <HQNowPluginPage onOpen={setSelectedManga} />
+        ) : pluginView === "novels" ? (
+          <WebNovelsPluginPage
+            onOpen={setSelectedManga}
+            onChanged={() => void catalogQuery.refetch()}
+          />
+        ) : (
+          <PluginLibraryPage
+            kind="hq"
+            onOpen={setSelectedManga}
+            onChanged={() => void catalogQuery.refetch()}
+          />
+        )
+      ) : loading ? (
         <SkeletonGrid />
       ) : isSearching || catalogView || libraryView ? (
         visibleMangas.length ? (
-          <VirtualMangaGrid
-            mangas={visibleMangas}
-            onSelect={setSelectedManga}
-            canLoadMore={canLoadMore}
-            loadingMore={catalogQuery.isFetching && requestOffset > 0}
-            onLoadMore={() => setCatalogOffset((offset) => Math.min(
-              offset + CATALOG_PAGE_SIZE,
-              CATALOG_MAX_LIMIT - CATALOG_PAGE_SIZE,
-            ))}
-          />
+          debouncedQuery ? (
+            <SearchSourceColumns mangas={visibleMangas} onSelect={setSelectedManga} />
+          ) : (
+            <VirtualMangaGrid
+              mangas={visibleMangas}
+              onSelect={setSelectedManga}
+              canLoadMore={canLoadMore}
+              loadingMore={catalogQuery.isFetching && requestOffset > 0}
+              onLoadMore={() => setCatalogOffset((offset) => Math.min(
+                offset + CATALOG_PAGE_SIZE,
+                CATALOG_MAX_LIMIT - CATALOG_PAGE_SIZE,
+              ))}
+            />
+          )
         ) : (
-          <SearchEmptyState query={libraryView === "history" ? "historico" : libraryView === "favorites" ? "favoritos" : catalogView ? "catalogo" : debouncedQuery} />
+          <SearchEmptyState query={libraryView === "history" ? "historico" : libraryView === "favorites" ? "favoritos" : libraryView === "library" ? "minha lista" : catalogView ? "catalogo" : debouncedQuery} />
         )
       ) : (
         <>
@@ -2538,11 +3729,13 @@ export default function App() {
       <MangaDetailPanel
         manga={selectedManga}
         onClose={handleDetailClose}
-        onHome={handleHome}
         onGenreSelect={handleGenreSelect}
         isFavorite={selectedIsFavorite}
         onToggleFavorite={toggleFavorite}
         onRead={rememberRead}
+        libraryEntry={selectedManga ? (profile?.library ?? []).find((item) => mangaStorageKey(item) === mangaStorageKey(selectedManga)) : null}
+        onSaveLibrary={saveLibraryEntry}
+        onDeleteLibrary={deleteLibraryEntry}
       />
       {profilePanelOpen && (
         <ProfilePanel
@@ -2550,7 +3743,10 @@ export default function App() {
           historyCount={history.length}
           onClose={() => setProfilePanelOpen(false)}
           onSave={saveProfile}
-          onProfileChange={setProfile}
+          onProfileChange={applyProfileChange}
+          onShowHistory={() => { setProfilePanelOpen(false); showLibrary("history") }}
+          onShowFavorites={() => { setProfilePanelOpen(false); showLibrary("favorites") }}
+          onShowLibrary={() => { setProfilePanelOpen(false); showLibrary("library") }}
           authed={authed}
           onOpenAuth={() => { setProfilePanelOpen(false); setAuthOpen(true) }}
           onLogout={handleLogout}

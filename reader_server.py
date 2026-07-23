@@ -29,6 +29,14 @@ from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 import cloudscraper
 import requests
 from PIL import Image
+from plugins.fliptru import FliptruPlugin
+from plugins.central_novel import CentralNovelPlugin
+from plugins.hq_local import HQLocalPlugin
+from plugins.hq_now import HQNowPlugin
+from plugins.light_novel_local import LightNovelLocalPlugin
+from plugins.novel_mania import NovelManiaPlugin
+from plugins.pleiades_translations import PleiadesTranslationsPlugin
+from plugins.tensura_fan import TensuraFanPlugin
 try:
     from curl_cffi import requests as curl_requests
 except Exception:
@@ -153,6 +161,9 @@ DEFAULT_PIECEPROJECT_URL = "https://www.pieceproject.xyz/"
 DEFAULT_DRAGONTEA_BASE_URL = "https://dragontea.ink"
 DEFAULT_TOOMICS_BASE_URL = "https://global.toomics.com"
 DEFAULT_MANGAKATANA_BASE_URL = "https://mangakatana.com"
+DEFAULT_MANGAGEEK_API_BASE = "http://geekstations.com.br/api/v2"
+DEFAULT_NEXUS_BASE_URL = "https://www.nexusmangas.com"
+DEFAULT_NEXUS_API_BASE = "https://supabase.nexusmangas.com"
 DEFAULT_MANGALIVRE_BASE_URL = "https://mangalivre.blog"
 DEFAULT_YUMO_API_BASE = "https://api.yomumangas.com"
 DEFAULT_YUMO_CDN_BASE = "https://b2.yomumangas.com"
@@ -1234,6 +1245,14 @@ class MangaReader:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.cache = TemporaryChapterCache()
+        self.hq_plugin = HQLocalPlugin()
+        self.hq_now_plugin = HQNowPlugin()
+        self.fliptru_plugin = FliptruPlugin()
+        self.central_novel_plugin = CentralNovelPlugin()
+        self.light_novel_plugin = LightNovelLocalPlugin()
+        self.novel_mania_plugin = NovelManiaPlugin()
+        self.pleiades_translations_plugin = PleiadesTranslationsPlugin()
+        self.tensura_fan_plugin = TensuraFanPlugin()
         self.driver = None
         self.state: ChapterState | None = None
         self.lock = threading.RLock()
@@ -1257,6 +1276,27 @@ class MangaReader:
             or os.environ.get("MANGAKATANA_BASE_URL")
             or DEFAULT_MANGAKATANA_BASE_URL
         ).rstrip("/")
+        self.mangageek_api_base = (
+            getattr(args, "mangageek_api_base", None)
+            or os.environ.get("MANGAGEEK_API_BASE")
+            or DEFAULT_MANGAGEEK_API_BASE
+        ).rstrip("/")
+        self.nexus_base_url = (
+            getattr(args, "nexus_base_url", None)
+            or os.environ.get("NEXUS_BASE_URL")
+            or DEFAULT_NEXUS_BASE_URL
+        ).rstrip("/")
+        self.nexus_api_base = (
+            getattr(args, "nexus_api_base", None)
+            or os.environ.get("NEXUS_API_BASE")
+            or DEFAULT_NEXUS_API_BASE
+        ).rstrip("/")
+        self.nexus_anon_key = (
+            getattr(args, "nexus_anon_key", None)
+            or os.environ.get("NEXUS_ANON_KEY")
+            or ""
+        ).strip()
+        self._nexus_key_lock = threading.Lock()
         self.mangalivre_base_url = (
             getattr(args, "mangalivre_base_url", None)
             or os.environ.get("MANGALIVRE_BASE_URL")
@@ -1303,6 +1343,7 @@ class MangaReader:
         self._mangalivre_chapters_cache: dict[str, tuple[float, list[Chapter]]] = {}
         self._mangasbrasuka_page_images_cache: dict[str, tuple[float, list[str]]] = {}
         self._mangasbrasuka_chapter_images_cache: dict[str, tuple[float, list[str]]] = {}
+        self._mangageek_chapter_availability_cache: dict[str, tuple[float, bool]] = {}
         self._mangadex_tag_ids_cache: dict[str, str] | None = None
         self._cloudscraper: cloudscraper.CloudScraper | None = None
         self._sakura_browser_lock = threading.RLock()
@@ -2873,6 +2914,28 @@ class MangaReader:
         match = re.match(r"(.+?)\s+Cap.tulo\b", title, re.IGNORECASE)
         return clean_title(match.group(1)) if match else None
 
+    def catalog_fliptru(self, limit: int = 24) -> dict:
+        results = self.fliptru_plugin.catalog_items(limit=limit)
+        return {
+            "ok": True,
+            "provider": "fliptru",
+            "api_url": "https://fliptru.com.br",
+            "count": len(results),
+            "results": results,
+        }
+
+    def search_fliptru(self, keyword: str, limit: int = 12) -> dict:
+        results = self.fliptru_plugin.search_items(keyword, limit=limit)
+        results = self._rank_search_results(keyword, results, limit)
+        return {
+            "ok": True,
+            "provider": "fliptru",
+            "api_url": "https://fliptru.com.br",
+            "keyword": keyword,
+            "count": len(results),
+            "results": results,
+        }
+
     def search_mangalivre(self, keyword: str, limit: int = 12) -> dict:
         keyword = keyword.strip()
         if not keyword:
@@ -3243,7 +3306,7 @@ class MangaReader:
         if match:
             return match.group(1), match.group(2)
         match = re.search(r"mangakatana\.com/manga/([^/?#]+)/([^/?#]+)", source_url, re.IGNORECASE)
-        if match and re.fullmatch(r"(?:c[\d.]+|fc)", match.group(2), re.IGNORECASE):
+        if match and re.fullmatch(r"(?:(?:v\d+)?c[\d.]+|fc)", match.group(2), re.IGNORECASE):
             return match.group(1), match.group(2)
         return None
 
@@ -3270,35 +3333,76 @@ class MangaReader:
             f"{self.mangakatana_base_url}/?search={quote(keyword)}",
             self.mangakatana_base_url,
         )
-        results: list[dict] = []
-        seen: set[str] = set()
-        for href, body in re.findall(
-            r'<a\b[^>]+href=["\'](https?://(?:www\.)?mangakatana\.com/manga/[^"\']+\.\d+)["\'][^>]*>(.*?)</a>',
-            html,
-            re.IGNORECASE | re.DOTALL,
-        ):
-            if "/c" in urlparse(href).path.rsplit("/", 1)[-1].lower():
-                continue
-            slug = self._mangakatana_slug_from_source(href)
-            title = text_from_html(body)
-            if not slug or not title or slug in seen:
-                continue
-            seen.add(slug)
-            results.append(
-                {
-                    "title": title,
-                    "url": self._mangakatana_manga_url(slug),
-                    "id": slug,
-                    "source": "mangakatana",
-                }
-            )
-
+        results = self._mangakatana_listing_results(html)
         results = self._rank_search_results(keyword, results, limit)
         return {
             "ok": True,
             "provider": "mangakatana",
             "api_url": self.mangakatana_base_url,
             "keyword": keyword,
+            "count": len(results),
+            "results": results,
+        }
+
+    def _mangakatana_listing_results(self, html: str, limit: int | None = None) -> list[dict]:
+        parser = CatalogListingParser(
+            self.mangakatana_base_url,
+            (frozenset({"item"}),),
+        )
+        parser.feed(html)
+
+        latest_by_slug: dict[str, tuple[float, str]] = {}
+        for href in re.findall(
+            r'<a\b[^>]+href=["\'](https?://(?:www\.)?mangakatana\.com/manga/[^"\']+/(?:(?:v\d+)?c[\d.]+|fc))["\']',
+            html,
+            re.IGNORECASE,
+        ):
+            parts = self._mangakatana_chapter_parts(href)
+            if not parts:
+                continue
+            slug, chapter_id = parts
+            number_text = self._mangakatana_chapter_number_from_id(chapter_id)
+            number = parse_float(number_text)
+            if number is None:
+                continue
+            current = latest_by_slug.get(slug)
+            if current is None or number > current[0]:
+                latest_by_slug[slug] = (number, number_text or str(number))
+
+        results: list[dict] = []
+        seen: set[str] = set()
+        for raw in parser.items:
+            slug = self._mangakatana_slug_from_source(str(raw.get("url") or ""))
+            if not slug or slug in seen:
+                continue
+            seen.add(slug)
+            latest = latest_by_slug.get(slug)
+            results.append(
+                {
+                    **raw,
+                    "id": slug,
+                    "url": self._mangakatana_manga_url(slug),
+                    "source": "mangakatana",
+                    "provider": "mangakatana",
+                    "language": "en",
+                    "available_translated_languages": ["en"],
+                    "latest_chapter": latest[1] if latest else "",
+                }
+            )
+            if limit is not None and len(results) >= limit:
+                break
+        return results
+
+    def catalog_mangakatana(self, limit: int = 24) -> dict:
+        html = self._mangakatana_get_html(
+            f"{self.mangakatana_base_url}/latest",
+            self.mangakatana_base_url,
+        )
+        results = self._mangakatana_listing_results(html, limit=max(1, limit))
+        return {
+            "ok": True,
+            "provider": "mangakatana",
+            "api_url": self.mangakatana_base_url,
             "count": len(results),
             "results": results,
         }
@@ -3360,22 +3464,31 @@ class MangaReader:
             if not parsed.path.startswith(path_prefix):
                 continue
             chapter_id = parsed.path.rstrip("/").rsplit("/", 1)[-1]
-            if not re.fullmatch(r"(?:c[\d.]+|fc)", chapter_id, re.IGNORECASE):
+            if not re.fullmatch(r"(?:(?:v\d+)?c[\d.]+|fc)", chapter_id, re.IGNORECASE):
                 continue
             if chapter_id in seen:
                 continue
             seen.add(chapter_id)
             label_text = text_from_html(body)
+            volume_match = re.fullmatch(r"v(\d+)c(\d+(?:\.\d+)?)", chapter_id, re.IGNORECASE)
             number_text = self._mangakatana_chapter_number_from_id(chapter_id)
-            if label_text and chapter_id.lower() != "fc":
+            sort_number = parse_float(number_text)
+            if volume_match:
+                volume, chapter = volume_match.groups()
+                # IDs repetem Chapter 1 em cada volume; usa numero interno so
+                # para ordenar, mas mostra formato real do MangaKatana no UI.
+                sort_number = int(volume) * 1000 + float(chapter)
+                number_text = f"Vol. {int(volume)} Cap. {chapter}"
+            elif label_text and chapter_id.lower() != "fc":
                 number_text = first_match(r"Chapter\s+(\d+(?:\.\d+)?)", label_text) or number_text
-            title = re.sub(r"^\s*Chapter\s+\d+(?:\.\d+)?\s*:?\s*", "", label_text, flags=re.IGNORECASE).strip()
+                sort_number = parse_float(number_text)
+            title = "" if volume_match else re.sub(r"^\s*Chapter\s+\d+(?:\.\d+)?\s*:?\s*", "", label_text, flags=re.IGNORECASE).strip()
             if chapter_id.lower() == "fc" and title.lower() == "first chapter":
                 title = "First Chapter"
             chapters.append(
                 Chapter(
                     url=self._mangakatana_chapter_url(slug, chapter_id),
-                    number=parse_float(number_text),
+                    number=sort_number,
                     number_text=number_text,
                     chapter_id=f"mangakatana:{slug}:{chapter_id}",
                     title=title or None,
@@ -3480,6 +3593,761 @@ class MangaReader:
                 "number": parse_float(number_text),
                 "number_text": number_text,
                 "language": "en",
+                "count": len(image_urls),
+                "previous": previous_url,
+                "next": next_url,
+                "images": [
+                    {"index": index, "src": f"/api/image/{index}?v={int(time.time())}"}
+                    for index in range(1, len(image_urls) + 1)
+                ],
+            }
+
+    # ------------------------------------------------------------------
+    # MangaGeek - API assinada extraida do cliente Android.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _mangageek_number_text(title: str | None) -> str | None:
+        match = re.search(r"(\d+(?:[.,]\d+)?)", str(title or ""))
+        return match.group(1).replace(",", ".") if match else None
+
+    def _mangageek_nonce_key(self, value: str | int | None = None) -> tuple[str, str]:
+        nonce = format(int(time.time() * 1000), "X")
+        signed_value = nonce if value is None else str(value)
+        key = hashlib.md5(f"M<{signed_value}#MANG33K>D".encode("utf-8")).hexdigest()
+        return nonce, key
+
+    def _mangageek_request(
+        self,
+        method: str,
+        route: str,
+        *,
+        value: str | int | None = None,
+        body: dict | None = None,
+        language: str = "pt",
+    ):
+        nonce, key = self._mangageek_nonce_key(value)
+        parts = [route.strip("/"), nonce]
+        if value is not None:
+            parts.append(quote(str(value), safe=""))
+        parts.append(key)
+        url = f"{self.mangageek_api_base}/{language.strip('/')}/{'/'.join(parts)}"
+        response = requests.request(
+            method,
+            url,
+            json=body,
+            timeout=self.args.timeout,
+            headers={
+                **DEFAULT_HEADERS,
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def _is_mangageek_source(self, source_url: str) -> bool:
+        return bool(
+            (source_url or "").startswith("mangageek://")
+            or re.search(r"geekstations\.com\.br/api/v2/[^/]+/(?:manga|chapter)/", source_url or "", re.IGNORECASE)
+        )
+
+    def _mangageek_manga_id_from_source(self, source_url: str) -> str | None:
+        match = re.search(r"mangageek://(?:manga|chapter)/(\d+)", source_url or "", re.IGNORECASE)
+        if match:
+            return match.group(1)
+        match = re.search(r"/manga/[^/]+/(\d+)/", source_url or "", re.IGNORECASE)
+        return match.group(1) if match else None
+
+    def _mangageek_chapter_parts(self, source_url: str) -> tuple[str, str] | None:
+        match = re.search(r"mangageek://chapter/(\d+)/(\d+)", source_url or "", re.IGNORECASE)
+        return (match.group(1), match.group(2)) if match else None
+
+    @staticmethod
+    def _mangageek_manga_url(manga_id: str | int) -> str:
+        return f"mangageek://manga/{manga_id}"
+
+    @staticmethod
+    def _mangageek_chapter_url(manga_id: str | int, chapter_id: str | int) -> str:
+        return f"mangageek://chapter/{manga_id}/{chapter_id}"
+
+    def _mangageek_normalize_manga(self, raw: dict, *, updated_at: str = "", latest_chapter: str = "") -> dict | None:
+        manga_id = str(raw.get("id") or "").strip()
+        title = str(raw.get("title") or "").strip()
+        if not manga_id or not title:
+            return None
+        alternative = str(raw.get("alternative_title") or "").strip()
+        return {
+            "id": manga_id,
+            "url": self._mangageek_manga_url(manga_id),
+            "title": title,
+            "alternative_title": alternative or None,
+            "alternative_titles": [alternative] if alternative else [],
+            "source": "mangageek",
+            "provider": "mangageek",
+            "language": "pt-br",
+            "available_translated_languages": ["pt-br"],
+            "poster": str(raw.get("thumbnail") or "").strip() or None,
+            "description": str(raw.get("description") or "").strip(),
+            "genres": [str(tag).strip() for tag in (raw.get("tags") or []) if str(tag).strip()],
+            "authors": [],
+            "status": "Finalizado" if raw.get("finished") else "Em andamento",
+            "type": str(raw.get("type") or "Manga"),
+            "latest_chapter": latest_chapter,
+            "updated_at": updated_at or str(raw.get("release_date") or ""),
+            "chapter_count": len(raw.get("chapters") or []),
+        }
+
+    def catalog_mangageek(self, limit: int = 24) -> dict:
+        payload = self._mangageek_request("GET", "home")
+        results: list[dict] = []
+        seen: set[str] = set()
+
+        def add(raw, *, updated_at: str = "", latest_chapter: str = "") -> None:
+            if not isinstance(raw, dict):
+                return
+            item = self._mangageek_normalize_manga(
+                raw,
+                updated_at=updated_at,
+                latest_chapter=latest_chapter,
+            )
+            if not item or item["id"] in seen:
+                return
+            seen.add(item["id"])
+            results.append(item)
+
+        for key in ("trending", "tops"):
+            for raw in payload.get(key) or []:
+                add(raw)
+        for key in ("news", "reading"):
+            for row in payload.get(key) or []:
+                if isinstance(row, dict):
+                    add(
+                        row.get("manga"),
+                        updated_at=str(row.get("created_at") or ""),
+                        latest_chapter=str(row.get("title") or ""),
+                    )
+        for category in payload.get("categories") or []:
+            if isinstance(category, dict):
+                for raw in category.get("list") or []:
+                    add(raw)
+        return {
+            "ok": True,
+            "provider": "mangageek",
+            "api_url": self.mangageek_api_base,
+            "count": min(len(results), max(1, limit)),
+            "results": results[:max(1, limit)],
+        }
+
+    def search_mangageek(self, keyword: str, limit: int = 12) -> dict:
+        keyword = keyword.strip()
+        if not keyword:
+            raise ValueError("Digite o nome do manga para buscar.")
+        payload = self._mangageek_request(
+            "POST",
+            "search",
+            value=keyword,
+            body={"tags": []},
+        )
+        results = [
+            item
+            for raw in (payload if isinstance(payload, list) else [])
+            if (item := self._mangageek_normalize_manga(raw))
+        ]
+        return {
+            "ok": True,
+            "provider": "mangageek",
+            "api_url": self.mangageek_api_base,
+            "keyword": keyword,
+            "count": min(len(results), max(1, limit)),
+            "results": results[:max(1, limit)],
+        }
+
+    def _mangageek_manga_payload(self, source_url: str) -> dict:
+        manga_id = self._mangageek_manga_id_from_source(source_url)
+        if not manga_id:
+            raise ValueError("Informe uma URL/ID de manga do MangaGeek.")
+        payload = self._mangageek_request("GET", "manga", value=manga_id)
+        if not isinstance(payload, dict) or not payload.get("id"):
+            raise RuntimeError("MangaGeek retornou uma obra invalida.")
+        return payload
+
+    def _mangageek_chapters_from_payload(self, manga_id: str, payload: dict) -> list[Chapter]:
+        chapters: list[Chapter] = []
+        for row in payload.get("chapters") or []:
+            if not isinstance(row, dict) or not row.get("id"):
+                continue
+            title = str(row.get("title") or "").strip()
+            number_text = self._mangageek_number_text(title)
+            chapter_id = str(row["id"])
+            chapters.append(
+                Chapter(
+                    url=self._mangageek_chapter_url(manga_id, chapter_id),
+                    label=title,
+                    number=parse_float(number_text),
+                    number_text=number_text,
+                    chapter_id=f"mangageek:{manga_id}:{chapter_id}",
+                    title=title or None,
+                )
+            )
+        chapters.sort(
+            key=lambda chapter: (
+                chapter.number is None,
+                chapter.number if chapter.number is not None else 0.0,
+                chapter.chapter_id or "",
+            )
+        )
+        return chapters
+
+    def _mangageek_chapter_has_pages(self, chapter_id: str) -> bool:
+        cached = self._mangageek_chapter_availability_cache.get(chapter_id)
+        if cached and time.time() - cached[0] < 30 * 60:
+            return cached[1]
+        try:
+            payload = self._mangageek_request("GET", "chapter", value=chapter_id)
+            available = bool(payload.get("pages"))
+        except Exception:
+            # Falha de rede nao significa capitulo vazio; preserva o item para retry.
+            return True
+        self._mangageek_chapter_availability_cache[chapter_id] = (time.time(), available)
+        return available
+
+    def _mangageek_filter_available_chapters(self, chapters: list[Chapter]) -> list[Chapter]:
+        # Listas curtas costumam ser novels antigas com entradas nao processadas.
+        # Validar em paralelo evita mostrar botoes que a propria API nao abre.
+        if not chapters or len(chapters) > 40:
+            return chapters
+        with ThreadPoolExecutor(max_workers=min(8, len(chapters))) as executor:
+            available = list(
+                executor.map(
+                    lambda chapter: self._mangageek_chapter_has_pages(
+                        str(chapter.chapter_id or "").rsplit(":", 1)[-1]
+                    ),
+                    chapters,
+                )
+            )
+        return [chapter for chapter, has_pages in zip(chapters, available) if has_pages]
+
+    def _fetch_mangageek_chapters(self, source_url: str, preferred_chapter: str | None = None) -> list[Chapter]:
+        payload = self._mangageek_manga_payload(source_url)
+        chapters = self._mangageek_chapters_from_payload(str(payload["id"]), payload)
+        return self._mangageek_filter_available_chapters(chapters)
+
+    def _mangageek_manga_metadata(self, payload: dict) -> dict:
+        normalized = self._mangageek_normalize_manga(payload)
+        if not normalized:
+            raise RuntimeError("MangaGeek retornou uma obra invalida.")
+        return {
+            "slug": str(payload.get("id") or ""),
+            "url": normalized["url"],
+            "title": normalized["title"],
+            "alternative_title": normalized.get("alternative_title"),
+            "alternative_titles": normalized.get("alternative_titles") or [],
+            "status": normalized.get("status"),
+            "type": normalized.get("type") or "Manga",
+            "poster": normalized.get("poster"),
+            "description": normalized.get("description") or "",
+            "latest_chapter": None,
+            "authors": [],
+            "genres": normalized.get("genres") or [],
+            "magazines": [],
+            "published": payload.get("release_date"),
+            "rating": {},
+        }
+
+    def _load_mangageek_chapter(self, url: str) -> dict:
+        with self.lock:
+            parts = self._mangageek_chapter_parts(url)
+            if not parts:
+                chapters = self._fetch_mangageek_chapters(url)
+                selected = self._select_chapter(chapters, url)
+                if not selected:
+                    raise RuntimeError("Nenhum capitulo do MangaGeek foi selecionado automaticamente.")
+                url = selected.url
+                parts = self._mangageek_chapter_parts(url)
+            if not parts:
+                raise ValueError("Informe uma URL de capitulo do MangaGeek.")
+
+            manga_id, chapter_id = parts
+            payload = self._mangageek_request("GET", "chapter", value=chapter_id)
+            image_urls = dedupe_image_urls(
+                [str(value).strip() for value in (payload.get("pages") or []) if str(value).strip()]
+            )
+            if not image_urls:
+                mirror = self._mangageek_request("GET", "mirror", value=chapter_id)
+                image_urls = dedupe_image_urls(
+                    [str(value).strip() for value in (mirror.get("pages") or []) if str(value).strip()]
+                )
+                if image_urls:
+                    payload = {**payload, **mirror}
+            if not image_urls:
+                raise RuntimeError("MangaGeek nao retornou imagens para este capitulo.")
+
+            title = str(payload.get("title") or "").strip() or None
+            number_text = self._mangageek_number_text(title)
+            previous = payload.get("previous") if isinstance(payload.get("previous"), dict) else {}
+            next_item = payload.get("next") if isinstance(payload.get("next"), dict) else {}
+            previous_url = (
+                self._mangageek_chapter_url(manga_id, previous["id"])
+                if previous.get("id") else None
+            )
+            next_url = (
+                self._mangageek_chapter_url(manga_id, next_item["id"])
+                if next_item.get("id") else None
+            )
+            try:
+                available_chapters = self._fetch_mangageek_chapters(
+                    self._mangageek_manga_url(manga_id)
+                )
+                if len(available_chapters) <= 40:
+                    previous_url, next_url = self._find_neighbors(available_chapters, url)
+            except Exception:
+                pass
+            label = clean_filename(
+                f"mangageek-{manga_id}-chapter-{number_text or chapter_id}",
+                fallback="mangageek-chapter",
+            )
+            session = requests.Session()
+            session.headers.update(DEFAULT_HEADERS)
+            cache_dir = self.cache.new_chapter_dir(label)
+            self.state = ChapterState(
+                url=url,
+                label=label,
+                image_urls=image_urls,
+                cache_dir=cache_dir,
+                session=session,
+                previous_url=previous_url,
+                next_url=next_url,
+            )
+            return {
+                "ok": True,
+                "provider": "mangageek",
+                "api_url": self.mangageek_api_base,
+                "url": url,
+                "source_url": url,
+                "chapter_id": f"mangageek:{manga_id}:{chapter_id}",
+                "label": label,
+                "title": title,
+                "number": parse_float(number_text),
+                "number_text": number_text,
+                "language": "pt-br",
+                "count": len(image_urls),
+                "previous": previous_url,
+                "next": next_url,
+                "images": [
+                    {"index": index, "src": f"/api/image/{index}?v={int(time.time())}"}
+                    for index in range(1, len(image_urls) + 1)
+                ],
+            }
+
+    def _nexus_headers(self, referer: str | None = None, *, json_response: bool = False) -> dict:
+        headers = {
+            **DEFAULT_HEADERS,
+            "Referer": referer or f"{self.nexus_base_url}/",
+            "Origin": self.nexus_base_url,
+        }
+        if json_response:
+            public_key = self._nexus_public_key()
+            headers.update(
+                {
+                    "Accept": "application/json",
+                    "apikey": public_key,
+                    "Authorization": f"Bearer {public_key}",
+                }
+            )
+        return headers
+
+    def _nexus_public_key(self) -> str:
+        if self.nexus_anon_key:
+            return self.nexus_anon_key
+        with self._nexus_key_lock:
+            if self.nexus_anon_key:
+                return self.nexus_anon_key
+            homepage = self._nexus_get_html(f"{self.nexus_base_url}/", self.nexus_base_url)
+            assets = re.findall(
+                r'(?:src|href)=["\']([^"\']*/assets/(?:entries|chunks)/pages\.[^"\']+\.js)["\']',
+                homepage,
+                re.IGNORECASE,
+            )
+            for asset in dict.fromkeys(assets):
+                response = requests.get(
+                    urljoin(self.nexus_base_url, unescape(asset)),
+                    timeout=self.args.timeout,
+                    headers=self._nexus_headers(self.nexus_base_url),
+                )
+                response.raise_for_status()
+                for candidate in re.findall(r"eyJ[A-Za-z0-9._-]{100,}", response.text):
+                    try:
+                        encoded_payload = candidate.split(".", 2)[1]
+                        padding = "=" * (-len(encoded_payload) % 4)
+                        payload = json.loads(base64.urlsafe_b64decode(encoded_payload + padding))
+                    except Exception:
+                        continue
+                    if payload.get("role") == "anon" and payload.get("iss") == "supabase":
+                        self.nexus_anon_key = candidate
+                        return candidate
+            raise RuntimeError("Nexus nao publicou a configuracao anon do cliente web.")
+
+    def _nexus_get_html(self, url: str, referer: str | None = None) -> str:
+        response = requests.get(
+            url,
+            timeout=self.args.timeout,
+            headers=self._nexus_headers(referer),
+        )
+        response.raise_for_status()
+        return response.text
+
+    def _nexus_rest(self, resource: str, params: dict | None = None):
+        response = requests.get(
+            f"{self.nexus_api_base}/rest/v1/{resource.lstrip('/')}",
+            params=params,
+            timeout=self.args.timeout,
+            headers=self._nexus_headers(json_response=True),
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def _is_nexus_source(self, source_url: str) -> bool:
+        return bool(
+            (source_url or "").startswith("nexus://")
+            or re.search(
+                r"(?:^https?://)?(?:www\.)?nexusmangas\.com/(?:obra|capitulo)/",
+                source_url or "",
+                re.IGNORECASE,
+            )
+        )
+
+    def _nexus_slug_from_source(self, source_url: str) -> str | None:
+        match = re.search(r"nexus://(?:manga|chapter)/([^/?#]+)", source_url or "", re.IGNORECASE)
+        if match:
+            return unquote(match.group(1))
+        match = re.search(
+            r"nexusmangas\.com/(?:obra|capitulo)/([^/?#]+)",
+            source_url or "",
+            re.IGNORECASE,
+        )
+        return unquote(match.group(1)) if match else None
+
+    def _nexus_chapter_parts(self, source_url: str) -> tuple[str, str] | None:
+        match = re.search(r"nexus://chapter/([^/]+)/([^/?#]+)", source_url or "", re.IGNORECASE)
+        if not match:
+            match = re.search(
+                r"nexusmangas\.com/capitulo/([^/]+)/([^/?#]+)",
+                source_url or "",
+                re.IGNORECASE,
+            )
+        if not match:
+            return None
+        return unquote(match.group(1)), unquote(match.group(2))
+
+    def _nexus_manga_url(self, slug: str) -> str:
+        return f"{self.nexus_base_url}/obra/{quote(slug, safe='')}"
+
+    def _nexus_chapter_url(self, slug: str, number_text: str) -> str:
+        return f"{self.nexus_base_url}/capitulo/{quote(slug, safe='')}/{quote(number_text, safe='')}"
+
+    @staticmethod
+    def _nexus_number_text(value) -> str | None:
+        if value is None or value == "":
+            return None
+        number = parse_float(str(value))
+        return format_chapter_number(number) if number is not None else normalize_text(str(value))
+
+    @staticmethod
+    def _nexus_relation_names(work: dict, relation: str, nested: str) -> list[str]:
+        names: list[str] = []
+        for entry in work.get(relation) or []:
+            value = entry.get(nested) if isinstance(entry, dict) else None
+            name = value.get("name") if isinstance(value, dict) else None
+            if isinstance(name, str) and name.strip() and name.strip() not in names:
+                names.append(name.strip())
+        return names
+
+    def _nexus_work_select(self, *, include_chapters: bool, require_chapters: bool = False) -> str:
+        fields = [
+            "id", "title", "slug", "description", "cover_url", "status", "type",
+            "content_rating", "content_ratings", "updated_at", "created_at",
+            "alternative_title", "author", "artist", "avg_rating", "release_year",
+            "work_genres(genre:genres(name))", "work_themes(theme:themes(name))",
+            "work_formats(format:formats(name))",
+        ]
+        if include_chapters:
+            relation = "chapters!inner" if require_chapters else "chapters"
+            fields.append(f"{relation}(id,number,title,created_at)")
+        return ",".join(fields)
+
+    def _nexus_normalize_work(self, work: dict) -> dict | None:
+        slug = str(work.get("slug") or "").strip()
+        title = str(work.get("title") or "").strip()
+        if not slug or not title:
+            return None
+
+        chapter_rows = [row for row in (work.get("chapters") or []) if isinstance(row, dict)]
+        latest = max(
+            chapter_rows,
+            key=lambda row: parse_float(str(row.get("number") or "")) or -1,
+            default=None,
+        )
+        genres = [
+            *self._nexus_relation_names(work, "work_genres", "genre"),
+            *self._nexus_relation_names(work, "work_themes", "theme"),
+            *self._nexus_relation_names(work, "work_formats", "format"),
+        ]
+        genres = list(dict.fromkeys(genres))
+        authors = [
+            value.strip()
+            for value in (str(work.get("author") or ""), str(work.get("artist") or ""))
+            if value.strip()
+        ]
+        alternative_title = str(work.get("alternative_title") or "").strip()
+        return {
+            "id": str(work.get("id") or slug),
+            "url": self._nexus_manga_url(slug),
+            "title": title,
+            "alternative_title": alternative_title or None,
+            "alternative_titles": [alternative_title] if alternative_title else [],
+            "source": "nexus",
+            "provider": "nexus",
+            "language": "pt-br",
+            "available_translated_languages": ["pt-br"],
+            "poster": str(work.get("cover_url") or "").strip() or None,
+            "description": str(work.get("description") or "").strip(),
+            "genres": genres,
+            "authors": list(dict.fromkeys(authors)),
+            "status": str(work.get("status") or ""),
+            "type": str(work.get("type") or ""),
+            "content_rating": str(work.get("content_rating") or ""),
+            "rating": work.get("avg_rating"),
+            "latest_chapter": self._nexus_number_text((latest or {}).get("number")) or "",
+            "chapter_count": len(chapter_rows),
+            "updated_at": str((latest or {}).get("created_at") or work.get("updated_at") or ""),
+        }
+
+    def catalog_nexus(self, limit: int = 24) -> dict:
+        rows = self._nexus_rest(
+            "works",
+            {
+                "select": self._nexus_work_select(include_chapters=True, require_chapters=True),
+                "order": "updated_at.desc",
+                "chapters.order": "number.desc",
+                "chapters.limit": "3",
+                "limit": str(max(1, limit)),
+            },
+        )
+        results = [item for row in rows if isinstance(row, dict) if (item := self._nexus_normalize_work(row))]
+        return {
+            "ok": True,
+            "provider": "nexus",
+            "api_url": self.nexus_base_url,
+            "count": len(results),
+            "results": results,
+        }
+
+    def search_nexus(self, keyword: str, limit: int = 12) -> dict:
+        keyword = normalize_text(keyword)
+        if not keyword:
+            raise ValueError("Digite o nome da obra para buscar.")
+        search_term = normalize_text(re.sub(r"[^\w\s-]+", " ", keyword, flags=re.UNICODE))
+        search_pattern = "*".join(search_term.split())
+        rows = self._nexus_rest(
+            "works",
+            {
+                "select": self._nexus_work_select(include_chapters=True, require_chapters=True),
+                "or": f"(title.ilike.*{search_pattern}*,alternative_title.ilike.*{search_pattern}*)",
+                "order": "updated_at.desc",
+                "chapters.order": "number.desc",
+                "chapters.limit": "3",
+                "limit": str(max(4, limit * 2)),
+            },
+        )
+        results = [item for row in rows if isinstance(row, dict) if (item := self._nexus_normalize_work(row))]
+        results = self._rank_search_results(keyword, results, limit)
+        return {
+            "ok": True,
+            "provider": "nexus",
+            "api_url": self.nexus_base_url,
+            "keyword": keyword,
+            "count": len(results),
+            "results": results,
+        }
+
+    def _nexus_ssr_data(self, html: str) -> dict:
+        match = re.search(
+            r'<template\s+id=["\']__NEXUS_SSR_PAGE_DATA__["\'][^>]*>(.*?)</template>',
+            html,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            raise RuntimeError("Nexus nao retornou dados SSR da pagina.")
+        payload = json.loads(unescape(match.group(1)))
+        if not isinstance(payload, dict):
+            raise RuntimeError("Nexus retornou dados SSR invalidos.")
+        return payload
+
+    def _nexus_work_record(self, slug: str, *, include_chapters: bool) -> dict:
+        params = {
+            "select": self._nexus_work_select(include_chapters=include_chapters),
+            "slug": f"eq.{slug}",
+            "limit": "1",
+        }
+        if include_chapters:
+            params["chapters.order"] = "number.asc"
+        rows = self._nexus_rest("works", params)
+        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+            return rows[0]
+
+        html = self._nexus_get_html(self._nexus_manga_url(slug), self.nexus_base_url)
+        work_page = self._nexus_ssr_data(html).get("workPage") or {}
+        work = dict(work_page.get("work") or {})
+        if include_chapters:
+            work["chapters"] = work_page.get("chapters") or []
+        if not work:
+            raise RuntimeError("Nexus nao encontrou a obra.")
+        return work
+
+    def _nexus_chapters_from_rows(self, slug: str, rows: list) -> list[Chapter]:
+        chapters: list[Chapter] = []
+        seen: set[str] = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            number_text = self._nexus_number_text(row.get("number"))
+            if not number_text:
+                continue
+            chapter_key = str(row.get("id") or number_text)
+            if chapter_key in seen:
+                continue
+            seen.add(chapter_key)
+            chapters.append(
+                Chapter(
+                    url=self._nexus_chapter_url(slug, number_text),
+                    number=parse_float(number_text),
+                    number_text=number_text,
+                    chapter_id=f"nexus:{slug}:{chapter_key}",
+                    title=str(row.get("title") or "").strip() or None,
+                )
+            )
+        chapters.sort(
+            key=lambda chapter: (
+                chapter.number is None,
+                chapter.number if chapter.number is not None else 0,
+                chapter.chapter_id or "",
+            )
+        )
+        return chapters
+
+    def _fetch_nexus_chapters(
+        self,
+        source_url: str,
+        preferred_chapter: str | None = None,
+    ) -> list[Chapter]:
+        slug = self._nexus_slug_from_source(source_url)
+        if not slug:
+            raise ValueError("Informe uma URL/slug do Nexus.")
+        work = self._nexus_work_record(slug, include_chapters=True)
+        return self._nexus_chapters_from_rows(slug, work.get("chapters") or [])
+
+    def _nexus_manga_metadata(self, work: dict) -> dict:
+        normalized = self._nexus_normalize_work(work)
+        if not normalized:
+            raise RuntimeError("Nexus retornou uma obra invalida.")
+        return {
+            "slug": str(work.get("slug") or ""),
+            "url": normalized["url"],
+            "title": normalized["title"],
+            "alternative_title": normalized.get("alternative_title"),
+            "alternative_titles": normalized.get("alternative_titles") or [],
+            "status": normalized.get("status"),
+            "type": normalized.get("type") or "Manga",
+            "poster": normalized.get("poster"),
+            "description": normalized.get("description") or "",
+            "latest_chapter": normalized.get("latest_chapter"),
+            "authors": normalized.get("authors") or [],
+            "genres": normalized.get("genres") or [],
+            "magazines": [],
+            "published": work.get("release_year"),
+            "rating": {"score": normalized.get("rating")} if normalized.get("rating") is not None else {},
+        }
+
+    def _load_nexus_chapter(self, url: str) -> dict:
+        with self.lock:
+            parts = self._nexus_chapter_parts(url)
+            if not parts:
+                chapters = self._fetch_nexus_chapters(url)
+                selected = self._select_chapter(chapters, url)
+                if not selected:
+                    raise RuntimeError("Nenhum capitulo do Nexus foi selecionado automaticamente.")
+                url = selected.url
+                parts = self._nexus_chapter_parts(url)
+            if not parts:
+                raise ValueError("Informe uma URL de capitulo do Nexus.")
+
+            slug, requested_number = parts
+            chapter_url = self._nexus_chapter_url(slug, requested_number)
+            html = self._nexus_get_html(chapter_url, self._nexus_manga_url(slug))
+            chapter_page = self._nexus_ssr_data(html).get("chapterPage") or {}
+            chapter = chapter_page.get("chapter") or {}
+            work = chapter_page.get("work") or chapter.get("work") or {}
+            number_text = self._nexus_number_text(
+                chapter.get("number") if chapter.get("number") is not None else chapter_page.get("chapterNumber")
+            ) or requested_number
+            title = str(chapter.get("title") or "").strip() or None
+            all_chapters = self._nexus_chapters_from_rows(slug, chapter_page.get("allChapters") or [])
+            previous_url, next_url = self._find_neighbors(all_chapters, chapter_url)
+
+            content = chapter.get("content")
+            if isinstance(content, str) and content.strip() and not chapter.get("pages"):
+                return {
+                    "ok": True,
+                    "provider": "nexus",
+                    "mode": "text",
+                    "api_url": self.nexus_base_url,
+                    "url": chapter_url,
+                    "source_url": chapter_url,
+                    "chapter_id": str(chapter.get("id") or ""),
+                    "label": clean_filename(f"nexus-{slug}-chapter-{number_text}"),
+                    "title": title or str(work.get("title") or "").strip() or None,
+                    "content": content.strip(),
+                    "number": parse_float(number_text),
+                    "number_text": number_text,
+                    "language": "pt-br",
+                    "count": 1,
+                    "previous": previous_url,
+                    "next": next_url,
+                }
+
+            image_urls = dedupe_image_urls(
+                [str(value).strip() for value in (chapter.get("pages") or []) if str(value).strip()]
+            )
+            if not image_urls:
+                raise RuntimeError("Nexus nao retornou imagens para este capitulo.")
+
+            session = requests.Session()
+            session.headers.update(self._nexus_headers(chapter_url))
+            label = clean_filename(f"nexus-{slug}-chapter-{number_text}", fallback="nexus-chapter")
+            cache_dir = self.cache.new_chapter_dir(label)
+            self.state = ChapterState(
+                url=chapter_url,
+                label=label,
+                image_urls=image_urls,
+                cache_dir=cache_dir,
+                session=session,
+                previous_url=previous_url,
+                next_url=next_url,
+            )
+
+            return {
+                "ok": True,
+                "provider": "nexus",
+                "api_url": self.nexus_base_url,
+                "url": chapter_url,
+                "source_url": chapter_url,
+                "chapter_id": str(chapter.get("id") or ""),
+                "label": label,
+                "title": title,
+                "number": parse_float(number_text),
+                "number_text": number_text,
+                "language": "pt-br",
                 "count": len(image_urls),
                 "previous": previous_url,
                 "next": next_url,
@@ -3635,7 +4503,14 @@ class MangaReader:
         return f"{self.MANGASBRASUKA_BASE}/manga/{manga_slug.strip('/')}/pt-br/{chapter_slug.strip('/')}/"
 
     def _mangasbrasuka_chapter_number(self, chapter_slug: str) -> str | None:
-        match = re.search(r"capitulo-(\d+)(?:[.-](\d+))?$", chapter_slug or "", re.IGNORECASE)
+        # Alguns slugs do site chegam com "capitulo" corrompido/URL-encoded
+        # (ex.: cap%e2%94%9ctulo-121). Numero segue confiavel.
+        slug = unquote(chapter_slug or "")
+        match = re.search(
+            r"cap.*?(\d+)(?:[.-](\d+))?(?:\D.*)?$",
+            slug,
+            re.IGNORECASE,
+        )
         if not match:
             return None
         return f"{match.group(1)}.{match.group(2)}" if match.group(2) else match.group(1)
@@ -3921,18 +4796,19 @@ class MangaReader:
         slug = self._mangasbrasuka_manga_slug_from_source(manga_url) or ""
         seen: set[str] = set()
         chapters: list[Chapter] = []
-        for href in re.findall(
-            r'href=["\']([^"\']*' + re.escape(f"/manga/{slug}/")
-            + r'(?:[a-z]{2}(?:-[a-z]{2})?/)?capitulo-\d+(?:[.-]\d+)?/)["\']',
-            html,
-            re.IGNORECASE,
-        ):
+        prefix = f"/manga/{slug}/".lower()
+        for href in re.findall(r'href=["\']([^"\']+)["\']', html, re.IGNORECASE):
             href = urljoin(base + "/", unescape(href))
+            path = urlparse(href).path
+            if prefix not in path.lower():
+                continue
+            chapter_slug = unquote(path.rstrip("/").rsplit("/", 1)[-1])
+            number_text = self._mangasbrasuka_chapter_number(chapter_slug)
+            if number_text is None:
+                continue
             if href in seen:
                 continue
             seen.add(href)
-            chapter_slug = href.rstrip("/").rsplit("/", 1)[-1]
-            number_text = self._mangasbrasuka_chapter_number(chapter_slug)
             chapters.append(
                 Chapter(
                     url=href,
@@ -4159,6 +5035,21 @@ class MangaReader:
             )
 
         results = self._rank_search_results(keyword, results, limit)
+        # API de busca Madara nao devolve capa. Hidratamos poucos resultados com
+        # metadata da obra para evitar fallback pegar imagem de capitulo.
+        for item in results[:4]:
+            try:
+                manga_url = str(item.get("url") or "")
+                metadata = self._mangasbrasuka_extract_metadata(
+                    manga_url,
+                    self._mangasbrasuka_get_html(manga_url),
+                )
+                poster = str(metadata.get("poster") or "").strip()
+                if poster:
+                    item["poster"] = poster
+                    item["cover_url"] = poster
+            except Exception:
+                continue
         return {
             "ok": True,
             "provider": "mangasbrasuka",
@@ -5351,7 +6242,8 @@ class MangaReader:
     def get_driver(self):
         raise RuntimeError(
             "Driver Selenium legado removido. Use as fontes ativas: MangaDex, MangaLivre, "
-            "MangasBrasuka, Toomics, One Piece Project, DragonTea, MangaKatana, ReadFull ou NovelToon."
+            "MangasBrasuka, Toomics, One Piece Project, DragonTea, Nexus, MangaKatana, "
+            "ReadFull, NovelToon ou Sakura Mangas."
         )
 
     def _get_cloudscraper(self) -> cloudscraper.CloudScraper:
@@ -6352,6 +7244,152 @@ class MangaReader:
         preferred_chapter: str | None = None,
         include_chapters: bool = True,
     ) -> dict:
+        if self.hq_plugin.is_source(source_url):
+            chapters_payload = (
+                self.list_chapters(source_url, lang, preferred_chapter)
+                if include_chapters
+                else {"chapters": [], "count": 0, "selected_url": None}
+            )
+            manga = self.hq_plugin.manga_metadata(source_url)
+            return {
+                "ok": True,
+                "provider": "hq_local",
+                "manga": manga,
+                "language": "pt-br",
+                "available_translated_languages": ["pt-br"],
+                "chapter_count": chapters_payload.get("count", 0),
+                "selected_chapter_url": chapters_payload.get("selected_url"),
+                "chapters": chapters_payload.get("chapters", []),
+            }
+
+        if self.hq_now_plugin.is_source(source_url):
+            chapters_payload = (
+                self.list_chapters(source_url, lang, preferred_chapter)
+                if include_chapters
+                else {"chapters": [], "count": 0, "selected_url": None}
+            )
+            manga = self.hq_now_plugin.manga_metadata(source_url)
+            return {
+                "ok": True,
+                "provider": "hq_now",
+                "manga": manga,
+                "language": "pt-br",
+                "available_translated_languages": ["pt-br"],
+                "chapter_count": chapters_payload.get("count", 0),
+                "selected_chapter_url": chapters_payload.get("selected_url"),
+                "chapters": chapters_payload.get("chapters", []),
+            }
+
+        if self.fliptru_plugin.is_source(source_url):
+            chapters_payload = (
+                self.list_chapters(source_url, lang, preferred_chapter)
+                if include_chapters
+                else {"chapters": [], "count": 0, "selected_url": None}
+            )
+            manga = self.fliptru_plugin.manga_metadata(source_url)
+            return {
+                "ok": True,
+                "provider": "fliptru",
+                "manga": manga,
+                "language": "pt-br",
+                "available_translated_languages": ["pt-br"],
+                "chapter_count": chapters_payload.get("count", manga.get("chapter_count", 0)),
+                "selected_chapter_url": chapters_payload.get("selected_url"),
+                "chapters": chapters_payload.get("chapters", []),
+            }
+
+        if self.light_novel_plugin.is_source(source_url):
+            chapters_payload = (
+                self.list_chapters(source_url, lang, preferred_chapter)
+                if include_chapters
+                else {"chapters": [], "count": 0, "selected_url": None}
+            )
+            manga = self.light_novel_plugin.manga_metadata(source_url)
+            return {
+                "ok": True,
+                "provider": "light_novel_local",
+                "manga": manga,
+                "language": manga.get("languages", [{}])[0].get("code") or "pt-br",
+                "available_translated_languages": [
+                    manga.get("languages", [{}])[0].get("code") or "pt-br"
+                ],
+                "chapter_count": chapters_payload.get("count", 0),
+                "selected_chapter_url": chapters_payload.get("selected_url"),
+                "chapters": chapters_payload.get("chapters", []),
+            }
+
+        if self.novel_mania_plugin.is_source(source_url):
+            chapters_payload = (
+                self.list_chapters(source_url, lang, preferred_chapter)
+                if include_chapters
+                else {"chapters": [], "count": 0, "selected_url": None}
+            )
+            manga = self.novel_mania_plugin.manga_metadata(source_url)
+            return {
+                "ok": True,
+                "provider": "novel_mania",
+                "manga": manga,
+                "language": "pt-br",
+                "available_translated_languages": ["pt-br"],
+                "chapter_count": chapters_payload.get("count", manga.get("chapter_count", 0)),
+                "selected_chapter_url": chapters_payload.get("selected_url"),
+                "chapters": chapters_payload.get("chapters", []),
+            }
+
+        if self.central_novel_plugin.is_source(source_url):
+            chapters_payload = (
+                self.list_chapters(source_url, lang, preferred_chapter)
+                if include_chapters
+                else {"chapters": [], "count": 0, "selected_url": None}
+            )
+            manga = self.central_novel_plugin.manga_metadata(source_url)
+            return {
+                "ok": True,
+                "provider": "central_novel",
+                "manga": manga,
+                "language": "pt-br",
+                "available_translated_languages": ["pt-br"],
+                "chapter_count": chapters_payload.get("count", manga.get("chapter_count", 0)),
+                "selected_chapter_url": chapters_payload.get("selected_url"),
+                "chapters": chapters_payload.get("chapters", []),
+            }
+
+        if self.tensura_fan_plugin.is_source(source_url):
+            chapters_payload = (
+                self.list_chapters(source_url, lang, preferred_chapter)
+                if include_chapters
+                else {"chapters": [], "count": 0, "selected_url": None}
+            )
+            manga = self.tensura_fan_plugin.manga_metadata(source_url)
+            return {
+                "ok": True,
+                "provider": "tensura_fan",
+                "manga": manga,
+                "language": "en",
+                "available_translated_languages": ["en"],
+                "chapter_count": chapters_payload.get("count", manga.get("chapter_count", 0)),
+                "selected_chapter_url": chapters_payload.get("selected_url"),
+                "chapters": chapters_payload.get("chapters", []),
+            }
+
+        if self.pleiades_translations_plugin.is_source(source_url):
+            chapters_payload = (
+                self.list_chapters(source_url, lang, preferred_chapter)
+                if include_chapters
+                else {"chapters": [], "count": 0, "selected_url": None}
+            )
+            manga = self.pleiades_translations_plugin.manga_metadata(source_url)
+            return {
+                "ok": True,
+                "provider": "pleiades_translations",
+                "manga": manga,
+                "language": "pt-br",
+                "available_translated_languages": ["pt-br"],
+                "chapter_count": chapters_payload.get("count", manga.get("chapter_count", 0)),
+                "selected_chapter_url": chapters_payload.get("selected_url"),
+                "chapters": chapters_payload.get("chapters", []),
+            }
+
         if self._is_toomics_source(source_url):
             chapters_payload = (
                 self.list_chapters(source_url, lang, preferred_chapter)
@@ -6404,6 +7442,58 @@ class MangaReader:
                 "chapter_count": chapters_payload.get("count", 0),
                 "selected_chapter_url": chapters_payload.get("selected_url"),
                 "chapters": chapters_payload.get("chapters", []),
+            }
+
+        if self._is_nexus_source(source_url):
+            slug = self._nexus_slug_from_source(source_url)
+            if not slug:
+                raise ValueError("Informe uma URL/slug do Nexus.")
+            work = self._nexus_work_record(slug, include_chapters=include_chapters)
+            chapters = (
+                self._nexus_chapters_from_rows(slug, work.get("chapters") or [])
+                if include_chapters
+                else []
+            )
+            selected = self._select_chapter(chapters, source_url, preferred_chapter)
+            manga = self._nexus_manga_metadata(work)
+            manga["languages"] = [
+                {"code": "pt-br", "title": "Portugues (Brasil)", "chapter_count": len(chapters)}
+            ]
+            return {
+                "ok": True,
+                "provider": "nexus",
+                "manga": manga,
+                "language": "pt-br",
+                "available_translated_languages": ["pt-br"],
+                "chapter_count": len(chapters),
+                "selected_chapter_url": selected.url if selected else None,
+                "chapters": [self._serialize_chapter(chapter) for chapter in reversed(chapters)],
+            }
+
+        if self._is_mangageek_source(source_url):
+            payload = self._mangageek_manga_payload(source_url)
+            chapters = (
+                self._mangageek_filter_available_chapters(
+                    self._mangageek_chapters_from_payload(str(payload["id"]), payload)
+                )
+                if include_chapters
+                else []
+            )
+            selected = self._select_chapter(chapters, source_url, preferred_chapter)
+            manga = self._mangageek_manga_metadata(payload)
+            manga["latest_chapter"] = chapters[-1].number_text if chapters else None
+            manga["languages"] = [
+                {"code": "pt-br", "title": "Portugues (Brasil)", "chapter_count": len(chapters)}
+            ]
+            return {
+                "ok": True,
+                "provider": "mangageek",
+                "manga": manga,
+                "language": "pt-br",
+                "available_translated_languages": ["pt-br"],
+                "chapter_count": len(chapters),
+                "selected_chapter_url": selected.url if selected else None,
+                "chapters": [self._serialize_chapter(chapter) for chapter in reversed(chapters)],
             }
 
         if self._is_mangakatana_source(source_url):
@@ -6587,8 +7677,8 @@ class MangaReader:
             }
 
         raise ValueError(
-            "Fonte nao suportada. Use MangaDex, MangaLivre, MangasBrasuka, Toomics, "
-            "One Piece Project, DragonTea, MangaKatana, ReadFull ou NovelToon."
+            "Fonte nao suportada. Use HQ Local, Light Novel Local, MangaDex, MangaLivre, MangasBrasuka, Toomics, "
+            "One Piece Project, DragonTea, Nexus, MangaKatana, ReadFull ou NovelToon."
         )
 
     def _mangadex_manga_metadata(
@@ -6680,7 +7770,19 @@ class MangaReader:
         with self.lock:
             loaded = self.load_chapter(chapter_url, include_neighbors=include_neighbors)
             if loaded.get("mode") == "text":
-                return {"ok": True, **loaded}
+                payload = {"ok": True, **loaded}
+                payload["chapter"] = {
+                    "url": loaded.get("url") or chapter_url,
+                    "label": loaded.get("label") or loaded.get("title") or "Capitulo",
+                    "number": loaded.get("number"),
+                    "number_text": loaded.get("number_text"),
+                    "page_count": 1,
+                    "previous": loaded.get("previous"),
+                    "next": loaded.get("next"),
+                }
+                payload["images"] = []
+                payload["count"] = 1
+                return payload
             return self.current_chapter_metadata(
                 cache_pages=cache_pages,
                 include_source_urls=include_source_urls,
@@ -6765,17 +7867,20 @@ class MangaReader:
             payload["source_url"] = source_url
 
         if path is not None and path.exists():
-            relative = path.resolve().relative_to(self.cache.root.resolve()).as_posix()
-            payload.update(
-                {
-                    "cache_url": f"/cache/{quote(relative, safe='/')}",
-                    "filename": path.name,
-                    "content_type": content_type
-                    or mimetypes.guess_type(path.name)[0]
-                    or "application/octet-stream",
-                    "bytes": path.stat().st_size,
-                }
-            )
+            path_fields = {
+                "filename": path.name,
+                "content_type": content_type
+                or mimetypes.guess_type(path.name)[0]
+                or "application/octet-stream",
+                "bytes": path.stat().st_size,
+            }
+            try:
+                relative = path.resolve().relative_to(self.cache.root.resolve()).as_posix()
+            except ValueError:
+                relative = ""
+            if relative:
+                path_fields["cache_url"] = f"/cache/{quote(relative, safe='/')}"
+            payload.update(path_fields)
         return payload
 
     def list_chapters(
@@ -6785,12 +7890,129 @@ class MangaReader:
         preferred_chapter: str | None = None,
     ) -> dict:
         with self.lock:
-            if self._is_toomics_source(source_url):
+            if self.hq_plugin.is_source(source_url):
+                issues = self.hq_plugin.list_issues(source_url)
+                _, comic_id, _ = self.hq_plugin.parse_source(source_url)
+                chapters = [
+                    Chapter(
+                        url=self.hq_plugin.issue_url(comic_id, str(issue["id"])),
+                        label=str(issue.get("title") or f"Edicao {issue.get('number') or ''}"),
+                        number=parse_float(str(issue.get("number") or "")),
+                        number_text=str(issue.get("number") or ""),
+                        chapter_id=f"hq-local:{comic_id}:{issue['id']}",
+                        title=str(issue.get("title") or ""),
+                    )
+                    for issue in issues
+                ]
+            elif self.hq_now_plugin.is_source(source_url):
+                issues = self.hq_now_plugin.list_issues(source_url)
+                _, comic_id, _ = self.hq_now_plugin.parse_source(source_url)
+                chapters = [
+                    Chapter(
+                        url=self.hq_now_plugin.issue_url(comic_id, int(issue["id"])),
+                        label=str(issue.get("name") or f"Edicao {issue.get('number') or ''}"),
+                        number=parse_float(str(issue.get("number") or "")),
+                        number_text=str(issue.get("number") or ""),
+                        chapter_id=f"hq-now:{comic_id}:{issue['id']}",
+                        title=str(issue.get("name") or ""),
+                    )
+                    for issue in issues
+                ]
+            elif self.fliptru_plugin.is_source(source_url):
+                chapter_rows = self.fliptru_plugin.list_chapters(source_url)
+                slug = self.fliptru_plugin.slug_from_source(source_url) or "comic"
+                chapters = [
+                    Chapter(
+                        url=str(chapter["url"]),
+                        label=(
+                            f"Capitulo {chapter.get('number') or chapter.get('id')}"
+                            + (f" - {chapter.get('title')}" if chapter.get("title") else "")
+                        ),
+                        number=parse_float(str(chapter.get("number") or "")),
+                        number_text=str(chapter.get("number") or chapter.get("id") or ""),
+                        chapter_id=f"fliptru:{slug}:{chapter['id']}",
+                        title=str(chapter.get("title") or ""),
+                    )
+                    for chapter in chapter_rows
+                ]
+            elif self.light_novel_plugin.is_source(source_url):
+                chapter_rows = self.light_novel_plugin.list_chapters(source_url)
+                _, novel_id, _ = self.light_novel_plugin.parse_source(source_url)
+                chapters = [
+                    Chapter(
+                        url=self.light_novel_plugin.chapter_url(novel_id, str(chapter["id"])),
+                        label=str(chapter.get("title") or f"Capitulo {chapter.get('number') or ''}"),
+                        number=parse_float(str(chapter.get("number") or "")),
+                        number_text=str(chapter.get("number") or ""),
+                        chapter_id=f"light-novel:{novel_id}:{chapter['id']}",
+                        title=str(chapter.get("title") or ""),
+                    )
+                    for chapter in chapter_rows
+                ]
+            elif self.novel_mania_plugin.is_source(source_url):
+                chapter_rows = self.novel_mania_plugin.list_chapters(source_url)
+                _, novel_slug, _ = self.novel_mania_plugin.parse_source(source_url)
+                chapters = [
+                    Chapter(
+                        url=str(chapter["url"]),
+                        label=str(chapter.get("label") or chapter.get("title") or "Capitulo"),
+                        number=parse_float(str(chapter.get("number") or "")),
+                        number_text=str(chapter.get("number_text") or chapter.get("number") or ""),
+                        chapter_id=f"novel-mania:{novel_slug}:{chapter['id']}",
+                        title=str(chapter.get("title") or ""),
+                    )
+                    for chapter in chapter_rows
+                ]
+            elif self.central_novel_plugin.is_source(source_url):
+                chapter_rows = self.central_novel_plugin.list_chapters(source_url)
+                _, series_slug = self.central_novel_plugin.parse_source(source_url)
+                chapters = [
+                    Chapter(
+                        url=str(chapter["url"]),
+                        label=str(chapter.get("label") or f"Capitulo {chapter.get('number_text') or ''}"),
+                        number=parse_float(str(chapter.get("number") or "")),
+                        number_text=str(chapter.get("number_text") or chapter.get("number") or ""),
+                        chapter_id=f"central-novel:{series_slug}:{chapter['id']}",
+                        title=str(chapter.get("title") or ""),
+                    )
+                    for chapter in chapter_rows
+                ]
+            elif self.tensura_fan_plugin.is_source(source_url):
+                chapter_rows = self.tensura_fan_plugin.list_chapters(source_url)
+                chapters = [
+                    Chapter(
+                        url=str(chapter["url"]),
+                        label=str(chapter.get("label") or chapter.get("title") or "Volume"),
+                        number=parse_float(str(chapter.get("number") or "")),
+                        number_text=str(chapter.get("number_text") or chapter.get("number") or ""),
+                        chapter_id=f"tensura-fan:{chapter['id']}",
+                        title=str(chapter.get("title") or ""),
+                    )
+                    for chapter in chapter_rows
+                ]
+            elif self.pleiades_translations_plugin.is_source(source_url):
+                chapter_rows = self.pleiades_translations_plugin.list_chapters(source_url)
+                chapters = [
+                    Chapter(
+                        url=str(chapter["url"]),
+                        label=str(chapter.get("label") or chapter.get("title") or "Capitulo"),
+                        number=parse_float(str(chapter.get("number") or "")),
+                        number_text=str(chapter.get("number_text") or chapter.get("number") or ""),
+                        chapter_id=f"pleiades:{chapter['id']}",
+                        title=str(chapter.get("title") or ""),
+                    )
+                    for chapter in chapter_rows
+                ]
+            elif self._is_toomics_source(source_url):
                 chapters = self._fetch_toomics_chapters(source_url, lang, preferred_chapter)
             elif self._is_mangalivre_source(source_url):
                 chapters = self._fetch_mangalivre_chapters(source_url, preferred_chapter)
             elif self._is_mangasbrasuka_source(source_url):
                 chapters = self._fetch_mangasbrasuka_chapters(source_url, preferred_chapter)
+            elif self._is_nexus_source(source_url):
+                chapters = self._fetch_nexus_chapters(source_url, preferred_chapter)
+            elif self._is_mangageek_source(source_url):
+                chapters = self._fetch_mangageek_chapters(source_url, preferred_chapter)
             elif self._is_mangakatana_source(source_url):
                 chapters = self._fetch_mangakatana_chapters(source_url, preferred_chapter)
             elif self._is_dragontea_source(source_url):
@@ -6803,39 +8025,71 @@ class MangaReader:
                 chapters = self._fetch_readfull_chapters(source_url, preferred_chapter)
             elif self._is_noveltoon_source(source_url):
                 chapters = self._fetch_noveltoon_chapters(source_url, lang, preferred_chapter)
-            elif self._is_yumo_source(source_url):
-                chapters = self._fetch_yumo_chapters(source_url, preferred_chapter)
             elif self._is_sakura_source(source_url):
                 chapters = self._fetch_sakura_chapters(source_url, preferred_chapter)
             else:
                 raise ValueError(
-                    "Fonte nao suportada para capitulos. Use MangaDex, MangaLivre, MangasBrasuka, "
-                    "Toomics, One Piece Project, DragonTea, MangaKatana, ReadFull, NovelToon, "
-                    "YumoMangas ou Sakura Mangas."
+                    "Fonte nao suportada para capitulos. Use HQ Local, Light Novel Local, Novel Mania, Central Novel, Tensura Fan, Pleiades Translations, MangaDex, MangaLivre, MangasBrasuka, "
+                    "Toomics, One Piece Project, DragonTea, Nexus, MangaKatana, ReadFull, "
+                    "NovelToon ou Sakura Mangas."
                 )
             selected = self._select_chapter(chapters, source_url, preferred_chapter)
             display_chapters = list(reversed(chapters))
             provider = (
-                "toomics"
+                "hq_local"
+                if self.hq_plugin.is_source(source_url)
+                else "hq_now"
+                if self.hq_now_plugin.is_source(source_url)
+                else "fliptru"
+                if self.fliptru_plugin.is_source(source_url)
+                else "light_novel_local"
+                if self.light_novel_plugin.is_source(source_url)
+                else "novel_mania"
+                if self.novel_mania_plugin.is_source(source_url)
+                else "central_novel"
+                if self.central_novel_plugin.is_source(source_url)
+                else "tensura_fan"
+                if self.tensura_fan_plugin.is_source(source_url)
+                else "pleiades_translations"
+                if self.pleiades_translations_plugin.is_source(source_url)
+                else "toomics"
                 if self._is_toomics_source(source_url)
                 else "mangalivre" if self._is_mangalivre_source(source_url)
                 else "mangasbrasuka" if self._is_mangasbrasuka_source(source_url)
+                else "nexus" if self._is_nexus_source(source_url)
+                else "mangageek" if self._is_mangageek_source(source_url)
                 else "mangakatana" if self._is_mangakatana_source(source_url)
                 else "dragontea" if self._is_dragontea_source(source_url)
                 else "mangadex" if self._is_mangadex_source(source_url)
                 else "pieceproject" if self._is_pieceproject_source(source_url)
                 else "readfull" if self._is_readfull_source(source_url)
                 else "noveltoon" if self._is_noveltoon_source(source_url)
-                else "yumo" if self._is_yumo_source(source_url)
                 else "sakura" if self._is_sakura_source(source_url)
                 else "unknown"
             )
             language = (
                 "en"
-                if provider in {"mangakatana", "readfull"}
-                else "pt-br" if provider in {"pieceproject", "mangalivre", "mangasbrasuka", "yumo", "sakura"}
+                if provider in {"mangakatana", "readfull", "tensura_fan"}
+                else "pt-br" if provider in {"hq_local", "hq_now", "fliptru", "light_novel_local", "novel_mania", "central_novel", "pleiades_translations", "pieceproject", "mangalivre", "mangasbrasuka", "nexus", "mangageek", "sakura"}
                 else normalize_lang(lang or "pt-br")
             )
+
+            serialized_chapters = [
+                self._serialize_chapter(chapter)
+                for chapter in display_chapters
+            ]
+            if provider in {"hq_local", "hq_now"}:
+                for chapter in serialized_chapters:
+                    number_text = str(chapter.get("number_text") or "").strip()
+                    chapter["label"] = f"Edicao {number_text}" if number_text else "Edicao"
+            elif provider == "tensura_fan":
+                for chapter in serialized_chapters:
+                    chapter["label"] = str(chapter.get("title") or "Volume")
+                    chapter["title"] = ""
+            elif provider == "pleiades_translations":
+                for chapter in serialized_chapters:
+                    chapter["label"] = str(chapter.get("title") or "Capitulo")
+                    chapter["title"] = ""
 
             return {
                 "ok": True,
@@ -6844,10 +8098,7 @@ class MangaReader:
                 "source_url": source_url,
                 "selected_url": selected.url if selected else None,
                 "count": len(chapters),
-                "chapters": [
-                    self._serialize_chapter(chapter)
-                    for chapter in display_chapters
-                ],
+                "chapters": serialized_chapters,
             }
 
     def load_source(
@@ -6857,17 +8108,41 @@ class MangaReader:
         preferred_chapter: str | None = None,
     ) -> dict:
         if (
-            self._is_chapter_url(source_url)
+            (self.hq_plugin.is_source(source_url) and self.hq_plugin.parse_source(source_url)[0] == "issue")
+            or (self.hq_now_plugin.is_source(source_url) and self.hq_now_plugin.parse_source(source_url)[0] == "issue")
+            or (self.fliptru_plugin.is_source(source_url) and self.fliptru_plugin.chapter_parts(source_url))
+            or (
+                self.light_novel_plugin.is_source(source_url)
+                and self.light_novel_plugin.parse_source(source_url)[0] == "chapter"
+            )
+            or (
+                self.novel_mania_plugin.is_source(source_url)
+                and self.novel_mania_plugin.parse_source(source_url)[0] == "chapter"
+            )
+            or (
+                self.central_novel_plugin.is_source(source_url)
+                and self.central_novel_plugin.parse_source(source_url)[0] == "chapter"
+            )
+            or (
+                self.tensura_fan_plugin.is_source(source_url)
+                and self.tensura_fan_plugin.parse_source(source_url)[0] == "chapter"
+            )
+            or (
+                self.pleiades_translations_plugin.is_source(source_url)
+                and self.pleiades_translations_plugin.parse_source(source_url)[0] == "chapter"
+            )
+            or self._is_chapter_url(source_url)
             or (self._is_toomics_source(source_url) and self._toomics_chapter_parts(source_url))
             or (self._is_mangalivre_source(source_url) and self._mangalivre_chapter_slug_from_source(source_url))
             or (self._is_mangasbrasuka_source(source_url) and self._mangasbrasuka_chapter_parts(source_url))
+            or (self._is_nexus_source(source_url) and self._nexus_chapter_parts(source_url))
+            or (self._is_mangageek_source(source_url) and self._mangageek_chapter_parts(source_url))
             or (self._is_mangakatana_source(source_url) and self._mangakatana_chapter_parts(source_url))
             or self._is_dragontea_source(source_url)
             or (self._is_readfull_source(source_url) and self._readfull_chapter_parts(source_url))
             or (self._is_mangadex_source(source_url) and self._mangadex_chapter_id_from_source(source_url))
             or (self._is_pieceproject_source(source_url) and self._pieceproject_chapter_number_from_source(source_url))
             or (self._is_noveltoon_source(source_url) and self._noveltoon_chapter_parts(source_url))
-            or (self._is_yumo_source(source_url) and self._yumo_chapter_parts(source_url))
             or (self._is_sakura_source(source_url) and self._sakura_chapter_parts(source_url))
         ):
             return self.load_chapter(source_url)
@@ -6879,6 +8154,30 @@ class MangaReader:
         return self.load_chapter(selected_url)
 
     def load_chapter(self, url: str, include_neighbors: bool = True) -> dict:
+        if self.hq_plugin.is_source(url):
+            return self._load_hq_chapter(url)
+
+        if self.hq_now_plugin.is_source(url):
+            return self._load_hq_now_chapter(url)
+
+        if self.fliptru_plugin.is_source(url):
+            return self._load_fliptru_chapter(url)
+
+        if self.light_novel_plugin.is_source(url):
+            return self._load_light_novel_chapter(url)
+
+        if self.novel_mania_plugin.is_source(url):
+            return self._load_novel_mania_chapter(url)
+
+        if self.central_novel_plugin.is_source(url):
+            return self._load_central_novel_chapter(url)
+
+        if self.tensura_fan_plugin.is_source(url):
+            return self._load_tensura_fan_chapter(url)
+
+        if self.pleiades_translations_plugin.is_source(url):
+            return self._load_pleiades_translations_chapter(url)
+
         if self._is_toomics_source(url):
             return self._load_toomics_chapter(url)
 
@@ -6887,6 +8186,12 @@ class MangaReader:
 
         if self._is_mangasbrasuka_source(url):
             return self._load_mangasbrasuka_chapter(url, include_neighbors=include_neighbors)
+
+        if self._is_nexus_source(url):
+            return self._load_nexus_chapter(url)
+
+        if self._is_mangageek_source(url):
+            return self._load_mangageek_chapter(url)
 
         if self._is_mangakatana_source(url):
             return self._load_mangakatana_chapter(url)
@@ -6900,9 +8205,6 @@ class MangaReader:
         if self._is_noveltoon_source(url) and self._noveltoon_chapter_parts(url):
             return self._load_noveltoon_chapter(url)
 
-        if self._is_yumo_source(url):
-            return self._load_yumo_chapter(url)
-
         if self._is_sakura_source(url):
             return self._load_sakura_chapter(url)
 
@@ -6913,10 +8215,228 @@ class MangaReader:
             return self._load_pieceproject_chapter(url)
 
         raise ValueError(
-            "Fonte de capitulo nao suportada. Use MangaDex, MangaLivre, MangasBrasuka, "
-            "Toomics, One Piece Project, DragonTea, MangaKatana, ReadFull, NovelToon, "
-            "YumoMangas ou Sakura Mangas."
+            "Fonte de capitulo nao suportada. Use HQ Local, Light Novel Local, Novel Mania, Central Novel, MangaDex, MangaLivre, MangasBrasuka, "
+            "Toomics, One Piece Project, DragonTea, Nexus, MangaKatana, ReadFull, NovelToon "
+            "ou Sakura Mangas."
         )
+
+    def _load_hq_chapter(self, url: str) -> dict:
+        comic, issue, pages = self.hq_plugin.get_issue(url)
+        previous_url, next_url = self.hq_plugin.issue_neighbors(url)
+        number_text = str(issue.get("number") or "")
+        label = clean_filename(
+            f"hq-{comic.get('title') or 'local'}-edicao-{number_text or issue.get('id')}",
+            fallback="hq-local",
+        )
+        self.state = ChapterState(
+            url=url,
+            label=label,
+            image_urls=[self.hq_plugin.page_url(path) for path in pages],
+            cache_dir=self.cache.new_chapter_dir(label),
+            session=requests.Session(),
+            previous_url=previous_url,
+            next_url=next_url,
+        )
+        return {
+            "ok": True,
+            "provider": "hq_local",
+            "url": url,
+            "title": comic.get("title") or "HQ Local",
+            "label": issue.get("title") or f"Edicao {number_text}",
+            "number": parse_float(number_text),
+            "number_text": number_text,
+            "language": "pt-br",
+            "previous": previous_url,
+            "next": next_url,
+        }
+
+    def _load_hq_now_chapter(self, url: str) -> dict:
+        comic, issue, pages = self.hq_now_plugin.get_issue(url)
+        previous_url, next_url = self.hq_now_plugin.issue_neighbors(url)
+        number_text = str(issue.get("number") or "")
+        label = clean_filename(
+            f"hq-now-{comic.get('title') or 'hq'}-edicao-{number_text or issue.get('id')}",
+            fallback="hq-now",
+        )
+        session = requests.Session()
+        session.headers.update(
+            {
+                "Referer": "https://www.hq-now.com/",
+                "User-Agent": "Mozilla/5.0 Kari/1.0",
+            }
+        )
+        self.state = ChapterState(
+            url=url,
+            label=label,
+            image_urls=pages,
+            cache_dir=self.cache.new_chapter_dir(label),
+            session=session,
+            previous_url=previous_url,
+            next_url=next_url,
+        )
+        return {
+            "ok": True,
+            "provider": "hq_now",
+            "url": url,
+            "title": comic.get("title") or "HQ Now",
+            "label": issue.get("title") or f"Edicao {number_text}",
+            "number": parse_float(number_text),
+            "number_text": number_text,
+            "language": "pt-br",
+            "previous": previous_url,
+            "next": next_url,
+        }
+
+    def _load_fliptru_chapter(self, url: str) -> dict:
+        payload = self.fliptru_plugin.get_chapter(url)
+        number_text = str(payload.get("chapter_key") or "")
+        title = str(payload.get("title") or f"Capitulo {number_text}")
+        label = clean_filename(
+            f"fliptru-{payload.get('slug') or 'comic'}-{number_text}",
+            fallback="fliptru",
+        )
+        session = requests.Session()
+        session.headers.update(
+            {
+                "Referer": "https://fliptru.com.br/",
+                "User-Agent": "Mozilla/5.0 Kari/1.0",
+            }
+        )
+        self.state = ChapterState(
+            url=url,
+            label=label,
+            image_urls=list(payload.get("pages") or []),
+            cache_dir=self.cache.new_chapter_dir(label),
+            session=session,
+            previous_url=payload.get("previous"),
+            next_url=payload.get("next"),
+        )
+        return {
+            "ok": True,
+            "provider": "fliptru",
+            "url": url,
+            "title": title,
+            "label": f"Capitulo {number_text}" + (f" - {title}" if title else ""),
+            "number": parse_float(number_text),
+            "number_text": number_text,
+            "language": "pt-br",
+            "previous": payload.get("previous"),
+            "next": payload.get("next"),
+        }
+
+    def _load_light_novel_chapter(self, url: str) -> dict:
+        novel, chapter, content = self.light_novel_plugin.get_chapter(url)
+        previous_url, next_url = self.light_novel_plugin.chapter_neighbors(url)
+        number_text = str(chapter.get("number") or "")
+        chapter_title = str(chapter.get("title") or f"Capitulo {number_text}")
+        return {
+            "ok": True,
+            "provider": "light_novel_local",
+            "mode": "text",
+            "url": url,
+            "source_url": url,
+            "label": chapter_title,
+            "title": novel.get("title") or "Light Novel",
+            "content": content,
+            "number": parse_float(number_text),
+            "number_text": number_text,
+            "language": novel.get("language") or "pt-br",
+            "count": 1,
+            "previous": previous_url,
+            "next": next_url,
+        }
+
+    def _load_novel_mania_chapter(self, url: str) -> dict:
+        payload = self.novel_mania_plugin.get_chapter(url)
+        chapter = payload.get("chapter") or {}
+        number_text = str(chapter.get("number_text") or chapter.get("number") or "")
+        subtitle = str(chapter.get("title") or "").strip()
+        chapter_title = f"Capitulo {number_text}" if number_text else "Capitulo"
+        if subtitle:
+            chapter_title += f" - {subtitle}"
+        return {
+            "ok": True,
+            "provider": "novel_mania",
+            "mode": "text",
+            "url": url,
+            "source_url": url,
+            "label": chapter_title,
+            "title": payload.get("novel_title") or "Novel Mania",
+            "content": payload.get("content") or "",
+            "blocks": payload.get("blocks") or [],
+            "number": parse_float(number_text),
+            "number_text": number_text,
+            "language": "pt-br",
+            "count": 1,
+            "previous": payload.get("previous"),
+            "next": payload.get("next"),
+        }
+
+    def _load_central_novel_chapter(self, url: str) -> dict:
+        payload = self.central_novel_plugin.get_chapter(url)
+        number_text = str(payload.get("number_text") or "")
+        chapter_title = str(payload.get("chapter_title") or f"Capitulo {number_text}")
+        return {
+            "ok": True,
+            "provider": "central_novel",
+            "mode": "text",
+            "url": url,
+            "source_url": url,
+            "label": chapter_title,
+            "title": payload.get("novel_title") or "Central Novel",
+            "content": payload.get("content") or "",
+            "blocks": payload.get("blocks") or [],
+            "number": parse_float(number_text),
+            "number_text": number_text,
+            "language": "pt-br",
+            "count": 1,
+            "previous": payload.get("previous"),
+            "next": payload.get("next"),
+        }
+
+    def _load_tensura_fan_chapter(self, url: str) -> dict:
+        payload = self.tensura_fan_plugin.get_chapter(url)
+        number_text = str(payload.get("number_text") or "")
+        chapter_title = str(payload.get("chapter_title") or f"Volume {number_text}")
+        return {
+            "ok": True,
+            "provider": "tensura_fan",
+            "mode": "text",
+            "url": url,
+            "source_url": payload.get("source_url") or "https://tensurafan.github.io/",
+            "label": chapter_title,
+            "title": payload.get("novel_title") or "Tensura Fan",
+            "content": payload.get("content") or "",
+            "blocks": payload.get("blocks") or [],
+            "number": parse_float(number_text),
+            "number_text": number_text,
+            "language": "en",
+            "count": 1,
+            "previous": payload.get("previous"),
+            "next": payload.get("next"),
+        }
+
+    def _load_pleiades_translations_chapter(self, url: str) -> dict:
+        payload = self.pleiades_translations_plugin.get_chapter(url)
+        number_text = str(payload.get("number_text") or "")
+        chapter_title = str(payload.get("chapter_title") or f"Capitulo {number_text}")
+        return {
+            "ok": True,
+            "provider": "pleiades_translations",
+            "mode": "text",
+            "url": url,
+            "source_url": payload.get("source_url") or "https://pleiadestranslations.wordpress.com/",
+            "label": chapter_title,
+            "title": payload.get("novel_title") or "Pleiades Translations",
+            "content": payload.get("content") or "",
+            "blocks": payload.get("blocks") or [],
+            "number": parse_float(number_text),
+            "number_text": number_text,
+            "language": "pt-br",
+            "count": 1,
+            "previous": payload.get("previous"),
+            "next": payload.get("next"),
+        }
 
     def _load_pieceproject_chapter(self, url: str) -> dict:
         wanted_number = self._pieceproject_chapter_number_from_source(url)
@@ -7247,6 +8767,15 @@ class MangaReader:
             session_headers = dict(state.session.headers)
             session_cookies = state.session.cookies.copy()
 
+        if urlparse(image_url).scheme.lower() == "hqfile":
+            target = self.hq_plugin.resolve_page_url(image_url)
+            content_type = mimetypes.guess_type(target.name)[0] or "image/webp"
+            with self.lock:
+                if self.state is not state:
+                    raise FileNotFoundError("O capitulo mudou antes da pagina terminar.")
+                state.image_cache[index] = ImageCacheEntry(target, content_type)
+            return target, content_type
+
         headers = dict(DEFAULT_HEADERS)
         headers.update(session_headers)
         headers.update(
@@ -7476,6 +9005,14 @@ class MangaReader:
             return self._toomics_chapter_label(url)
         if self._is_mangalivre_source(url):
             return self._mangalivre_chapter_label(url)
+        if self._is_nexus_source(url):
+            parts = self._nexus_chapter_parts(url)
+            if parts:
+                return clean_filename(f"nexus-{parts[0]}-chapter-{parts[1]}")
+        if self._is_mangageek_source(url):
+            parts = self._mangageek_chapter_parts(url)
+            if parts:
+                return clean_filename(f"mangageek-{parts[0]}-chapter-{parts[1]}")
         if self._is_mangakatana_source(url):
             return self._mangakatana_chapter_label(url)
         if self._is_dragontea_source(url):
@@ -7523,6 +9060,8 @@ class ReaderHandler(BaseHTTPRequestHandler):
                 self._handle_json(lambda: self.reader.search_mangasbrasuka(keyword, limit=limit))
             elif provider == "sakura":
                 self._handle_json(lambda: self.reader.search_sakura(keyword, limit=limit))
+            elif provider == "nexus":
+                self._handle_json(lambda: self.reader.search_nexus(keyword, limit=limit))
             elif provider == "mangakatana":
                 self._handle_json(lambda: self.reader.search_mangakatana(keyword, limit=limit))
             else:

@@ -59,3 +59,24 @@ html {
 .manga-chapter-row > span:first-child {
   display: none;
 }
+
+@keyframes kari-skeleton-shimmer {
+  from { transform: translateX(-115%); }
+  to { transform: translateX(115%); }
+}
+
+.kari-skeleton {
+  position: relative;
+  overflow: hidden;
+  isolation: isolate;
+  background: #151c20;
+}
+
+.kari-skeleton::after {
+  position: absolute;
+  inset: 0;
+  width: 58%;
+  content: "";
+  background: linear-gradient(100deg, transparent, rgba(123, 160, 166, 0.42), transparent);
+  animation: kari-skeleton-shimmer 1.15s linear infinite;
+}
