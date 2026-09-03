@@ -33,6 +33,8 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from backend.config import load_settings
+
 from schemas import (
     HomeResponse,
     MangaHomeItem,
@@ -69,6 +71,9 @@ try:
     load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 except Exception:  # noqa: BLE001 - sem dotenv o app ainda roda (OAuth fica desligado).
     pass
+
+
+settings = load_settings()
 
 
 CATALOG_CACHE_TTL_SECONDS = 30 * 60
@@ -200,8 +205,8 @@ PROFILE_VIDEO_MAX_BYTES = 64 * 1024 * 1024
 # OAuth de contas externas (AniList / MyAnimeList).
 # Credenciais vem do .env; sem elas o vinculo fica desabilitado (HTTP 503).
 # ---------------------------------------------------------------------------
-BACKEND_BASE_URL = os.environ.get("KARI_BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
-FRONTEND_BASE_URL = os.environ.get("KARI_FRONTEND_URL", "http://127.0.0.1:5173").rstrip("/")
+BACKEND_BASE_URL = settings.backend_url
+FRONTEND_BASE_URL = settings.frontend_url
 
 ANILIST_CLIENT_ID = os.environ.get("ANILIST_CLIENT_ID", "").strip()
 ANILIST_CLIENT_SECRET = os.environ.get("ANILIST_CLIENT_SECRET", "").strip()
@@ -474,6 +479,29 @@ reader = MangaReader(
 )
 
 
+DESKTOP_ONLY_PROVIDERS = {"hq_local", "light_novel_local", "sakura"}
+
+
+def _provider_enabled(provider: str) -> bool:
+    return not settings.is_web or provider not in DESKTOP_ONLY_PROVIDERS
+
+
+def _require_desktop_capability() -> None:
+    if settings.is_web:
+        raise HTTPException(status_code=404, detail="Recurso disponivel somente no Kari local.")
+
+
+def _ensure_source_allowed(source_url: str) -> None:
+    if not settings.is_web:
+        return
+    if (
+        reader.hq_plugin.is_source(source_url)
+        or reader.light_novel_plugin.is_source(source_url)
+        or reader._is_sakura_source(source_url)
+    ):
+        _require_desktop_capability()
+
+
 def _tcp_port_open(host: str, port: int, timeout: float = 0.15) -> bool:
     try:
         with socket.create_connection((host, port), timeout=timeout):
@@ -484,6 +512,8 @@ def _tcp_port_open(host: str, port: int, timeout: float = 0.15) -> bool:
 
 def _sakura_search_available() -> bool:
     # Sakura precisa de navegador/CDP. Sem isso, search vira abertura pesada de browser.
+    if settings.is_web:
+        return False
     cdp_url = str(getattr(reader, "sakura_cdp_url", "") or "").strip()
     if not cdp_url:
         return False
@@ -494,7 +524,10 @@ def _sakura_search_available() -> bool:
 
 
 def _pt_complete_sources() -> list[str]:
-    return list(PT_COMPLETE_SOURCES)
+    return [
+        source for source in PT_COMPLETE_SOURCES
+        if source != "sakura" or not settings.is_web
+    ]
 
 
 def _search_sources() -> list[str]:
@@ -738,12 +771,10 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=list(settings.allowed_origins),
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
-    allow_headers=["*"],
+    allow_headers=["Accept", "Authorization", "Content-Type"],
+    allow_credentials=False,
 )
 
 # Capas baixadas viram arquivo estatico: GET /static/covers/<manga_id>.<ext>
@@ -1534,6 +1565,8 @@ def _normalize_manga_item(item: dict, *, section: str = "") -> dict | None:
         return None
 
     provider = _guess_provider(item)
+    if not _provider_enabled(provider):
+        return None
     poster_original = str(item.get("poster") or item.get("cover_url") or "").strip()
     fallback_originals = [
         str(url).strip()
@@ -4826,6 +4859,11 @@ def _search_mangas(query: str, limit: int) -> dict:
     return data
 
 
+@app.get("/api/capabilities")
+def capabilities() -> dict:
+    return settings.public_capabilities()
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -6271,6 +6309,7 @@ def home_catalog(
 
 @app.get("/api/hq/library")
 def hq_library(q: str = Query(default="", description="Filtra biblioteca local por titulo.")) -> dict:
+    _require_desktop_capability()
     normalized = _hq_catalog_items(q.strip())
     items = [_home_item(item) for item in normalized]
     return {
@@ -6465,6 +6504,7 @@ async def import_hq(
     issue_number: str = Form(default=""),
     description: str = Form(default=""),
 ) -> dict:
+    _require_desktop_capability()
     filename = Path(file.filename or "").name
     extension = Path(filename).suffix.lower()
     if extension not in HQ_SUPPORTED_EXTENSIONS:
@@ -6516,6 +6556,7 @@ async def import_hq(
 
 @app.delete("/api/hq/{comic_id}")
 def delete_hq(comic_id: str) -> dict:
+    _require_desktop_capability()
     try:
         reader.hq_plugin.delete_comic(comic_id)
     except (FileNotFoundError, ValueError) as exc:
@@ -6525,6 +6566,7 @@ def delete_hq(comic_id: str) -> dict:
 
 @app.get("/api/hq/assets/{comic_id}/{issue_id}/{filename}")
 def hq_asset(comic_id: str, issue_id: str, filename: str) -> FileResponse:
+    _require_desktop_capability()
     try:
         path = reader.hq_plugin.resolve_asset(comic_id, issue_id, filename)
     except (FileNotFoundError, ValueError) as exc:
@@ -6538,6 +6580,7 @@ def hq_asset(comic_id: str, issue_id: str, filename: str) -> FileResponse:
 
 @app.get("/api/light-novels/library")
 def light_novel_library(q: str = Query(default="", description="Filtra light novels locais.")) -> dict:
+    _require_desktop_capability()
     normalized = _light_novel_catalog_items(q.strip())
     items = [_home_item(item) for item in normalized]
     return {
@@ -6556,6 +6599,7 @@ async def import_light_novel(
     description: str = Form(default=""),
     language: str = Form(default="pt-br"),
 ) -> dict:
+    _require_desktop_capability()
     filename = Path(file.filename or "").name
     extension = Path(filename).suffix.lower()
     if extension not in NOVEL_SUPPORTED_EXTENSIONS:
@@ -6609,6 +6653,7 @@ async def import_light_novel(
 
 @app.delete("/api/light-novels/{novel_id}")
 def delete_light_novel(novel_id: str) -> dict:
+    _require_desktop_capability()
     try:
         reader.light_novel_plugin.delete_novel(novel_id)
     except (FileNotFoundError, ValueError) as exc:
@@ -6618,6 +6663,7 @@ def delete_light_novel(novel_id: str) -> dict:
 
 @app.get("/api/light-novels/assets/{novel_id}/{filename}")
 def light_novel_asset(novel_id: str, filename: str) -> FileResponse:
+    _require_desktop_capability()
     if filename != "cover.webp":
         raise HTTPException(status_code=404, detail="Arquivo da light novel nao encontrado.")
     try:
@@ -6965,6 +7011,7 @@ def manga_meta(
     source = unquote(source_url).strip()
     if not source:
         raise HTTPException(status_code=400, detail="source_url vazio.")
+    _ensure_source_allowed(source)
     confirmed = None if (
         reader.hq_now_plugin.is_source(source)
         or reader.novel_mania_plugin.is_source(source)
@@ -6997,6 +7044,7 @@ def list_chapters(
     source = requested_source
     if not source:
         raise HTTPException(status_code=400, detail="source_url vazio.")
+    _ensure_source_allowed(source)
     resolved_item = None
     requested_lang = (lang or "").strip().lower()
     confirmed = None if (
@@ -7283,8 +7331,11 @@ def open_chapter(
     source = unquote(source_url).strip()
     if not source:
         raise HTTPException(status_code=400, detail="source_url vazio.")
+    _ensure_source_allowed(source)
     pieceproject_source = reader._is_pieceproject_source(source)
     manga_source = unquote(fallback_source_url or "").strip()
+    if manga_source:
+        _ensure_source_allowed(manga_source)
     if not manga_source:
         mangasbrasuka_parts = reader._mangasbrasuka_chapter_parts(source)
         mangageek_parts = reader._mangageek_chapter_parts(source)

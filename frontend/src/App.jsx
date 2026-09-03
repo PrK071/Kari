@@ -7,6 +7,8 @@ import MangaCard, { MangaCardSkeleton } from "./components/MangaCard.jsx"
 const API_BASE_URL = import.meta.env.VITE_DESKTOP_BUILD === "1"
   ? window.location.origin
   : (import.meta.env.VITE_API_BASE_URL || window.location.origin)
+const LOCAL_CAPABILITIES_ENABLED = import.meta.env.VITE_DESKTOP_BUILD === "1"
+  || import.meta.env.VITE_KARI_RUNTIME !== "web"
 const CARD_WIDTH = 380
 const CARD_HEIGHT = 180
 const GRID_GAP = 8
@@ -945,7 +947,7 @@ function chapterTextBlocks(content) {
     .filter(Boolean)
 }
 
-function HQNowPluginPage({ onOpen }) {
+function HQNowPluginPage({ onOpen, localLibrariesEnabled }) {
   const [tab, setTab] = useState("remote")
   const [query, setQuery] = useState("")
   const [activeQuery, setActiveQuery] = useState("")
@@ -993,15 +995,17 @@ function HQNowPluginPage({ onOpen }) {
       >
         <FileArchive size={15} aria-hidden="true" /> HQ Now
       </button>
-      <button
-        type="button"
-        role="tab"
-        aria-selected={tab === "local"}
-        onClick={() => setTab("local")}
-        className={`flex h-9 items-center gap-2 rounded px-3 text-xs font-bold transition ${tab === "local" ? "bg-accent text-black" : "border border-line bg-panel text-zinc-300 hover:border-accent"}`}
-      >
-        <Upload size={15} aria-hidden="true" /> Minha biblioteca
-      </button>
+      {localLibrariesEnabled && (
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "local"}
+          onClick={() => setTab("local")}
+          className={`flex h-9 items-center gap-2 rounded px-3 text-xs font-bold transition ${tab === "local" ? "bg-accent text-black" : "border border-line bg-panel text-zinc-300 hover:border-accent"}`}
+        >
+          <Upload size={15} aria-hidden="true" /> Minha biblioteca
+        </button>
+      )}
     </div>
     {tab === "local" ? (
       <PluginLibraryPage kind="hq" onOpen={onOpen} />
@@ -1204,7 +1208,7 @@ function RemoteNovelsPluginPage({ source, onOpen }) {
   )
 }
 
-function WebNovelsPluginPage({ onOpen, onChanged }) {
+function WebNovelsPluginPage({ onOpen, onChanged, localLibrariesEnabled }) {
   const [tab, setTab] = useState("novel-mania")
   return (
     <>
@@ -1245,15 +1249,17 @@ function WebNovelsPluginPage({ onOpen, onChanged }) {
         >
           <BookOpen size={15} aria-hidden="true" /> Pleiades
         </button>
-        <button
-          type="button"
-          role="tab"
-          aria-selected={tab === "local"}
-          onClick={() => setTab("local")}
-          className={`flex h-9 items-center gap-2 rounded px-3 text-xs font-bold transition ${tab === "local" ? "bg-accent text-black" : "border border-line bg-panel text-zinc-300 hover:border-accent"}`}
-        >
-          <Upload size={15} aria-hidden="true" /> Minha biblioteca
-        </button>
+        {localLibrariesEnabled && (
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === "local"}
+            onClick={() => setTab("local")}
+            className={`flex h-9 items-center gap-2 rounded px-3 text-xs font-bold transition ${tab === "local" ? "bg-accent text-black" : "border border-line bg-panel text-zinc-300 hover:border-accent"}`}
+          >
+            <Upload size={15} aria-hidden="true" /> Minha biblioteca
+          </button>
+        )}
       </div>
       {tab !== "local" ? (
         <RemoteNovelsPluginPage source={tab} onOpen={onOpen} />
@@ -3686,11 +3692,15 @@ export default function App() {
       )}
       {pluginView ? (
         pluginView === "hq" ? (
-          <HQNowPluginPage onOpen={setSelectedManga} />
+          <HQNowPluginPage
+            onOpen={setSelectedManga}
+            localLibrariesEnabled={LOCAL_CAPABILITIES_ENABLED}
+          />
         ) : pluginView === "novels" ? (
           <WebNovelsPluginPage
             onOpen={setSelectedManga}
             onChanged={() => void catalogQuery.refetch()}
+            localLibrariesEnabled={LOCAL_CAPABILITIES_ENABLED}
           />
         ) : (
           <PluginLibraryPage

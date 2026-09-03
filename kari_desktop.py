@@ -119,6 +119,7 @@ def prepare_runtime() -> Path:
 
     os.environ["KARI_DATA_DIR"] = str(data_dir)
     os.environ["KARI_STATIC_DIR"] = str(static_dir)
+    os.environ["KARI_RUNTIME"] = "desktop"
     os.environ["KARI_BACKEND_URL"] = APP_URL
     os.environ["KARI_FRONTEND_URL"] = APP_URL
 
