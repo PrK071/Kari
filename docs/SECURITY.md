@@ -6,7 +6,6 @@ O runtime web já desliga bibliotecas locais e Sakura, mas o backend ainda não 
 aprovado para exposição pública. Os bloqueadores atuais são:
 
 - estado global do capítulo corrente;
-- usuários, sessões e tokens OAuth persistidos em JSON;
 - ausência de rate limiting nos endpoints de autenticação e scraping.
 
 ## Classificação atual das rotas
@@ -28,12 +27,17 @@ concorrência antes da publicação.
 
 - Toda mutação e leitura privada deve derivar o usuário da sessão, nunca confiar
   em um `profile_id` enviado pelo cliente.
-- Senhas devem usar hash moderno com versão e possibilidade de rehash.
-- O servidor deve persistir somente hash de tokens de sessão.
+- Novas senhas usam Argon2id e no mínimo 12 caracteres. Um login PBKDF2 legado
+  válido faz rehash transparente sem invalidar o usuário.
+- PostgreSQL persiste somente SHA-256 dos tokens opacos de alta entropia. O
+  adaptador JSON preserva tokens legados somente no runtime local/desktop.
 - Logout revoga a sessão atual; uma ação separada deve revogar todas as sessões.
 - Tokens OAuth externos nunca entram no payload da API ou nos logs.
-- Se cookies forem adotados, usar `HttpOnly`, `Secure` e `SameSite` compatível
-  com os domínios reais. O modelo atual usa Bearer em `localStorage`.
+- O modelo atual continua usando Bearer em `localStorage`. A troca para cookie
+  será atômica com proteção CSRF, `HttpOnly`, `Secure`, `SameSite` e CORS com
+  credenciais; não deve existir uma etapa híbrida parcialmente protegida.
+- `KARI_SESSION_TTL_HOURS` controla a validade entre 1 e 720 horas. Logout
+  revoga somente a sessão apresentada e múltiplas sessões continuam possíveis.
 
 ## CORS e configuração
 

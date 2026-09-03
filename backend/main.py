@@ -26,6 +26,8 @@ from types import SimpleNamespace
 from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlparse
 
 import requests
+from argon2 import PasswordHasher
+from argon2.exceptions import InvalidHashError, VerificationError
 from requests.adapters import HTTPAdapter
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, Query, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -137,8 +139,8 @@ PROFILES_STORE_PATH = KARI_DATA_DIR / "profiles.json"
 # Contas de usuario (cadastro/login) e sessoes. Local, senha com PBKDF2.
 USERS_STORE_PATH = KARI_DATA_DIR / "users.json"
 AUTH_TOKENS_PATH = KARI_DATA_DIR / "tokens.json"
-AUTH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60
 PBKDF2_ITERATIONS = 200_000
+_password_hasher = PasswordHasher()
 
 repositories = build_repositories(
     backend=settings.persistence_backend,
@@ -6059,6 +6061,41 @@ def _hash_password(password: str, salt: str) -> str:
     ).hex()
 
 
+def _argon2_hash_password(password: str) -> str:
+    return _password_hasher.hash(password)
+
+
+def _verify_password_and_rehash(login_key: str, user: dict, password: str) -> bool:
+    password_hash = str(user.get("password_hash") or "")
+    algorithm = str(user.get("password_algorithm") or "").lower()
+    if password_hash.startswith("$argon2id$") or algorithm == "argon2id":
+        try:
+            valid = _password_hasher.verify(password_hash, password)
+        except (InvalidHashError, VerificationError):
+            return False
+        if valid and _password_hasher.check_needs_rehash(password_hash):
+            updated = dict(user)
+            updated["password_hash"] = _argon2_hash_password(password)
+            updated["password_algorithm"] = "argon2id"
+            updated.pop("salt", None)
+            user_repository.save(login_key, updated)
+        return bool(valid)
+
+    salt = str(user.get("salt") or "")
+    try:
+        candidate = _hash_password(password, salt)
+    except (ValueError, TypeError):
+        return False
+    if not secrets.compare_digest(candidate, password_hash):
+        return False
+    updated = dict(user)
+    updated["password_hash"] = _argon2_hash_password(password)
+    updated["password_algorithm"] = "argon2id"
+    updated.pop("salt", None)
+    user_repository.save(login_key, updated)
+    return True
+
+
 def _issue_token(profile_id: str, username: str) -> str:
     token = secrets.token_urlsafe(32)
     now = time.time()
@@ -6069,7 +6106,7 @@ def _issue_token(profile_id: str, username: str) -> str:
             {
                 "profile_id": profile_id,
                 "username": username,
-                "expires": now + AUTH_TOKEN_TTL_SECONDS,
+                "expires": now + settings.session_ttl_seconds,
                 "created_at": now,
             },
         )
@@ -6080,7 +6117,7 @@ def _issue_token(profile_id: str, username: str) -> str:
 
 class RegisterRequest(BaseModel):
     username: str = Field(min_length=3, max_length=32)
-    password: str = Field(min_length=6, max_length=128)
+    password: str = Field(min_length=12, max_length=128)
     email: str = Field(default="", max_length=120)
 
 
@@ -6096,7 +6133,6 @@ def auth_register(request: RegisterRequest) -> dict:
         raise HTTPException(status_code=422, detail="Usuario invalido (3-32: letras, numeros, _ ou .).")
     key = username.lower()
     now = time.time()
-    salt = secrets.token_hex(16)
     with _users_lock:
         if user_repository.get(key) is not None:
             raise HTTPException(status_code=409, detail="Esse usuario ja existe.")
@@ -6112,8 +6148,8 @@ def auth_register(request: RegisterRequest) -> dict:
         user_repository.save(key, {
             "username": username,
             "email": request.email.strip(),
-            "salt": salt,
-            "password_hash": _hash_password(request.password, salt),
+            "password_hash": _argon2_hash_password(request.password),
+            "password_algorithm": "argon2id",
             "profile_id": profile["id"],
             "created_at": now,
         })
@@ -6126,7 +6162,10 @@ def auth_login(request: LoginRequest) -> dict:
     key = request.username.strip().lower()
     with _users_lock:
         user = user_repository.get(key)
-    if not user or _hash_password(request.password, user.get("salt", "")) != user.get("password_hash"):
+        password_valid = bool(
+            user and _verify_password_and_rehash(key, user, request.password)
+        )
+    if not password_valid:
         raise HTTPException(status_code=401, detail="Usuario ou senha invalidos.")
     with _profiles_lock:
         profile = profile_repository.get(user["profile_id"])

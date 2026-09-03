@@ -73,6 +73,7 @@ class Settings:
     persistence_backend: str
     storage_backend: str
     secret_key: str
+    session_ttl_seconds: int
 
     @property
     def is_production(self) -> bool:
@@ -155,6 +156,12 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         raise ConfigurationError(
             "KARI_SECRET_KEY deve ter ao menos 32 caracteres com persistencia PostgreSQL."
         )
+    try:
+        session_ttl_hours = int(source.get("KARI_SESSION_TTL_HOURS", "720"))
+    except ValueError as exc:
+        raise ConfigurationError("KARI_SESSION_TTL_HOURS deve ser inteiro.") from exc
+    if not 1 <= session_ttl_hours <= 720:
+        raise ConfigurationError("KARI_SESSION_TTL_HOURS deve estar entre 1 e 720.")
 
     return Settings(
         environment=environment,
@@ -166,4 +173,5 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         persistence_backend=persistence_backend,
         storage_backend=storage_backend,
         secret_key=secret_key,
+        session_ttl_seconds=session_ttl_hours * 60 * 60,
     )
