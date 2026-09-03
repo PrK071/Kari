@@ -74,6 +74,7 @@ class Settings:
     storage_backend: str
     secret_key: str
     session_ttl_seconds: int
+    rate_limit_backend: str
 
     @property
     def is_production(self) -> bool:
@@ -162,6 +163,11 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         raise ConfigurationError("KARI_SESSION_TTL_HOURS deve ser inteiro.") from exc
     if not 1 <= session_ttl_hours <= 720:
         raise ConfigurationError("KARI_SESSION_TTL_HOURS deve estar entre 1 e 720.")
+    rate_limit_backend = source.get("KARI_RATE_LIMIT_BACKEND", "memory").strip().lower()
+    if rate_limit_backend != "memory":
+        raise ConfigurationError(
+            "KARI_RATE_LIMIT_BACKEND suporta somente memory nesta versao."
+        )
 
     return Settings(
         environment=environment,
@@ -174,4 +180,5 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         storage_backend=storage_backend,
         secret_key=secret_key,
         session_ttl_seconds=session_ttl_hours * 60 * 60,
+        rate_limit_backend=rate_limit_backend,
     )

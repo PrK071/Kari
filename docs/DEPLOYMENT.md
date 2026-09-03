@@ -50,6 +50,7 @@ KARI_STATIC_DIR=/var/lib/kari/static
 DATABASE_URL=postgresql+psycopg://USUARIO:SENHA@HOST:5432/kari
 KARI_SECRET_KEY=GERAR_FORA_DO_GIT_COM_PELO_MENOS_32_CARACTERES
 KARI_SESSION_TTL_HOURS=720
+KARI_RATE_LIMIT_BACKEND=memory
 KARI_STORAGE_BACKEND=filesystem
 ```
 
@@ -118,6 +119,10 @@ WantedBy=multi-user.target
 Use um único worker enquanto existir estado global de leitura e caches em
 memória. Isso não corrige concorrência entre usuários; apenas evita divergência
 adicional entre processos.
+
+O rate limiter em memória também pressupõe uma única instância. Antes de escalar
+horizontalmente, implemente um `RateLimitBackend` compartilhado e execute os
+testes de políticas contra ele.
 
 Proxy `/etc/caddy/Caddyfile`:
 

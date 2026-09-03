@@ -29,7 +29,7 @@ import requests
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError
 from requests.adapters import HTTPAdapter
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, Query, Response, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -37,6 +37,7 @@ from pydantic import BaseModel, Field
 
 from backend.config import load_settings
 from backend.network_security import UnsafeRemoteURLError, validate_public_http_url
+from backend.rate_limit import MemoryRateLimitBackend, RateLimiter, RateLimitPolicy
 from backend.persistence import (
     ProfileRepository,
     SessionRepository,
@@ -83,6 +84,15 @@ except Exception:  # noqa: BLE001 - sem dotenv o app ainda roda (OAuth fica desl
 
 
 settings = load_settings()
+rate_limit_backend = MemoryRateLimitBackend()
+rate_limiter = RateLimiter(rate_limit_backend)
+
+REGISTER_RATE_LIMIT = RateLimitPolicy(limit=30, window_seconds=60 * 60)
+LOGIN_RATE_LIMIT = RateLimitPolicy(limit=30, window_seconds=5 * 60)
+SEARCH_RATE_LIMIT = RateLimitPolicy(limit=60, window_seconds=60)
+EXPENSIVE_RATE_LIMIT = RateLimitPolicy(limit=30, window_seconds=60)
+IMAGE_RATE_LIMIT = RateLimitPolicy(limit=120, window_seconds=60)
+OAUTH_RATE_LIMIT = RateLimitPolicy(limit=10, window_seconds=10 * 60)
 
 
 CATALOG_CACHE_TTL_SECONDS = 30 * 60
@@ -178,6 +188,29 @@ DIRECT_IMAGE_HOSTS = {
 }
 
 logger = logging.getLogger("mangatemp")
+
+
+def _enforce_rate_limit(
+    request: Request,
+    scope: str,
+    policy: RateLimitPolicy,
+    *,
+    user_id: str = "",
+    resource: str = "",
+) -> None:
+    client_ip = request.client.host if request.client else "unknown"
+    dimensions = {"ip": client_ip}
+    if user_id:
+        dimensions["user"] = user_id
+    if resource:
+        dimensions["resource"] = resource
+    decision = rate_limiter.check(scope, policy, dimensions)
+    if not decision.allowed:
+        raise HTTPException(
+            status_code=429,
+            detail="Muitas requisicoes. Tente novamente mais tarde.",
+            headers={"Retry-After": str(decision.retry_after)},
+        )
 
 # User-Agents reais p/ rotacionar e fugir de filtros antibot/rate-limit.
 USER_AGENTS = [
@@ -5724,9 +5757,17 @@ def _resolve_external_list_items(entries: list[dict]) -> list[tuple[dict, dict]]
 def start_account_link(
     profile_id: str,
     provider: str,
+    request: Request,
     current_user: AuthenticatedUser = Depends(require_profile_owner),
 ) -> dict:
     del current_user
+    _enforce_rate_limit(
+        request,
+        "oauth-link",
+        OAUTH_RATE_LIMIT,
+        user_id=profile_id,
+        resource=provider,
+    )
     if provider not in OAUTH_PROVIDERS:
         raise HTTPException(status_code=404, detail="Provedor desconhecido.")
     if not _oauth_provider_configured(provider):
@@ -5904,9 +5945,17 @@ def account_link_status(
 def sync_linked_manga_list(
     profile_id: str,
     provider: str,
+    request: Request,
     current_user: AuthenticatedUser = Depends(require_profile_owner),
 ) -> dict:
     del current_user
+    _enforce_rate_limit(
+        request,
+        "oauth-sync",
+        OAUTH_RATE_LIMIT,
+        user_id=profile_id,
+        resource=provider,
+    )
     if provider not in OAUTH_PROVIDERS:
         raise HTTPException(status_code=404, detail="Provedor desconhecido.")
     with _profiles_lock:
@@ -6127,8 +6176,14 @@ class LoginRequest(BaseModel):
 
 
 @app.post("/api/auth/register")
-def auth_register(request: RegisterRequest) -> dict:
+def auth_register(request: RegisterRequest, http_request: Request) -> dict:
     username = request.username.strip()
+    _enforce_rate_limit(
+        http_request,
+        "auth-register",
+        REGISTER_RATE_LIMIT,
+        resource=username.lower(),
+    )
     if not _USERNAME_RE.match(username):
         raise HTTPException(status_code=422, detail="Usuario invalido (3-32: letras, numeros, _ ou .).")
     key = username.lower()
@@ -6158,8 +6213,14 @@ def auth_register(request: RegisterRequest) -> dict:
 
 
 @app.post("/api/auth/login")
-def auth_login(request: LoginRequest) -> dict:
+def auth_login(request: LoginRequest, http_request: Request) -> dict:
     key = request.username.strip().lower()
+    _enforce_rate_limit(
+        http_request,
+        "auth-login",
+        LOGIN_RATE_LIMIT,
+        resource=key,
+    )
     with _users_lock:
         user = user_repository.get(key)
         password_valid = bool(
@@ -6206,7 +6267,8 @@ def auth_providers() -> dict:
 
 
 @app.get("/api/auth/discord/start")
-def auth_discord_start() -> dict:
+def auth_discord_start(request: Request) -> dict:
+    _enforce_rate_limit(request, "oauth-login", OAUTH_RATE_LIMIT, resource="discord")
     if not _discord_configured():
         raise HTTPException(status_code=503, detail="Login com Discord nao configurado no servidor (.env).")
     state = secrets.token_urlsafe(24)
@@ -6225,7 +6287,8 @@ def auth_discord_start() -> dict:
 
 
 @app.get("/api/auth/google/start")
-def auth_google_start() -> dict:
+def auth_google_start(request: Request) -> dict:
+    _enforce_rate_limit(request, "oauth-login", OAUTH_RATE_LIMIT, resource="google")
     if not _google_configured():
         raise HTTPException(status_code=503, detail="Login com Google nao configurado no servidor (.env).")
     state = secrets.token_urlsafe(24)
@@ -6438,6 +6501,7 @@ def auth_google_callback(
 
 @app.get("/api/mangas")
 def list_mangas(
+    request: Request,
     background_tasks: BackgroundTasks,
     q: str = Query(default="", description="Busca por titulo em fontes reais."),
     genre: str = Query(default="", description="Filtro local por genero."),
@@ -6449,6 +6513,7 @@ def list_mangas(
     Mantida para nao quebrar clientes antigos; as rotas novas e TIPADAS sao
     /api/search e /api/home.
     """
+    _enforce_rate_limit(request, "catalog", SEARCH_RATE_LIMIT, resource=q.strip().lower())
     if q.strip():
         return _build_search_payload(q, genre, limit, offset)
     return _build_home_payload(genre, limit, offset)
@@ -6456,22 +6521,26 @@ def list_mangas(
 
 @app.get("/api/search", response_model=SearchResponse)
 def search_mangas(
+    request: Request,
     q: str = Query(..., description="Termo de busca por titulo em fontes reais."),
     genre: str = Query(default="", description="Filtro local por genero."),
     limit: int = Query(default=DEFAULT_LIMIT, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> SearchResponse:
     """Busca tipada: retorna MangaSearchItem (sinopse, generos, autores, etc.)."""
+    _enforce_rate_limit(request, "search", SEARCH_RATE_LIMIT, resource=q.strip().lower())
     return SearchResponse(**_build_search_payload(q, genre, limit, offset))
 
 
 @app.get("/api/home", response_model=HomeResponse)
 def home_catalog(
+    request: Request,
     genre: str = Query(default="", description="Filtro local por genero."),
     limit: int = Query(default=DEFAULT_LIMIT, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> HomeResponse:
     """Home tipada: obras PRONTAS (capa real + capitulos) como MangaHomeItem."""
+    _enforce_rate_limit(request, "home", SEARCH_RATE_LIMIT, resource=genre.strip().lower())
     return HomeResponse(**_build_home_payload(genre, limit, offset))
 
 
@@ -6490,10 +6559,12 @@ def hq_library(q: str = Query(default="", description="Filtra biblioteca local p
 
 @app.get("/api/plugins/hq-now")
 def hq_now_library(
+    request: Request,
     q: str = Query(default="", description="Busca HQs exclusivamente no plugin HQ Now."),
     limit: int = Query(default=32, ge=1, le=60),
 ) -> dict:
     """Catalogo isolado do plugin. Nunca participa da home ou busca geral."""
+    _enforce_rate_limit(request, "plugin", EXPENSIVE_RATE_LIMIT, resource="hq-now")
     try:
         raw_items = reader.hq_now_plugin.catalog_items(query=q.strip(), limit=limit)
         items: list[dict] = []
@@ -6521,10 +6592,12 @@ def hq_now_library(
 
 @app.get("/api/plugins/novel-mania")
 def novel_mania_library(
+    request: Request,
     q: str = Query(default="", description="Busca novels exclusivamente no plugin Novel Mania."),
     limit: int = Query(default=24, ge=1, le=24),
 ) -> dict:
     """Catalogo isolado do plugin de novels; nao participa da home geral."""
+    _enforce_rate_limit(request, "plugin", EXPENSIVE_RATE_LIMIT, resource="novel-mania")
     try:
         raw_items = reader.novel_mania_plugin.catalog_items(query=q.strip(), limit=limit)
         items: list[dict] = []
@@ -6553,10 +6626,12 @@ def novel_mania_library(
 
 @app.get("/api/plugins/central-novel")
 def central_novel_library(
+    request: Request,
     q: str = Query(default="", description="Busca novels exclusivamente no plugin Central Novel."),
     limit: int = Query(default=24, ge=1, le=24),
 ) -> dict:
     """Catalogo isolado do Central Novel; nao participa da home geral."""
+    _enforce_rate_limit(request, "plugin", EXPENSIVE_RATE_LIMIT, resource="central-novel")
     try:
         raw_items = reader.central_novel_plugin.catalog_items(query=q.strip(), limit=limit)
         items: list[dict] = []
@@ -6590,10 +6665,12 @@ def central_novel_library(
 
 @app.get("/api/plugins/tensura-fan")
 def tensura_fan_library(
+    request: Request,
     q: str = Query(default="", description="Busca exclusivamente no plugin Tensura Fan."),
     limit: int = Query(default=24, ge=1, le=24),
 ) -> dict:
     """Catalogo isolado do Tensura Fan; nao participa da home geral."""
+    _enforce_rate_limit(request, "plugin", EXPENSIVE_RATE_LIMIT, resource="tensura-fan")
     try:
         raw_items = reader.tensura_fan_plugin.catalog_items(query=q.strip(), limit=limit)
         items: list[dict] = []
@@ -6627,10 +6704,12 @@ def tensura_fan_library(
 
 @app.get("/api/plugins/pleiades-translations")
 def pleiades_translations_library(
+    request: Request,
     q: str = Query(default="", description="Busca exclusivamente no plugin Pleiades Translations."),
     limit: int = Query(default=24, ge=1, le=24),
 ) -> dict:
     """Catalogo isolado do Pleiades Translations; nao participa da home geral."""
+    _enforce_rate_limit(request, "plugin", EXPENSIVE_RATE_LIMIT, resource="pleiades")
     try:
         raw_items = reader.pleiades_translations_plugin.catalog_items(query=q.strip(), limit=limit)
         items: list[dict] = []
@@ -6847,6 +6926,7 @@ def light_novel_asset(novel_id: str, filename: str) -> FileResponse:
 
 @app.get("/api/authors/lookup")
 def author_lookup(
+    request: Request,
     name: str = Query(..., min_length=1, description="Nome do autor no catalogo."),
     title: str = Query(default="", description="Titulo da obra para casar staff no AniList."),
     source_url: str = Query(default="", description="Fonte da obra para fallback nativo."),
@@ -7173,10 +7253,13 @@ def _build_manga_meta(item: dict | None, source_url: str, title: str = "") -> di
 
 @app.get("/api/manga-meta")
 def manga_meta(
+    request: Request,
     source_url: str = Query(..., description="URL ou source id da obra."),
     title: str = Query(default=""),
 ) -> dict:
+    _enforce_rate_limit(request, "author-lookup", EXPENSIVE_RATE_LIMIT, resource=name.lower())
     source = unquote(source_url).strip()
+    _enforce_rate_limit(request, "manga-meta", EXPENSIVE_RATE_LIMIT, resource=source)
     if not source:
         raise HTTPException(status_code=400, detail="source_url vazio.")
     _ensure_source_allowed(source)
@@ -7203,12 +7286,19 @@ def manga_meta(
 
 @app.get("/api/chapters")
 def list_chapters(
+    request: Request,
     source_url: str = Query(..., description="URL ou source id da obra."),
     title: str = Query(default="", description="Titulo usado para escolher fonte mais completa."),
     lang: str = Query(default="pt-br"),
     auto_source: bool = Query(default=True, description="Troca MangaDex por fonte com mais capitulos quando possivel."),
 ) -> dict:
     requested_source = unquote(source_url).strip()
+    _enforce_rate_limit(
+        request,
+        "chapters",
+        EXPENSIVE_RATE_LIMIT,
+        resource=requested_source,
+    )
     source = requested_source
     if not source:
         raise HTTPException(status_code=400, detail="source_url vazio.")
@@ -7337,8 +7427,12 @@ def list_chapters(
 
 
 @app.post("/api/chapter-cards/refresh")
-def refresh_chapter_cards(request: ChapterCardRefreshRequest) -> dict:
+def refresh_chapter_cards(
+    request: ChapterCardRefreshRequest,
+    http_request: Request,
+) -> dict:
     """Atualiza cards persistidos sem refazer catalogo inteiro."""
+    _enforce_rate_limit(http_request, "chapter-refresh", EXPENSIVE_RATE_LIMIT)
     result: dict[str, dict] = {}
     pending: list[dict] = []
     seen: set[str] = set()
@@ -7490,6 +7584,7 @@ def _apply_cached_chapter_neighbors(
 
 @app.get("/api/chapter")
 def open_chapter(
+    request: Request,
     source_url: str = Query(..., description="URL do capitulo."),
     lang: str = Query(default="pt-br"),
     fallback_source_url: str = Query(default="", description="Fonte original para fallback."),
@@ -7497,6 +7592,7 @@ def open_chapter(
     title: str = Query(default="", description="Titulo da obra p/ achar fonte alternativa quando a fonte cai."),
 ) -> dict:
     source = unquote(source_url).strip()
+    _enforce_rate_limit(request, "chapter-open", EXPENSIVE_RATE_LIMIT, resource=source)
     if not source:
         raise HTTPException(status_code=400, detail="source_url vazio.")
     _ensure_source_allowed(source)
@@ -7621,7 +7717,8 @@ def open_chapter(
 
 
 @app.get("/api/reader-image/{index}")
-def reader_image(index: int) -> FileResponse:
+def reader_image(index: int, request: Request) -> FileResponse:
+    _enforce_rate_limit(request, "reader-image", IMAGE_RATE_LIMIT, resource=str(index))
     try:
         path, content_type = reader.get_image(index)
     except Exception as exc:
@@ -7630,8 +7727,12 @@ def reader_image(index: int) -> FileResponse:
 
 
 @app.get("/api/image")
-def proxy_image(url: str = Query(..., description="URL remota da imagem.")) -> Response:
+def proxy_image(
+    request: Request,
+    url: str = Query(..., description="URL remota da imagem."),
+) -> Response:
     remote_url = unquote(url).strip()
+    _enforce_rate_limit(request, "image-proxy", IMAGE_RATE_LIMIT, resource=remote_url)
     if not _is_remote_image_url(remote_url):
         raise HTTPException(status_code=400, detail="URL de imagem invalida.")
     try:

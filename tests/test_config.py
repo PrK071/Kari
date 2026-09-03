@@ -61,6 +61,14 @@ class SettingsTests(unittest.TestCase):
                 }
             )
 
+    def test_session_ttl_and_rate_limit_backend_are_validated(self) -> None:
+        with self.assertRaises(ConfigurationError):
+            load_settings({"KARI_SESSION_TTL_HOURS": "0"})
+        with self.assertRaises(ConfigurationError):
+            load_settings({"KARI_SESSION_TTL_HOURS": "not-a-number"})
+        with self.assertRaises(ConfigurationError):
+            load_settings({"KARI_RATE_LIMIT_BACKEND": "redis"})
+
 
 if __name__ == "__main__":
     unittest.main()

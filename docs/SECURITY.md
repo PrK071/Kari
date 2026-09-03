@@ -6,7 +6,6 @@ O runtime web já desliga bibliotecas locais e Sakura, mas o backend ainda não 
 aprovado para exposição pública. Os bloqueadores atuais são:
 
 - estado global do capítulo corrente;
-- ausência de rate limiting nos endpoints de autenticação e scraping.
 
 ## Classificação atual das rotas
 
@@ -20,8 +19,20 @@ aprovado para exposição pública. Os bloqueadores atuais são:
 | INTERNAL | nenhuma rota interna formal existe |
 
 Busca, capítulos, leitura, sync de listas e lookup de autor são públicos hoje e
-podem disparar I/O externo pesado. Eles precisam de rate limit e orçamento de
-concorrência antes da publicação.
+podem disparar I/O externo pesado. O primeiro limite é por janela deslizante:
+
+| Grupo | Limite inicial | Dimensões |
+| --- | --- | --- |
+| Registro | 30/hora | IP e nome de login |
+| Login | 30/5 minutos | IP e nome de login |
+| OAuth/vínculo/sync | 10/10 minutos | IP, usuário e provedor quando disponíveis |
+| Home, catálogo e busca | 60/minuto | IP e consulta |
+| Plugins, metadados, capítulos, refresh e autor | 30/minuto | IP e fonte/recurso |
+| Proxy/imagem do leitor | 120/minuto | IP e URL/índice |
+
+O backend `memory` é deliberadamente limitado a uma instância. A interface
+`RateLimitBackend` permite substituir o armazenamento antes de escalar
+horizontalmente; múltiplas instâncias não podem usar limites independentes.
 
 ## Regras de autenticação alvo
 
@@ -61,8 +72,6 @@ Bearer e comparar o `profile_id` com a identidade da sessão. No runtime web,
 ausência ou invalidade do token resulta em 401 e acesso cruzado resulta em 403.
 O runtime desktop preserva perfis anônimos apenas quando nenhum bearer é enviado.
 
-1. repositórios de persistência e PostgreSQL;
-2. rate limiter com interface substituível por Redis/serviço externo;
-3. IDs de sessão de leitura isolados e limites globais por scraper;
-4. middleware de acesso com método, path normalizado, status e duração;
-5. testes de CORS, auth, IDOR, SSRF, upload e ambos os runtimes.
+1. IDs de sessão de leitura isolados e limites globais por scraper;
+2. middleware de acesso com método, path normalizado, status e duração;
+3. testes de CORS, auth, IDOR, SSRF, upload e ambos os runtimes.
