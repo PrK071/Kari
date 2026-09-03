@@ -36,6 +36,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from backend.config import load_settings
+from backend.concurrency import BoundedWorkCoordinator
 from backend.network_security import UnsafeRemoteURLError, validate_public_http_url
 from backend.rate_limit import MemoryRateLimitBackend, RateLimiter, RateLimitPolicy
 from backend.persistence import (
@@ -86,6 +87,10 @@ except Exception:  # noqa: BLE001 - sem dotenv o app ainda roda (OAuth fica desl
 settings = load_settings()
 rate_limit_backend = MemoryRateLimitBackend()
 rate_limiter = RateLimiter(rate_limit_backend)
+scraper_coordinator = BoundedWorkCoordinator(
+    max_global=settings.scraper_max_concurrency,
+    max_per_source=settings.scraper_max_per_source,
+)
 
 REGISTER_RATE_LIMIT = RateLimitPolicy(limit=30, window_seconds=60 * 60)
 LOGIN_RATE_LIMIT = RateLimitPolicy(limit=30, window_seconds=5 * 60)
@@ -211,6 +216,11 @@ def _enforce_rate_limit(
             detail="Muitas requisicoes. Tente novamente mais tarde.",
             headers={"Retry-After": str(decision.retry_after)},
         )
+
+
+def _scraper_source_name(source: str) -> str:
+    provider = _guess_provider({"url": source})
+    return provider or (urlparse(source).hostname or source or "unknown")
 
 # User-Agents reais p/ rotacionar e fugir de filtros antibot/rate-limit.
 USER_AGENTS = [
@@ -615,6 +625,24 @@ def _matching_chapter_url(chapters_payload: dict, chapter_number: str | float | 
     return ""
 
 
+def _coordinated_chapter_metadata(
+    chapter_url: str,
+    *,
+    include_neighbors: bool = True,
+) -> dict:
+    return scraper_coordinator.run(
+        _scraper_source_name(chapter_url),
+        f"chapter-open:{chapter_url}:{include_neighbors}",
+        lambda: reader.chapter_metadata(
+            chapter_url,
+            cache_pages=False,
+            include_source_urls=True,
+            include_neighbors=include_neighbors,
+            retain_state=not settings.is_web,
+        ),
+    )
+
+
 def _open_fallback_chapter(
     fallback_source_url: str,
     lang: str,
@@ -625,16 +653,15 @@ def _open_fallback_chapter(
     fallback_source = unquote(fallback_source_url or "").strip()
     if not fallback_source or fallback_source == original_source:
         return None
-    chapters_payload = reader.list_chapters(fallback_source, lang, str(chapter_number or ""))
+    chapters_payload = _resilient_list_chapters(
+        fallback_source,
+        lang,
+        str(chapter_number or ""),
+    )
     selected_url = _matching_chapter_url(chapters_payload, chapter_number)
     if not selected_url:
         return None
-    payload = reader.chapter_metadata(
-        selected_url,
-        cache_pages=False,
-        include_source_urls=True,
-        retain_state=not settings.is_web,
-    )
+    payload = _coordinated_chapter_metadata(selected_url)
     payload["fallback"] = {
         "from": original_source,
         "to": fallback_source,
@@ -796,7 +823,11 @@ def _rotate_headers(attempt: int) -> None:
     )
 
 
-def _resilient_list_chapters(source: str, lang: str) -> dict:
+def _resilient_list_chapters_unbounded(
+    source: str,
+    lang: str,
+    preferred_chapter: str | None = None,
+) -> dict:
     """Busca capitulos com RETRY + backoff exponencial + rotacao de UA.
 
     Tenta CHAPTERS_FETCH_ATTEMPTS vezes (espera 1s, 2s, 4s...). So levanta
@@ -807,7 +838,11 @@ def _resilient_list_chapters(source: str, lang: str) -> dict:
     for attempt in range(attempts):
         try:
             _rotate_headers(attempt)
-            return reader.list_chapters(source, lang=lang)
+            return reader.list_chapters(
+                source,
+                lang=lang,
+                preferred_chapter=preferred_chapter,
+            )
         except Exception as exc:  # noqa: BLE001 (rede/HTTP/timeout/parse)
             last_exc = exc
             if attempt < attempts - 1:
@@ -818,6 +853,18 @@ def _resilient_list_chapters(source: str, lang: str) -> dict:
                 )
                 time.sleep(wait)
     raise last_exc if last_exc else RuntimeError("Falha desconhecida ao buscar capitulos.")
+
+
+def _resilient_list_chapters(
+    source: str,
+    lang: str,
+    preferred_chapter: str | None = None,
+) -> dict:
+    return scraper_coordinator.run(
+        _scraper_source_name(source),
+        f"chapters:{source}:{lang}:{preferred_chapter or ''}",
+        lambda: _resilient_list_chapters_unbounded(source, lang, preferred_chapter),
+    )
 
 
 app = FastAPI(
@@ -1976,7 +2023,7 @@ def _chapter_count_for_source(source_url: str, lang: str = "pt-br") -> int:
         chapter_count_cache[cache_key] = CacheEntry(time.time(), {"count": disk_count})
         return disk_count
     try:
-        payload = reader.list_chapters(source_url, lang=lang)
+        payload = _resilient_list_chapters(source_url, lang)
         count = int(payload.get("count") or 0)
         with _chapters_cache_lock:
             chapters_cache[_chapters_cache_key(source_url, lang)] = CacheEntry(time.time(), dict(payload))
@@ -2229,7 +2276,7 @@ def _fast_catalog_seed(limit: int) -> dict:
     return data
 
 
-def _partner_catalog_source(provider: str, limit: int) -> tuple[list[dict], dict | None]:
+def _partner_catalog_source_unbounded(provider: str, limit: int) -> tuple[list[dict], dict | None]:
     if provider == "nexus":
         payload = reader.catalog_nexus(limit=limit)
     elif provider == "mangageek":
@@ -2255,6 +2302,14 @@ def _partner_catalog_source(provider: str, limit: int) -> tuple[list[dict], dict
     if not items:
         return [], None
     return items, {"title": f"Catalogo - {label}", "items": items}
+
+
+def _partner_catalog_source(provider: str, limit: int) -> tuple[list[dict], dict | None]:
+    return scraper_coordinator.run(
+        provider,
+        f"catalog:{provider}:{limit}",
+        lambda: _partner_catalog_source_unbounded(provider, limit),
+    )
 
 
 def _dedupe_cross_source_sections(sections: list[dict]) -> list[dict]:
@@ -2356,8 +2411,10 @@ def _refresh_catalog_cache(limit: int = DEFAULT_LIMIT) -> None:
         ]
         executor = ThreadPoolExecutor(max_workers=2)
         mangadex_future = executor.submit(
-            _catalog_sections_from_mangadex,
-            min(max(limit, 24), 80),
+            scraper_coordinator.run,
+            "mangadex",
+            f"catalog:mangadex:{min(max(limit, 24), 80)}",
+            lambda: _catalog_sections_from_mangadex(min(max(limit, 24), 80)),
         )
         partner_future = executor.submit(_partner_catalog_sections, PARTNER_CATALOG_LIMIT)
         try:
@@ -2620,7 +2677,7 @@ def _build_catalog(limit: int) -> dict:
     return data
 
 
-def _search_source(name: str, query: str, limit: int) -> list[dict]:
+def _search_source_unbounded(name: str, query: str, limit: int) -> list[dict]:
     if name == "mangadex":
         payload = reader.search_mangadex(query, limit=limit)
     elif name == "mangalivre":
@@ -2648,6 +2705,14 @@ def _search_source(name: str, query: str, limit: int) -> list[dict]:
         if item:
             items.append(item)
     return items
+
+
+def _search_source(name: str, query: str, limit: int) -> list[dict]:
+    return scraper_coordinator.run(
+        name,
+        f"search:{query.casefold()}:{limit}",
+        lambda: _search_source_unbounded(name, query, limit),
+    )
 
 
 def _search_sources_with_timeout(
@@ -4175,7 +4240,7 @@ def _fill_chapter_counts(items: list[dict], max_workers: int = 6, cap: int = 60)
             lang = _item_chapter_language(item)
             payload = _cached_chapters_payload(source_url, lang)
             if payload is None:
-                payload = reader.list_chapters(source_url, lang=lang)
+                payload = _resilient_list_chapters(source_url, lang)
                 with _chapters_cache_lock:
                     chapters_cache[_chapters_cache_key(source_url, lang)] = CacheEntry(time.time(), dict(payload))
             _apply_verified_chapters(item, payload)
@@ -4785,7 +4850,12 @@ def _prewarm_chapters(items: list[dict], limit: int = 40, max_workers: int = 4) 
             audit_reader = _chapter_audit_reader()
             fetch_executor = ThreadPoolExecutor(max_workers=1)
             try:
-                future = fetch_executor.submit(audit_reader.list_chapters, source_url, lang=lang)
+                future = fetch_executor.submit(
+                    scraper_coordinator.run,
+                    _scraper_source_name(source_url),
+                    f"audit-chapters:{source_url}:{lang}",
+                    lambda: audit_reader.list_chapters(source_url, lang=lang),
+                )
                 payload = future.result(timeout=CHAPTER_AUDIT_TARGET_TIMEOUT_SECONDS)
             except FuturesTimeoutError:
                 # Fetch travado segura o self.lock do reader; abandona esse reader
@@ -6567,7 +6637,11 @@ def hq_now_library(
     """Catalogo isolado do plugin. Nunca participa da home ou busca geral."""
     _enforce_rate_limit(request, "plugin", EXPENSIVE_RATE_LIMIT, resource="hq-now")
     try:
-        raw_items = reader.hq_now_plugin.catalog_items(query=q.strip(), limit=limit)
+        raw_items = scraper_coordinator.run(
+            "hq-now",
+            f"plugin:{q.strip().casefold()}:{limit}",
+            lambda: reader.hq_now_plugin.catalog_items(query=q.strip(), limit=limit),
+        )
         items: list[dict] = []
         for raw in raw_items:
             normalized = _normalize_manga_item(raw, section="HQ Now")
@@ -6600,7 +6674,11 @@ def novel_mania_library(
     """Catalogo isolado do plugin de novels; nao participa da home geral."""
     _enforce_rate_limit(request, "plugin", EXPENSIVE_RATE_LIMIT, resource="novel-mania")
     try:
-        raw_items = reader.novel_mania_plugin.catalog_items(query=q.strip(), limit=limit)
+        raw_items = scraper_coordinator.run(
+            "novel-mania",
+            f"plugin:{q.strip().casefold()}:{limit}",
+            lambda: reader.novel_mania_plugin.catalog_items(query=q.strip(), limit=limit),
+        )
         items: list[dict] = []
         for raw in raw_items:
             normalized = _normalize_manga_item(raw, section="Novel Mania")
@@ -6634,7 +6712,11 @@ def central_novel_library(
     """Catalogo isolado do Central Novel; nao participa da home geral."""
     _enforce_rate_limit(request, "plugin", EXPENSIVE_RATE_LIMIT, resource="central-novel")
     try:
-        raw_items = reader.central_novel_plugin.catalog_items(query=q.strip(), limit=limit)
+        raw_items = scraper_coordinator.run(
+            "central-novel",
+            f"plugin:{q.strip().casefold()}:{limit}",
+            lambda: reader.central_novel_plugin.catalog_items(query=q.strip(), limit=limit),
+        )
         items: list[dict] = []
         for raw in raw_items:
             normalized = _normalize_manga_item(raw, section="Central Novel")
@@ -6673,7 +6755,11 @@ def tensura_fan_library(
     """Catalogo isolado do Tensura Fan; nao participa da home geral."""
     _enforce_rate_limit(request, "plugin", EXPENSIVE_RATE_LIMIT, resource="tensura-fan")
     try:
-        raw_items = reader.tensura_fan_plugin.catalog_items(query=q.strip(), limit=limit)
+        raw_items = scraper_coordinator.run(
+            "tensura-fan",
+            f"plugin:{q.strip().casefold()}:{limit}",
+            lambda: reader.tensura_fan_plugin.catalog_items(query=q.strip(), limit=limit),
+        )
         items: list[dict] = []
         for raw in raw_items:
             normalized = _normalize_manga_item(raw, section="Tensura Fan")
@@ -6712,7 +6798,11 @@ def pleiades_translations_library(
     """Catalogo isolado do Pleiades Translations; nao participa da home geral."""
     _enforce_rate_limit(request, "plugin", EXPENSIVE_RATE_LIMIT, resource="pleiades")
     try:
-        raw_items = reader.pleiades_translations_plugin.catalog_items(query=q.strip(), limit=limit)
+        raw_items = scraper_coordinator.run(
+            "pleiades",
+            f"plugin:{q.strip().casefold()}:{limit}",
+            lambda: reader.pleiades_translations_plugin.catalog_items(query=q.strip(), limit=limit),
+        )
         items: list[dict] = []
         for raw in raw_items:
             normalized = _normalize_manga_item(raw, section="Pleiades Translations")
@@ -7632,12 +7722,9 @@ def open_chapter(
     payload = _cached_open_chapter(source, lang)
     if payload is None:
         try:
-            payload = reader.chapter_metadata(
+            payload = _coordinated_chapter_metadata(
                 source,
-                cache_pages=False,
-                include_source_urls=True,
                 include_neighbors=False,
-                retain_state=not settings.is_web,
             )
         except Exception as exc:
             wanted = chapter_number.strip()

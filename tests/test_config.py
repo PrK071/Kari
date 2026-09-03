@@ -68,6 +68,15 @@ class SettingsTests(unittest.TestCase):
             load_settings({"KARI_SESSION_TTL_HOURS": "not-a-number"})
         with self.assertRaises(ConfigurationError):
             load_settings({"KARI_RATE_LIMIT_BACKEND": "redis"})
+        with self.assertRaises(ConfigurationError):
+            load_settings({"KARI_SCRAPER_MAX_CONCURRENCY": "0"})
+        with self.assertRaises(ConfigurationError):
+            load_settings(
+                {
+                    "KARI_SCRAPER_MAX_CONCURRENCY": "2",
+                    "KARI_SCRAPER_MAX_PER_SOURCE": "3",
+                }
+            )
 
 
 if __name__ == "__main__":

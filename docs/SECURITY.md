@@ -6,7 +6,6 @@ O runtime web já desliga bibliotecas locais e Sakura, mas o backend ainda não 
 aprovado para exposição pública. Os bloqueadores atuais são:
 
 - mídia persistente de perfil ainda gravada no filesystem da VPS;
-- limites internos de concorrência dos scrapers ainda incompletos;
 - advisories HIGH do frontend ainda precisam de triagem/correção;
 - integração precisa ser validada contra PostgreSQL real no staging.
 
@@ -36,6 +35,14 @@ podem disparar I/O externo pesado. O primeiro limite é por janela deslizante:
 O backend `memory` é deliberadamente limitado a uma instância. A interface
 `RateLimitBackend` permite substituir o armazenamento antes de escalar
 horizontalmente; múltiplas instâncias não podem usar limites independentes.
+
+Além das janelas HTTP, `BoundedWorkCoordinator` limita o trabalho remoto a 12
+operações simultâneas no processo e duas por fonte. Chamadas idênticas em voo
+são deduplicadas e os demais solicitantes recebem uma cópia do mesmo resultado;
+esperas por capacidade têm timeout. Os valores podem ser reduzidos por
+`KARI_SCRAPER_MAX_CONCURRENCY` e `KARI_SCRAPER_MAX_PER_SOURCE`. O limite por IP
+ou usuário continua sendo aplicado antes desse coordenador pelas políticas
+acima.
 
 ## Isolamento do leitor
 
@@ -84,6 +91,5 @@ Bearer e comparar o `profile_id` com a identidade da sessão. No runtime web,
 ausência ou invalidade do token resulta em 401 e acesso cruzado resulta em 403.
 O runtime desktop preserva perfis anônimos apenas quando nenhum bearer é enviado.
 
-1. IDs de sessão de leitura isolados e limites globais por scraper;
-2. middleware de acesso com método, path normalizado, status e duração;
-3. testes de CORS, auth, IDOR, SSRF, upload e ambos os runtimes.
+1. middleware de acesso com método, path normalizado, status e duração;
+2. testes de CORS, auth, IDOR, SSRF, upload e ambos os runtimes.

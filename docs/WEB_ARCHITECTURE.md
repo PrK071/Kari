@@ -74,6 +74,7 @@ enquanto a capability web estiver desligada.
 
 O runtime web usa capítulos autocontidos e descarta o estado mutável depois de
 montar cada resposta. Fontes que dependem de arquivos/cache corrente são
-rejeitadas em web e continuam no desktop. O backend ainda não deve ser publicado
-antes de limitar a concorrência interna dos scrapers, resolver mídia persistente
-e concluir os demais gates de `SECURITY.md`.
+rejeitadas em web e continuam no desktop. Scrapers possuem limites globais e por
+fonte, além de deduplicação das chamadas idênticas em voo. O backend ainda não
+deve ser publicado antes de resolver mídia persistente e concluir os demais
+gates de `SECURITY.md`.

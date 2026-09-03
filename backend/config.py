@@ -75,6 +75,8 @@ class Settings:
     secret_key: str
     session_ttl_seconds: int
     rate_limit_backend: str
+    scraper_max_concurrency: int
+    scraper_max_per_source: int
 
     @property
     def is_production(self) -> bool:
@@ -168,6 +170,17 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         raise ConfigurationError(
             "KARI_RATE_LIMIT_BACKEND suporta somente memory nesta versao."
         )
+    try:
+        scraper_max_concurrency = int(source.get("KARI_SCRAPER_MAX_CONCURRENCY", "12"))
+        scraper_max_per_source = int(source.get("KARI_SCRAPER_MAX_PER_SOURCE", "2"))
+    except ValueError as exc:
+        raise ConfigurationError("Limites de scraper devem ser inteiros.") from exc
+    if not 1 <= scraper_max_concurrency <= 64:
+        raise ConfigurationError("KARI_SCRAPER_MAX_CONCURRENCY deve estar entre 1 e 64.")
+    if not 1 <= scraper_max_per_source <= scraper_max_concurrency:
+        raise ConfigurationError(
+            "KARI_SCRAPER_MAX_PER_SOURCE deve estar entre 1 e o limite global."
+        )
 
     return Settings(
         environment=environment,
@@ -181,4 +194,6 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         secret_key=secret_key,
         session_ttl_seconds=session_ttl_hours * 60 * 60,
         rate_limit_backend=rate_limit_backend,
+        scraper_max_concurrency=scraper_max_concurrency,
+        scraper_max_per_source=scraper_max_per_source,
     )
