@@ -101,6 +101,7 @@ cf_clearance*
 .tmp_*/
 .tmp-sakura-test/
 .cache/
+migration-backups/
 
 # Artefatos locais de debug e perfis de usuario
 frontend/debug_*.html

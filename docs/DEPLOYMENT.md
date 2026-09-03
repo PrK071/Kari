@@ -62,6 +62,32 @@ set +a
 /opt/kari/venv/bin/alembic upgrade head
 ```
 
+## Migração dos dados JSON
+
+Depois do `alembic upgrade head`, execute a cópia legada explicitamente com o
+diretório que contém `users.json`, `profiles.json` e `tokens.json`:
+
+```bash
+cd /opt/kari/app
+set -a
+source /etc/kari.env
+set +a
+/opt/kari/venv/bin/python -m tools.migrate_identity \
+  --source-dir /CAMINHO/DO/KARI_DATA_DIR \
+  --backup-dir /var/backups/kari/json-migration
+```
+
+A ferramenta cria backup com hashes antes de ler os registros, faz upserts
+idempotentes e imprime somente contagens/erros sem valores sensíveis. Ela nunca
+remove ou altera os JSON de origem. Código de saída diferente de zero indica
+migração parcial ou inválida; corrija a origem/schema e repita o mesmo comando.
+Proteja o backup como credencial, pois ele contém hashes de senha, tokens de
+sessão legados e possivelmente tokens OAuth.
+
+Confirme que `users_migrated`, `profiles_migrated` e `sessions_migrated`
+correspondem às respectivas contagens `*_found` e que `errors` está vazio antes
+de trocar o serviço para `KARI_PERSISTENCE_BACKEND=postgres`.
+
 O filesystem ainda não deve ser tratado como storage persistente multiusuário
 para avatares e backgrounds; essa migração permanece separada do banco.
 

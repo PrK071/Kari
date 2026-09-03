@@ -193,24 +193,30 @@ class PostgresProfileRepository:
             model.updated_at = float(profile.get("updated_at") or now)
 
             database.execute(delete(FavoriteModel).where(FavoriteModel.profile_id == profile_id))
+            favorite_keys: set[str] = set()
             for position, item in enumerate(profile.get("favorites") or []):
-                if isinstance(item, dict) and _item_key(item):
+                item_key = _item_key(item) if isinstance(item, dict) else ""
+                if item_key and item_key not in favorite_keys:
+                    favorite_keys.add(item_key)
                     database.add(
                         FavoriteModel(
                             profile_id=profile_id,
-                            item_key=_item_key(item),
+                            item_key=item_key,
                             position=position,
                             data=dict(item),
                         )
                     )
 
             database.execute(delete(LibraryEntryModel).where(LibraryEntryModel.profile_id == profile_id))
+            library_keys: set[str] = set()
             for position, item in enumerate(profile.get("library") or []):
-                if isinstance(item, dict) and _item_key(item):
+                item_key = _item_key(item) if isinstance(item, dict) else ""
+                if item_key and item_key not in library_keys:
+                    library_keys.add(item_key)
                     database.add(
                         LibraryEntryModel(
                             profile_id=profile_id,
-                            item_key=_item_key(item),
+                            item_key=item_key,
                             position=position,
                             status=str(item.get("status") or "COMPLETED"),
                             score=item.get("score"),
@@ -281,20 +287,28 @@ class PostgresSessionRepository:
     def save(self, token: str, session: dict) -> None:
         profile_id = str(session.get("profile_id") or "")
         now = time.time()
+        digest = token_digest(token)
         with self._sessions.begin() as database:
             user = database.scalar(select(UserModel).where(UserModel.profile_id == profile_id))
             if user is None:
                 raise ValueError("Sessao requer usuario persistido.")
-            database.add(
-                SessionModel(
+            model = database.scalar(
+                select(SessionModel).where(SessionModel.token_digest == digest)
+            )
+            if model is None:
+                model = SessionModel(
                     id=uuid4().hex,
-                    token_digest=token_digest(token),
+                    token_digest=digest,
                     user_id=user.id,
                     created_at=float(session.get("created_at") or now),
                     expires_at=float(session.get("expires") or now),
                     last_seen_at=now,
                 )
-            )
+                database.add(model)
+            else:
+                model.user_id = user.id
+                model.expires_at = float(session.get("expires") or model.expires_at)
+                model.revoked_at = None
 
     def revoke(self, token: str) -> bool:
         digest = token_digest(token)
