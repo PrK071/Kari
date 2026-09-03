@@ -72,7 +72,8 @@ enquanto a capability web estiver desligada.
 
 ## Restrições conhecidas
 
-O `MangaReader` mantém um único capítulo corrente. Até ele ser isolado por sessão
-de leitura, o backend não é seguro para leitores concorrentes. A API também não
-deve ser publicada antes de concluir migração dos dados legados e rate limiting.
-Consulte `SECURITY.md`.
+O runtime web usa capítulos autocontidos e descarta o estado mutável depois de
+montar cada resposta. Fontes que dependem de arquivos/cache corrente são
+rejeitadas em web e continuam no desktop. O backend ainda não deve ser publicado
+antes de limitar a concorrência interna dos scrapers, resolver mídia persistente
+e concluir os demais gates de `SECURITY.md`.

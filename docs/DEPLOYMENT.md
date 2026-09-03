@@ -116,11 +116,9 @@ TimeoutStopSec=30
 WantedBy=multi-user.target
 ```
 
-Use um único worker enquanto existir estado global de leitura e caches em
-memória. Isso não corrige concorrência entre usuários; apenas evita divergência
-adicional entre processos.
-
-O rate limiter em memória também pressupõe uma única instância. Antes de escalar
+Use um único worker na implantação inicial porque o rate limiter e caches são
+locais ao processo. O leitor web já descarta estado mutável antes de responder,
+mas múltiplos workers teriam limites independentes. Antes de escalar
 horizontalmente, implemente um `RateLimitBackend` compartilhado e execute os
 testes de políticas contra ele.
 

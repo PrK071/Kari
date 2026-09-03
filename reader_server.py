@@ -7766,28 +7766,37 @@ class MangaReader:
         cache_pages: bool = False,
         include_source_urls: bool = False,
         include_neighbors: bool = True,
+        retain_state: bool = True,
     ) -> dict:
         with self.lock:
-            loaded = self.load_chapter(chapter_url, include_neighbors=include_neighbors)
-            if loaded.get("mode") == "text":
-                payload = {"ok": True, **loaded}
-                payload["chapter"] = {
-                    "url": loaded.get("url") or chapter_url,
-                    "label": loaded.get("label") or loaded.get("title") or "Capitulo",
-                    "number": loaded.get("number"),
-                    "number_text": loaded.get("number_text"),
-                    "page_count": 1,
-                    "previous": loaded.get("previous"),
-                    "next": loaded.get("next"),
-                }
-                payload["images"] = []
-                payload["count"] = 1
-                return payload
-            return self.current_chapter_metadata(
-                cache_pages=cache_pages,
-                include_source_urls=include_source_urls,
-                loaded=loaded,
-            )
+            try:
+                loaded = self.load_chapter(chapter_url, include_neighbors=include_neighbors)
+                if loaded.get("mode") == "text":
+                    payload = {"ok": True, **loaded}
+                    payload["chapter"] = {
+                        "url": loaded.get("url") or chapter_url,
+                        "label": loaded.get("label") or loaded.get("title") or "Capitulo",
+                        "number": loaded.get("number"),
+                        "number_text": loaded.get("number_text"),
+                        "page_count": 1,
+                        "previous": loaded.get("previous"),
+                        "next": loaded.get("next"),
+                    }
+                    payload["images"] = []
+                    payload["count"] = 1
+                    return payload
+                return self.current_chapter_metadata(
+                    cache_pages=cache_pages,
+                    include_source_urls=include_source_urls,
+                    loaded=loaded,
+                )
+            finally:
+                if not retain_state:
+                    state = self.state
+                    self.state = None
+                    self.cache.clear_current()
+                    if state is not None:
+                        state.session.close()
 
     def current_chapter_metadata(
         self,

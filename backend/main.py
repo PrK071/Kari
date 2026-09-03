@@ -633,6 +633,7 @@ def _open_fallback_chapter(
         selected_url,
         cache_pages=False,
         include_source_urls=True,
+        retain_state=not settings.is_web,
     )
     payload["fallback"] = {
         "from": original_source,
@@ -7507,6 +7508,24 @@ def _store_open_chapter(source: str, lang: str, payload: dict) -> None:
         chapter_payload_cache[key] = CacheEntry(time.time(), copy.deepcopy(payload))
 
 
+def _sanitize_web_chapter_payload(payload: dict) -> None:
+    if not settings.is_web:
+        return
+    payload.pop("cache", None)
+    if payload.get("mode") == "text":
+        return
+    images = payload.get("images") or []
+    if not images or not all(
+        isinstance(image, dict)
+        and _is_remote_image_url(str(image.get("source_url") or ""))
+        for image in images
+    ):
+        raise HTTPException(
+            status_code=502,
+            detail="Esta fonte requer estado local e nao esta disponivel no runtime web.",
+        )
+
+
 def _cached_chapter_neighbors(
     manga_source: str,
     lang: str,
@@ -7618,6 +7637,7 @@ def open_chapter(
                 cache_pages=False,
                 include_source_urls=True,
                 include_neighbors=False,
+                retain_state=not settings.is_web,
             )
         except Exception as exc:
             wanted = chapter_number.strip()
@@ -7686,6 +7706,8 @@ def open_chapter(
         )
         _store_open_chapter(source, lang, payload)
 
+    _sanitize_web_chapter_payload(payload)
+
     if pieceproject_source and payload.get("provider") == "pieceproject":
         source_outage_cache.pop(ONE_PIECE_PIECEPROJECT_URL, None)
 
@@ -7718,6 +7740,7 @@ def open_chapter(
 
 @app.get("/api/reader-image/{index}")
 def reader_image(index: int, request: Request) -> FileResponse:
+    _require_desktop_capability()
     _enforce_rate_limit(request, "reader-image", IMAGE_RATE_LIMIT, resource=str(index))
     try:
         path, content_type = reader.get_image(index)

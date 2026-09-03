@@ -5,7 +5,10 @@
 O runtime web já desliga bibliotecas locais e Sakura, mas o backend ainda não está
 aprovado para exposição pública. Os bloqueadores atuais são:
 
-- estado global do capítulo corrente;
+- mídia persistente de perfil ainda gravada no filesystem da VPS;
+- limites internos de concorrência dos scrapers ainda incompletos;
+- advisories HIGH do frontend ainda precisam de triagem/correção;
+- integração precisa ser validada contra PostgreSQL real no staging.
 
 ## Classificação atual das rotas
 
@@ -33,6 +36,15 @@ podem disparar I/O externo pesado. O primeiro limite é por janela deslizante:
 O backend `memory` é deliberadamente limitado a uma instância. A interface
 `RateLimitBackend` permite substituir o armazenamento antes de escalar
 horizontalmente; múltiplas instâncias não podem usar limites independentes.
+
+## Isolamento do leitor
+
+No runtime web, a abertura do capítulo é stateless: o `ChapterState` é descartado
+sob o mesmo lock que cria o payload, caminhos locais de cache não são retornados
+e todas as páginas precisam possuir URL HTTP(S) autocontida. A rota baseada no
+estado global `/api/reader-image/{index}` retorna 404 em web e continua disponível
+apenas no desktop. Duas aberturas concorrentes são serializadas durante a coleta,
+mas seus payloads não compartilham estado após a resposta.
 
 ## Regras de autenticação alvo
 
