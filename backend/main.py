@@ -35,6 +35,14 @@ from pydantic import BaseModel, Field
 
 from backend.config import load_settings
 from backend.network_security import UnsafeRemoteURLError, validate_public_http_url
+from backend.persistence import (
+    JsonProfileRepository,
+    JsonSessionRepository,
+    JsonUserRepository,
+    ProfileRepository,
+    SessionRepository,
+    UserRepository,
+)
 
 from schemas import (
     HomeResponse,
@@ -133,6 +141,14 @@ USERS_STORE_PATH = KARI_DATA_DIR / "users.json"
 AUTH_TOKENS_PATH = KARI_DATA_DIR / "tokens.json"
 AUTH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60
 PBKDF2_ITERATIONS = 200_000
+
+profile_repository: ProfileRepository = JsonProfileRepository(
+    lambda: PROFILES_STORE_PATH
+)
+user_repository: UserRepository = JsonUserRepository(lambda: USERS_STORE_PATH)
+session_repository: SessionRepository = JsonSessionRepository(
+    lambda: AUTH_TOKENS_PATH
+)
 # Obras adicionadas manualmente (ex.: via tools/add_sakura_manga.py). Mescladas
 # ao CURATED_CATALOG p/ aparecerem na home como as fontes fixas.
 CUSTOM_CATALOG_PATH = KARI_DATA_DIR / "custom_catalog.json"
@@ -1018,40 +1034,6 @@ class AuthenticatedUser:
     session_expires_at: float
 
 
-def _load_profiles() -> dict[str, dict]:
-    try:
-        if not PROFILES_STORE_PATH.exists():
-            return {}
-        data = json.loads(PROFILES_STORE_PATH.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def _save_profiles(profiles: dict[str, dict]) -> None:
-    PROFILES_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = PROFILES_STORE_PATH.with_suffix(".json.tmp")
-    temp_path.write_text(json.dumps(profiles, ensure_ascii=False), encoding="utf-8")
-    temp_path.replace(PROFILES_STORE_PATH)
-
-
-def _load_json_store(path: Path) -> dict[str, dict]:
-    try:
-        if not path.exists():
-            return {}
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def _save_json_store(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(path)
-
-
 def _token_from_header(authorization: str) -> str:
     if authorization and authorization.lower().startswith("bearer "):
         return authorization[7:].strip()
@@ -1064,8 +1046,7 @@ def _resolve_authenticated_user(authorization: str) -> AuthenticatedUser | None:
         return None
     now = time.time()
     with _tokens_lock:
-        tokens = _load_json_store(AUTH_TOKENS_PATH)
-        entry = tokens.get(token)
+        entry = session_repository.get(token)
         if not isinstance(entry, dict):
             return None
         try:
@@ -1073,23 +1054,14 @@ def _resolve_authenticated_user(authorization: str) -> AuthenticatedUser | None:
         except (TypeError, ValueError):
             expires_at = 0
         if expires_at <= now:
-            tokens.pop(token, None)
-            _save_json_store(AUTH_TOKENS_PATH, tokens)
+            session_repository.revoke(token)
             return None
 
     profile_id = str(entry.get("profile_id") or "")
     if not profile_id:
         return None
     with _users_lock:
-        user = next(
-            (
-                value
-                for value in _load_json_store(USERS_STORE_PATH).values()
-                if isinstance(value, dict)
-                and str(value.get("profile_id") or "") == profile_id
-            ),
-            None,
-        )
+        user = user_repository.get_by_profile_id(profile_id)
     if not isinstance(user, dict):
         return None
     return AuthenticatedUser(
@@ -1152,9 +1124,7 @@ def _revoke_token(authorization: str) -> None:
     if not token:
         return
     with _tokens_lock:
-        tokens = _load_json_store(AUTH_TOKENS_PATH)
-        if tokens.pop(token, None) is not None:
-            _save_json_store(AUTH_TOKENS_PATH, tokens)
+        session_repository.revoke(token)
 
 
 def _profile_favorite(item: dict) -> dict | None:
@@ -1263,8 +1233,8 @@ def _profile_payload(profile: dict) -> dict:
     }
 
 
-def _get_profile_or_404(profile_id: str, profiles: dict[str, dict]) -> dict:
-    profile = profiles.get(profile_id)
+def _profile_or_404(profile_id: str) -> dict:
+    profile = profile_repository.get(profile_id)
     if not isinstance(profile, dict):
         raise HTTPException(status_code=404, detail="Perfil nao encontrado.")
     return profile
@@ -5049,9 +5019,7 @@ def create_profile(request: ProfileCreateRequest) -> dict:
         "updated_at": now,
     }
     with _profiles_lock:
-        profiles = _load_profiles()
-        profiles[profile["id"]] = profile
-        _save_profiles(profiles)
+        profile_repository.save(profile)
     return _profile_payload(profile)
 
 
@@ -5062,7 +5030,7 @@ def get_profile(
 ) -> dict:
     del current_user
     with _profiles_lock:
-        profile = _get_profile_or_404(profile_id, _load_profiles())
+        profile = _profile_or_404(profile_id)
         return _profile_payload(profile)
 
 
@@ -5077,12 +5045,10 @@ def update_profile(
     if not display_name:
         raise HTTPException(status_code=422, detail="Nome do perfil vazio.")
     with _profiles_lock:
-        profiles = _load_profiles()
-        profile = _get_profile_or_404(profile_id, profiles)
+        profile = _profile_or_404(profile_id)
         profile["display_name"] = display_name
         profile["updated_at"] = time.time()
-        profiles[profile_id] = profile
-        _save_profiles(profiles)
+        profile_repository.save(profile)
     return _profile_payload(profile)
 
 
@@ -5106,12 +5072,10 @@ def update_profile_favorites(
         favorites.append(item)
 
     with _profiles_lock:
-        profiles = _load_profiles()
-        profile = _get_profile_or_404(profile_id, profiles)
+        profile = _profile_or_404(profile_id)
         profile["favorites"] = favorites
         profile["updated_at"] = time.time()
-        profiles[profile_id] = profile
-        _save_profiles(profiles)
+        profile_repository.save(profile)
     return _profile_payload(profile)
 
 
@@ -5127,11 +5091,10 @@ def upsert_profile_library_entry(
         raise HTTPException(status_code=422, detail="Obra invalida para biblioteca.")
     key = str(entry.get("source_url") or entry.get("id") or "")
     with _profiles_lock:
-        remote_profile = copy.deepcopy(_get_profile_or_404(profile_id, _load_profiles()))
+        remote_profile = copy.deepcopy(_profile_or_404(profile_id))
     anilist_sync = _save_library_entry_to_anilist(remote_profile, entry)
     with _profiles_lock:
-        profiles = _load_profiles()
-        profile = _get_profile_or_404(profile_id, profiles)
+        profile = _profile_or_404(profile_id)
         library = [item for item in (profile.get("library") or []) if isinstance(item, dict)]
         entry["updated_at"] = time.time()
         replaced = False
@@ -5145,8 +5108,7 @@ def upsert_profile_library_entry(
             library.insert(0, entry)
         profile["library"] = library[:500]
         profile["updated_at"] = time.time()
-        profiles[profile_id] = profile
-        _save_profiles(profiles)
+        profile_repository.save(profile)
     return {"profile": _profile_payload(profile), "anilist": anilist_sync}
 
 
@@ -5163,7 +5125,7 @@ def delete_profile_library_entry(
     if not requested_key:
         raise HTTPException(status_code=422, detail="Obra invalida para remover da lista.")
     with _profiles_lock:
-        remote_profile = copy.deepcopy(_get_profile_or_404(profile_id, _load_profiles()))
+        remote_profile = copy.deepcopy(_profile_or_404(profile_id))
         current = next(
             (
                 item for item in (remote_profile.get("library") or [])
@@ -5176,16 +5138,14 @@ def delete_profile_library_entry(
         raise HTTPException(status_code=404, detail="Obra nao esta na sua lista.")
     anilist_sync = _delete_library_entry_from_anilist(remote_profile, current)
     with _profiles_lock:
-        profiles = _load_profiles()
-        profile = _get_profile_or_404(profile_id, profiles)
+        profile = _profile_or_404(profile_id)
         profile["library"] = [
             item for item in (profile.get("library") or [])
             if not isinstance(item, dict)
             or str(item.get("source_url") or item.get("id") or "") != requested_key
         ]
         profile["updated_at"] = time.time()
-        profiles[profile_id] = profile
-        _save_profiles(profiles)
+        profile_repository.save(profile)
     return {"profile": _profile_payload(profile), "anilist": anilist_sync}
 
 
@@ -5200,12 +5160,10 @@ def set_profile_avatar(
 ) -> dict:
     del current_user
     with _profiles_lock:
-        profiles = _load_profiles()
-        profile = _get_profile_or_404(profile_id, profiles)
+        profile = _profile_or_404(profile_id)
         profile["avatar_url"] = _apply_profile_image(profile, "avatar", request)
         profile["updated_at"] = time.time()
-        profiles[profile_id] = profile
-        _save_profiles(profiles)
+        profile_repository.save(profile)
     return _profile_payload(profile)
 
 
@@ -5217,12 +5175,10 @@ def set_profile_background(
 ) -> dict:
     del current_user
     with _profiles_lock:
-        profiles = _load_profiles()
-        profile = _get_profile_or_404(profile_id, profiles)
+        profile = _profile_or_404(profile_id)
         profile["background_url"] = _apply_profile_image(profile, "background", request)
         profile["updated_at"] = time.time()
-        profiles[profile_id] = profile
-        _save_profiles(profiles)
+        profile_repository.save(profile)
     return _profile_payload(profile)
 
 
@@ -5235,12 +5191,10 @@ def set_profile_home_background(
     """Imagem de fundo da HOME escolhida pelo leitor (customizacao de perfil)."""
     del current_user
     with _profiles_lock:
-        profiles = _load_profiles()
-        profile = _get_profile_or_404(profile_id, profiles)
+        profile = _profile_or_404(profile_id)
         profile["home_background_url"] = _apply_profile_image(profile, "home_background", request)
         profile["updated_at"] = time.time()
-        profiles[profile_id] = profile
-        _save_profiles(profiles)
+        profile_repository.save(profile)
     return _profile_payload(profile)
 
 
@@ -5777,7 +5731,7 @@ def start_account_link(
             detail=f"OAuth do {PROVIDER_LABELS.get(provider, provider)} nao configurado no servidor (.env).",
         )
     with _profiles_lock:
-        _get_profile_or_404(profile_id, _load_profiles())
+        _profile_or_404(profile_id)
 
     state = secrets.token_urlsafe(24)
     redirect_uri = _oauth_redirect_uri(provider)
@@ -5873,8 +5827,7 @@ def account_link_callback(
 
     link_info = {**viewer, "linked_at": time.time()}
     with _profiles_lock:
-        profiles = _load_profiles()
-        profile = profiles.get(profile_id)
+        profile = profile_repository.get(profile_id)
         if not isinstance(profile, dict):
             return _oauth_html({"ok": False, "provider": provider, "detail": "Perfil nao encontrado."})
         links = profile.get("links")
@@ -5893,8 +5846,7 @@ def account_link_callback(
         }
         profile["_tokens"] = stored_tokens
         profile["updated_at"] = time.time()
-        profiles[profile_id] = profile
-        _save_profiles(profiles)
+        profile_repository.save(profile)
 
     return _oauth_html({
         "ok": True,
@@ -5914,8 +5866,7 @@ def unlink_account(
     if provider not in OAUTH_PROVIDERS:
         raise HTTPException(status_code=404, detail="Provedor desconhecido.")
     with _profiles_lock:
-        profiles = _load_profiles()
-        profile = _get_profile_or_404(profile_id, profiles)
+        profile = _profile_or_404(profile_id)
         links = profile.get("links")
         if isinstance(links, dict):
             links.pop(provider, None)
@@ -5923,8 +5874,7 @@ def unlink_account(
         if isinstance(tokens, dict):
             tokens.pop(provider, None)
         profile["updated_at"] = time.time()
-        profiles[profile_id] = profile
-        _save_profiles(profiles)
+        profile_repository.save(profile)
     return _profile_payload(profile)
 
 
@@ -5956,7 +5906,7 @@ def sync_linked_manga_list(
     if provider not in OAUTH_PROVIDERS:
         raise HTTPException(status_code=404, detail="Provedor desconhecido.")
     with _profiles_lock:
-        profile = _get_profile_or_404(profile_id, _load_profiles())
+        profile = _profile_or_404(profile_id)
         link = copy.deepcopy((profile.get("links") or {}).get(provider))
         tokens = copy.deepcopy((profile.get("_tokens") or {}).get(provider))
     if not isinstance(link, dict) or not isinstance(tokens, dict):
@@ -5977,8 +5927,7 @@ def sync_linked_manga_list(
     matched_pairs = _resolve_external_list_items(external_entries)
     now = time.time()
     with _profiles_lock:
-        profiles = _load_profiles()
-        profile = _get_profile_or_404(profile_id, profiles)
+        profile = _profile_or_404(profile_id)
         library = [item for item in (profile.get("library") or []) if isinstance(item, dict)]
         seen = {
             str(item.get("source_url") or _canonical_title_identity(str(item.get("title") or "")))
@@ -6059,8 +6008,7 @@ def sync_linked_manga_list(
         })
         profile.setdefault("_tokens", {})[provider] = refreshed_tokens
         profile["updated_at"] = now
-        profiles[profile_id] = profile
-        _save_profiles(profiles)
+        profile_repository.save(profile)
 
     return {
         "profile": _profile_payload(profile),
@@ -6113,12 +6061,16 @@ def _issue_token(profile_id: str, username: str) -> str:
     token = secrets.token_urlsafe(32)
     now = time.time()
     with _tokens_lock:
-        tokens = {
-            t: v for t, v in _load_json_store(AUTH_TOKENS_PATH).items()
-            if float(v.get("expires", 0)) > now
-        }
-        tokens[token] = {"profile_id": profile_id, "username": username, "expires": now + AUTH_TOKEN_TTL_SECONDS}
-        _save_json_store(AUTH_TOKENS_PATH, tokens)
+        session_repository.purge_expired(now)
+        session_repository.save(
+            token,
+            {
+                "profile_id": profile_id,
+                "username": username,
+                "expires": now + AUTH_TOKEN_TTL_SECONDS,
+                "created_at": now,
+            },
+        )
     return token
 
 
@@ -6144,8 +6096,7 @@ def auth_register(request: RegisterRequest) -> dict:
     now = time.time()
     salt = secrets.token_hex(16)
     with _users_lock:
-        users = _load_json_store(USERS_STORE_PATH)
-        if key in users:
+        if user_repository.get(key) is not None:
             raise HTTPException(status_code=409, detail="Esse usuario ja existe.")
         profile = {
             "id": uuid4().hex,
@@ -6155,18 +6106,15 @@ def auth_register(request: RegisterRequest) -> dict:
             "updated_at": now,
         }
         with _profiles_lock:
-            profiles = _load_profiles()
-            profiles[profile["id"]] = profile
-            _save_profiles(profiles)
-        users[key] = {
+            profile_repository.save(profile)
+        user_repository.save(key, {
             "username": username,
             "email": request.email.strip(),
             "salt": salt,
             "password_hash": _hash_password(request.password, salt),
             "profile_id": profile["id"],
             "created_at": now,
-        }
-        _save_json_store(USERS_STORE_PATH, users)
+        })
     token = _issue_token(profile["id"], username)
     return {"token": token, "profile": _profile_payload(profile)}
 
@@ -6175,11 +6123,11 @@ def auth_register(request: RegisterRequest) -> dict:
 def auth_login(request: LoginRequest) -> dict:
     key = request.username.strip().lower()
     with _users_lock:
-        user = _load_json_store(USERS_STORE_PATH).get(key)
+        user = user_repository.get(key)
     if not user or _hash_password(request.password, user.get("salt", "")) != user.get("password_hash"):
         raise HTTPException(status_code=401, detail="Usuario ou senha invalidos.")
     with _profiles_lock:
-        profile = _load_profiles().get(user["profile_id"])
+        profile = profile_repository.get(user["profile_id"])
     if not isinstance(profile, dict):
         raise HTTPException(status_code=500, detail="Perfil da conta nao encontrado.")
     token = _issue_token(user["profile_id"], user["username"])
@@ -6191,7 +6139,7 @@ def auth_me(
     current_user: AuthenticatedUser = Depends(require_current_user),
 ) -> dict:
     with _profiles_lock:
-        profile = _load_profiles().get(current_user.profile_id)
+        profile = profile_repository.get(current_user.profile_id)
     if not isinstance(profile, dict):
         raise HTTPException(status_code=401, detail="Sessao invalida.")
     return {"profile": _profile_payload(profile)}
@@ -6286,12 +6234,11 @@ def _finish_external_login(
     key = f"{provider}:{external_id}"
     now = time.time()
     with _users_lock:
-        users = _load_json_store(USERS_STORE_PATH)
-        user = users.get(key)
+        user = user_repository.get(key)
         profile = None
         if user and isinstance(user.get("profile_id"), str):
             with _profiles_lock:
-                profile = _load_profiles().get(user["profile_id"])
+                profile = profile_repository.get(user["profile_id"])
             if not isinstance(profile, dict):
                 profile = None
         if profile is None:
@@ -6304,18 +6251,15 @@ def _finish_external_login(
                 "updated_at": now,
             }
             with _profiles_lock:
-                profiles = _load_profiles()
-                profiles[profile["id"]] = profile
-                _save_profiles(profiles)
-            users[key] = {
+                profile_repository.save(profile)
+            user_repository.save(key, {
                 "username": display,
                 "provider": provider,
                 f"{provider}_id": external_id,
                 "email": email,
                 "profile_id": profile["id"],
                 "created_at": now,
-            }
-            _save_json_store(USERS_STORE_PATH, users)
+            })
 
     return {
         "token": _issue_token(profile["id"], display),
