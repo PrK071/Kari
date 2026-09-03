@@ -6,7 +6,6 @@ O runtime web já desliga bibliotecas locais e Sakura, mas o backend ainda não 
 aprovado para exposição pública. Os bloqueadores atuais são:
 
 - rotas de perfil e integrações sem autorização por proprietário;
-- proxy de imagens com SSRF para destinos arbitrários;
 - estado global do capítulo corrente;
 - usuários, sessões e tokens OAuth persistidos em JSON;
 - ausência de rate limiting nos endpoints de autenticação e scraping.
@@ -48,9 +47,13 @@ contém somente nomes e placeholders. Nunca registrar senha, token, cookie,
 
 ## Próximos controles
 
-1. bloquear IPs privados, loopback, link-local e redirects inseguros no proxy;
-2. autorização por dono e repositórios de persistência;
-3. rate limiter com interface substituível por Redis/serviço externo;
-4. IDs de sessão de leitura isolados e limites globais por scraper;
-5. middleware de acesso com método, path normalizado, status e duração;
-6. testes de CORS, auth, IDOR, SSRF, upload e ambos os runtimes.
+O proxy de imagens valida DNS, rejeita endereços não públicos/credenciais,
+revalida redirects, limita portas no runtime web, restringe o tamanho a 25 MB e
+aceita somente formatos raster reconhecidos por assinatura. A VPS ainda deve
+aplicar regras de egress como defesa adicional contra DNS rebinding.
+
+1. autorização por dono e repositórios de persistência;
+2. rate limiter com interface substituível por Redis/serviço externo;
+3. IDs de sessão de leitura isolados e limites globais por scraper;
+4. middleware de acesso com método, path normalizado, status e duração;
+5. testes de CORS, auth, IDOR, SSRF, upload e ambos os runtimes.

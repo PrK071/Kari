@@ -23,7 +23,7 @@ from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -34,6 +34,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from backend.config import load_settings
+from backend.network_security import UnsafeRemoteURLError, validate_public_http_url
 
 from schemas import (
     HomeResponse,
@@ -85,6 +86,8 @@ CHAPTER_PAYLOAD_CACHE_TTL_SECONDS = 30 * 60
 MANGA_META_CACHE_TTL_SECONDS = 12 * 60 * 60
 IMAGE_CACHE_TTL_SECONDS = 15 * 60
 IMAGE_CACHE_MAX_ITEMS = 1000
+REMOTE_IMAGE_MAX_BYTES = 25 * 1024 * 1024
+REMOTE_IMAGE_MAX_REDIRECTS = 3
 ANILIST_CACHE_TTL_SECONDS = 12 * 60 * 60
 KITSU_CACHE_TTL_SECONDS = 12 * 60 * 60
 MANGAUPDATES_CACHE_TTL_SECONDS = 24 * 60 * 60
@@ -4342,10 +4345,7 @@ def _image_referer(url: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}/"
 
 
-def _guess_image_media_type(url: str, content: bytes, fallback: str) -> str:
-    guessed = mimetypes.guess_type(urlparse(url).path)[0]
-    if guessed and guessed.startswith("image/"):
-        return guessed
+def _sniff_image_media_type(content: bytes) -> str:
     if content.startswith(b"\xff\xd8\xff"):
         return "image/jpeg"
     if content.startswith(b"\x89PNG\r\n\x1a\n"):
@@ -4354,7 +4354,9 @@ def _guess_image_media_type(url: str, content: bytes, fallback: str) -> str:
         return "image/gif"
     if content[:4] == b"RIFF" and content[8:12] == b"WEBP":
         return "image/webp"
-    return fallback
+    if content[4:8] == b"ftyp" and content[8:12] in {b"avif", b"avis"}:
+        return "image/avif"
+    return ""
 
 
 def _prune_image_cache() -> None:
@@ -4373,45 +4375,78 @@ def _prune_image_cache() -> None:
 
 
 def _fetch_image(url: str) -> ImageCacheEntry:
+    allowed_ports = {80, 443} if settings.is_web else None
+    requested_url = validate_public_http_url(url, allowed_ports=allowed_ports)
     while True:
         with _image_cache_lock:
-            cached = image_cache.get(url)
+            cached = image_cache.get(requested_url)
             if cached and time.time() - cached.saved_at < IMAGE_CACHE_TTL_SECONDS:
                 return cached
-            pending = image_inflight.get(url)
+            pending = image_inflight.get(requested_url)
             if pending is None:
                 pending = threading.Event()
-                image_inflight[url] = pending
+                image_inflight[requested_url] = pending
                 break
         pending.wait(timeout=30)
 
-    headers = {
-        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/138.0.0.0 Safari/537.36"
-        ),
-        "Referer": _image_referer(url),
-    }
-    if _is_mangadex_image_url(url):
-        headers["Accept"] = "*/*"
-        headers["User-Agent"] = "python-requests/2.32.5"
-
     try:
-        response = _image_http.get(
-            url,
-            timeout=(5, 20),
-            headers=headers,
-        )
-        response.raise_for_status()
-        content = response.content
-        media_type = response.headers.get("content-type", "image/jpeg").split(";")[0].strip()
-        if not media_type.startswith("image/"):
-            guessed_type = _guess_image_media_type(url, content, media_type)
-            if not guessed_type.startswith("image/"):
-                raise RuntimeError(f"URL nao retornou imagem: {media_type}")
-            media_type = guessed_type
+        current_url = requested_url
+        response = None
+        content = b""
+        for redirect_count in range(REMOTE_IMAGE_MAX_REDIRECTS + 1):
+            headers = {
+                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/138.0.0.0 Safari/537.36"
+                ),
+                "Referer": _image_referer(current_url),
+            }
+            if _is_mangadex_image_url(current_url):
+                headers["Accept"] = "*/*"
+                headers["User-Agent"] = "python-requests/2.32.5"
+
+            response = _image_http.get(
+                current_url,
+                timeout=(5, 20),
+                headers=headers,
+                allow_redirects=False,
+                stream=True,
+            )
+            if response.status_code in {301, 302, 303, 307, 308}:
+                location = response.headers.get("location", "").strip()
+                response.close()
+                if not location or redirect_count >= REMOTE_IMAGE_MAX_REDIRECTS:
+                    raise RuntimeError("Redirecionamento de imagem invalido.")
+                current_url = validate_public_http_url(
+                    urljoin(current_url, location),
+                    allowed_ports=allowed_ports,
+                )
+                continue
+
+            try:
+                response.raise_for_status()
+                content_length = response.headers.get("content-length", "").strip()
+                if content_length.isdigit() and int(content_length) > REMOTE_IMAGE_MAX_BYTES:
+                    raise RuntimeError("Imagem remota excede o limite de 25 MB.")
+                chunks = bytearray()
+                for chunk in response.iter_content(chunk_size=64 * 1024):
+                    if not chunk:
+                        continue
+                    chunks.extend(chunk)
+                    if len(chunks) > REMOTE_IMAGE_MAX_BYTES:
+                        raise RuntimeError("Imagem remota excede o limite de 25 MB.")
+            finally:
+                response.close()
+            content = bytes(chunks)
+            break
+
+        if response is None or not content:
+            raise RuntimeError("URL retornou imagem vazia.")
+        media_type = _sniff_image_media_type(content)
+        if not media_type:
+            raise RuntimeError("URL nao retornou imagem raster valida.")
 
         entry = ImageCacheEntry(
             saved_at=time.time(),
@@ -4419,12 +4454,12 @@ def _fetch_image(url: str) -> ImageCacheEntry:
             media_type=media_type,
         )
         with _image_cache_lock:
-            image_cache[url] = entry
+            image_cache[requested_url] = entry
             _prune_image_cache()
         return entry
     finally:
         with _image_cache_lock:
-            finished = image_inflight.pop(url, None)
+            finished = image_inflight.pop(requested_url, None)
             if finished is not None:
                 finished.set()
 
@@ -7468,6 +7503,8 @@ def proxy_image(url: str = Query(..., description="URL remota da imagem.")) -> R
         raise HTTPException(status_code=400, detail="URL de imagem invalida.")
     try:
         image = _fetch_image(remote_url)
+    except UnsafeRemoteURLError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return Response(
