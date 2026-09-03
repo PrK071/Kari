@@ -28,6 +28,7 @@ class RuntimeCapabilitiesTests(unittest.TestCase):
         self.assertFalse(capabilities["local_libraries"])
         self.assertFalse(capabilities["sakura"])
         self.assertNotIn("sakura", main._search_sources())
+        self.assertNotIn("mangageek", main._search_sources())
         self.assertIsNone(
             main._normalize_manga_item(
                 {
@@ -41,6 +42,7 @@ class RuntimeCapabilitiesTests(unittest.TestCase):
             "hq-local://comic/example",
             "light-novel://novel/example",
             "https://sakuramangas.org/obras/example",
+            "mangageek://manga/4288",
         ):
             with self.assertRaises(HTTPException) as raised:
                 main._ensure_source_allowed(source)
@@ -53,6 +55,7 @@ class RuntimeCapabilitiesTests(unittest.TestCase):
         main.settings = load_settings({"KARI_RUNTIME": "desktop"})
 
         main._ensure_source_allowed("hq-local://comic/example")
+        main._ensure_source_allowed("mangageek://manga/4288")
         self.assertTrue(main.capabilities()["local_libraries"])
         self.assertTrue(main.capabilities()["sakura"])
 

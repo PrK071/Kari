@@ -549,7 +549,14 @@ DESKTOP_ONLY_PROVIDERS = {"hq_local", "light_novel_local", "sakura"}
 
 
 def _provider_enabled(provider: str) -> bool:
-    return not settings.is_web or provider not in DESKTOP_ONLY_PROVIDERS
+    normalized = provider.strip().casefold()
+    if not settings.is_web:
+        return True
+    if normalized in DESKTOP_ONLY_PROVIDERS:
+        return False
+    if normalized == "mangageek":
+        return urlparse(reader.mangageek_api_base).scheme.casefold() == "https"
+    return True
 
 
 def _require_desktop_capability() -> None:
@@ -564,6 +571,7 @@ def _ensure_source_allowed(source_url: str) -> None:
         reader.hq_plugin.is_source(source_url)
         or reader.light_novel_plugin.is_source(source_url)
         or reader._is_sakura_source(source_url)
+        or (reader._is_mangageek_source(source_url) and not _provider_enabled("mangageek"))
     ):
         _require_desktop_capability()
 
@@ -590,14 +598,11 @@ def _sakura_search_available() -> bool:
 
 
 def _pt_complete_sources() -> list[str]:
-    return [
-        source for source in PT_COMPLETE_SOURCES
-        if source != "sakura" or not settings.is_web
-    ]
+    return [source for source in PT_COMPLETE_SOURCES if _provider_enabled(source)]
 
 
 def _search_sources() -> list[str]:
-    sources = list(SEARCH_SOURCES)
+    sources = [source for source in SEARCH_SOURCES if _provider_enabled(source)]
     if not _sakura_search_available():
         sources = [source for source in sources if source != "sakura"]
     return sources
@@ -2172,7 +2177,7 @@ def _snapshot_payload(data: dict, limit: int | None = None) -> dict:
     items = [
         item
         for item in (payload.get("items") or [])
-        if _guess_provider(item) != "yumo"
+        if _guess_provider(item) != "yumo" and _provider_enabled(_guess_provider(item))
     ]
     if limit is not None:
         payload["items"] = items[:limit]
@@ -2191,10 +2196,14 @@ def _snapshot_payload(data: dict, limit: int | None = None) -> dict:
         if (section_items := [
             item
             for item in (section.get("items") or [])
-            if _guess_provider(item) != "yumo"
+            if _guess_provider(item) != "yumo" and _provider_enabled(_guess_provider(item))
         ])
     ]
-    payload["sources"] = list(ACTIVE_CATALOG_SOURCES)
+    payload["sources"] = [
+        label
+        for label in ACTIVE_CATALOG_SOURCES
+        if _provider_enabled(label.casefold().replace(" ", "_"))
+    ]
     payload["total"] = len(items)
     return payload
 
@@ -2362,7 +2371,11 @@ def _dedupe_cross_source_sections(sections: list[dict]) -> list[dict]:
 
 
 def _partner_catalog_sections(limit: int = PARTNER_CATALOG_LIMIT) -> tuple[list[dict], list[dict]]:
-    providers = ("fliptru", "nexus", "mangageek", "mangakatana", "mangasbrasuka", "mangalivre")
+    providers = tuple(
+        provider
+        for provider in ("fliptru", "nexus", "mangageek", "mangakatana", "mangasbrasuka", "mangalivre")
+        if _provider_enabled(provider)
+    )
     all_items: list[dict] = []
     sections: list[dict] = []
     with ThreadPoolExecutor(max_workers=len(providers)) as executor:

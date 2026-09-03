@@ -86,6 +86,13 @@ revalida redirects, limita portas no runtime web, restringe o tamanho a 25 MB e
 aceita somente formatos raster reconhecidos por assinatura. A VPS ainda deve
 aplicar regras de egress como defesa adicional contra DNS rebinding.
 
+Em 3 de setembro de 2026, a API pública conhecida do MangaGeek respondeu por
+HTTP, mas recusou conexão em HTTPS. Ela não recebe credenciais de usuário, porém
+seu conteúdo não possui garantia de confidencialidade ou integridade no
+transporte. Por isso, MangaGeek é filtrado de busca, catálogo, snapshots e
+abertura direta no runtime web enquanto `MANGAGEEK_API_BASE` não for uma origem
+HTTPS validada. O desktop preserva a integração legada para conteúdo público.
+
 As rotas de dados privados usam uma dependência FastAPI central para validar o
 Bearer e comparar o `profile_id` com a identidade da sessão. No runtime web,
 ausência ou invalidade do token resulta em 401 e acesso cruzado resulta em 403.
