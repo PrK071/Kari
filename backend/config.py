@@ -12,6 +12,7 @@ class ConfigurationError(RuntimeError):
 
 _ENVIRONMENTS = {"development", "production"}
 _RUNTIMES = {"desktop", "web"}
+_PERSISTENCE_BACKENDS = {"json", "postgres"}
 _DEVELOPMENT_ORIGINS = (
     "http://localhost:5173",
     "http://127.0.0.1:5173",
@@ -69,6 +70,7 @@ class Settings:
     frontend_url: str
     allowed_origins: tuple[str, ...]
     database_url: str
+    persistence_backend: str
     storage_backend: str
     secret_key: str
 
@@ -135,13 +137,33 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
             "KARI_STORAGE_BACKEND deve ser filesystem ou object_storage."
         )
 
+    persistence_default = "postgres" if production else "json"
+    persistence_backend = _choice(
+        "KARI_PERSISTENCE_BACKEND",
+        source.get("KARI_PERSISTENCE_BACKEND", persistence_default),
+        _PERSISTENCE_BACKENDS,
+    )
+    database_url = source.get("DATABASE_URL", "").strip()
+    secret_key = source.get("KARI_SECRET_KEY", "").strip()
+    if persistence_backend == "postgres" and not database_url:
+        raise ConfigurationError(
+            "DATABASE_URL e obrigatorio com persistencia PostgreSQL."
+        )
+    if production and not database_url.startswith(("postgresql://", "postgresql+psycopg://")):
+        raise ConfigurationError("DATABASE_URL deve apontar para PostgreSQL em producao.")
+    if persistence_backend == "postgres" and len(secret_key) < 32:
+        raise ConfigurationError(
+            "KARI_SECRET_KEY deve ter ao menos 32 caracteres com persistencia PostgreSQL."
+        )
+
     return Settings(
         environment=environment,
         runtime=runtime,
         backend_url=backend_url,
         frontend_url=frontend_url,
         allowed_origins=allowed_origins,
-        database_url=source.get("DATABASE_URL", "").strip(),
+        database_url=database_url,
+        persistence_backend=persistence_backend,
         storage_backend=storage_backend,
-        secret_key=source.get("KARI_SECRET_KEY", "").strip(),
+        secret_key=secret_key,
     )

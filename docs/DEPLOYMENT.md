@@ -41,19 +41,29 @@ Crie `/etc/kari.env`, legível somente pelo usuário do serviço:
 ```dotenv
 KARI_ENV=production
 KARI_RUNTIME=web
+KARI_PERSISTENCE_BACKEND=postgres
 KARI_BACKEND_URL=https://api.DOMINIO_DO_KARI
 KARI_FRONTEND_URL=https://DOMINIO_DO_KARI
 KARI_ALLOWED_ORIGINS=https://DOMINIO_DO_KARI
 KARI_DATA_DIR=/var/lib/kari/data
 KARI_STATIC_DIR=/var/lib/kari/static
-DATABASE_URL=postgresql://USUARIO:SENHA@HOST:5432/kari
-KARI_SECRET_KEY=GERAR_FORA_DO_GIT
+DATABASE_URL=postgresql+psycopg://USUARIO:SENHA@HOST:5432/kari
+KARI_SECRET_KEY=GERAR_FORA_DO_GIT_COM_PELO_MENOS_32_CARACTERES
 KARI_STORAGE_BACKEND=filesystem
 ```
 
-Enquanto a migração PostgreSQL/storage não estiver implementada, não trate esse
-filesystem como produção multiusuário. `DATABASE_URL` e `KARI_SECRET_KEY` já são
-reservados pela configuração, mas ainda não substituem o JSON atual.
+Crie o schema explicitamente antes de iniciar a API. O startup não executa DDL:
+
+```bash
+cd /opt/kari/app
+set -a
+source /etc/kari.env
+set +a
+/opt/kari/venv/bin/alembic upgrade head
+```
+
+O filesystem ainda não deve ser tratado como storage persistente multiusuário
+para avatares e backgrounds; essa migração permanece separada do banco.
 
 Serviço `/etc/systemd/system/kari.service`:
 

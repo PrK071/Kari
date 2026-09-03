@@ -40,6 +40,16 @@ frontend é apenas apresentação; o guard do backend é a barreira de seguranç
 
 ## Persistência alvo
 
+`KARI_PERSISTENCE_BACKEND=json|postgres` seleciona o adaptador. Desenvolvimento
+e desktop usam JSON por padrão; produção exige PostgreSQL, `DATABASE_URL` e uma
+`KARI_SECRET_KEY` de pelo menos 32 caracteres. O startup da API nunca cria ou
+altera tabelas: schema é versionado exclusivamente pelo Alembic.
+
+O schema relacional separa usuários, sessões, perfis, favoritos, biblioteca e
+contas OAuth. Tokens de sessão são persistidos somente como SHA-256 do token
+opaco de alta entropia; credenciais OAuth são cifradas com chave derivada do
+segredo da aplicação.
+
 A migração deve manter adaptadores JSON para o uso local enquanto introduz
 interfaces pequenas para `User`, `Session`, `Profile`, `Favorite` e `History`.
 A implementação PostgreSQL deve entrar nesta ordem:
@@ -64,5 +74,5 @@ enquanto a capability web estiver desligada.
 
 O `MangaReader` mantém um único capítulo corrente. Até ele ser isolado por sessão
 de leitura, o backend não é seguro para leitores concorrentes. A API também não
-deve ser publicada antes de corrigir autorização de perfil, SSRF do proxy de
-imagem e rate limiting. Consulte `SECURITY.md`.
+deve ser publicada antes de concluir migração dos dados legados e rate limiting.
+Consulte `SECURITY.md`.

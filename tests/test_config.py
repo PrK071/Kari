@@ -11,6 +11,7 @@ class SettingsTests(unittest.TestCase):
 
         self.assertEqual(settings.environment, "development")
         self.assertEqual(settings.runtime, "desktop")
+        self.assertEqual(settings.persistence_backend, "json")
         self.assertEqual(
             settings.allowed_origins,
             ("http://localhost:5173", "http://127.0.0.1:5173"),
@@ -26,10 +27,13 @@ class SettingsTests(unittest.TestCase):
                 "KARI_BACKEND_URL": "https://api.example.test",
                 "KARI_FRONTEND_URL": "https://kari.example.test",
                 "KARI_ALLOWED_ORIGINS": "https://kari.example.test",
+                "DATABASE_URL": "postgresql+psycopg://kari:password@db/kari",
+                "KARI_SECRET_KEY": "a" * 32,
             }
         )
 
         self.assertEqual(settings.runtime, "web")
+        self.assertEqual(settings.persistence_backend, "postgres")
         self.assertEqual(settings.allowed_origins, ("https://kari.example.test",))
 
     def test_production_rejects_http_and_wildcard_origins(self) -> None:
@@ -37,11 +41,25 @@ class SettingsTests(unittest.TestCase):
             "KARI_ENV": "production",
             "KARI_BACKEND_URL": "https://api.example.test",
             "KARI_FRONTEND_URL": "https://kari.example.test",
+            "DATABASE_URL": "postgresql+psycopg://kari:password@db/kari",
+            "KARI_SECRET_KEY": "a" * 32,
         }
         with self.assertRaises(ConfigurationError):
             load_settings({**base, "KARI_ALLOWED_ORIGINS": "*"})
         with self.assertRaises(ConfigurationError):
             load_settings({**base, "KARI_ALLOWED_ORIGINS": "http://kari.example.test"})
+
+    def test_postgres_requires_database_and_encryption_secret(self) -> None:
+        with self.assertRaises(ConfigurationError):
+            load_settings({"KARI_PERSISTENCE_BACKEND": "postgres"})
+        with self.assertRaises(ConfigurationError):
+            load_settings(
+                {
+                    "KARI_PERSISTENCE_BACKEND": "postgres",
+                    "DATABASE_URL": "sqlite:///test.db",
+                    "KARI_SECRET_KEY": "short",
+                }
+            )
 
 
 if __name__ == "__main__":

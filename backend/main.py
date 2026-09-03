@@ -36,12 +36,10 @@ from pydantic import BaseModel, Field
 from backend.config import load_settings
 from backend.network_security import UnsafeRemoteURLError, validate_public_http_url
 from backend.persistence import (
-    JsonProfileRepository,
-    JsonSessionRepository,
-    JsonUserRepository,
     ProfileRepository,
     SessionRepository,
     UserRepository,
+    build_repositories,
 )
 
 from schemas import (
@@ -142,13 +140,17 @@ AUTH_TOKENS_PATH = KARI_DATA_DIR / "tokens.json"
 AUTH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60
 PBKDF2_ITERATIONS = 200_000
 
-profile_repository: ProfileRepository = JsonProfileRepository(
-    lambda: PROFILES_STORE_PATH
+repositories = build_repositories(
+    backend=settings.persistence_backend,
+    database_url=settings.database_url,
+    secret_key=settings.secret_key,
+    users_path=lambda: USERS_STORE_PATH,
+    profiles_path=lambda: PROFILES_STORE_PATH,
+    sessions_path=lambda: AUTH_TOKENS_PATH,
 )
-user_repository: UserRepository = JsonUserRepository(lambda: USERS_STORE_PATH)
-session_repository: SessionRepository = JsonSessionRepository(
-    lambda: AUTH_TOKENS_PATH
-)
+profile_repository: ProfileRepository = repositories.profiles
+user_repository: UserRepository = repositories.users
+session_repository: SessionRepository = repositories.sessions
 # Obras adicionadas manualmente (ex.: via tools/add_sakura_manga.py). Mescladas
 # ao CURATED_CATALOG p/ aparecerem na home como as fontes fixas.
 CUSTOM_CATALOG_PATH = KARI_DATA_DIR / "custom_catalog.json"

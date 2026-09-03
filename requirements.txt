@@ -12,3 +12,7 @@ rarfile>=4.2
 capsolver>=1.0.7
 2captcha-python>=1.5.1
 python-dotenv>=1.0.0
+SQLAlchemy>=2.0.43,<3
+alembic>=1.16.5,<2
+psycopg[binary]>=3.2.9,<4
+cryptography>=45.0.7,<50
