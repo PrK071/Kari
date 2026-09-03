@@ -5,7 +5,6 @@
 O runtime web já desliga bibliotecas locais e Sakura, mas o backend ainda não está
 aprovado para exposição pública. Os bloqueadores atuais são:
 
-- rotas de perfil e integrações sem autorização por proprietário;
 - estado global do capítulo corrente;
 - usuários, sessões e tokens OAuth persistidos em JSON;
 - ausência de rate limiting nos endpoints de autenticação e scraping.
@@ -15,7 +14,8 @@ aprovado para exposição pública. Os bloqueadores atuais são:
 | Classe | Rotas |
 | --- | --- |
 | PUBLIC | `/health`, `/api/capabilities`, catálogo, busca, metadados e providers configurados |
-| AUTHENTICATED | `/api/auth/me` e logout (parcialmente); perfis ainda precisam ser migrados para esta classe |
+| AUTHENTICATED | `/api/auth/me` e logout |
+| OWNER_ONLY | perfil, favoritos, biblioteca, mídia de perfil e integrações AniList/MyAnimeList |
 | DESKTOP ONLY | biblioteca/import/assets/delete de HQ e light novel local; fontes Sakura |
 | ADMIN | nenhuma rota administrativa formal existe |
 | INTERNAL | nenhuma rota interna formal existe |
@@ -52,7 +52,12 @@ revalida redirects, limita portas no runtime web, restringe o tamanho a 25 MB e
 aceita somente formatos raster reconhecidos por assinatura. A VPS ainda deve
 aplicar regras de egress como defesa adicional contra DNS rebinding.
 
-1. autorização por dono e repositórios de persistência;
+As rotas de dados privados usam uma dependência FastAPI central para validar o
+Bearer e comparar o `profile_id` com a identidade da sessão. No runtime web,
+ausência ou invalidade do token resulta em 401 e acesso cruzado resulta em 403.
+O runtime desktop preserva perfis anônimos apenas quando nenhum bearer é enviado.
+
+1. repositórios de persistência e PostgreSQL;
 2. rate limiter com interface substituível por Redis/serviço externo;
 3. IDs de sessão de leitura isolados e limites globais por scraper;
 4. middleware de acesso com método, path normalizado, status e duração;

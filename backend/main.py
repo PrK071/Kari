@@ -27,7 +27,7 @@ from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
-from fastapi import BackgroundTasks, FastAPI, File, Form, Header, HTTPException, Query, Response, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, Query, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -1007,6 +1007,15 @@ def _apply_profile_image(profile: dict, kind: str, request: "ProfileImageRequest
 
 
 _profiles_lock = threading.RLock()
+_users_lock = threading.RLock()
+_tokens_lock = threading.RLock()
+
+
+@dataclass(frozen=True)
+class AuthenticatedUser:
+    profile_id: str
+    username: str
+    session_expires_at: float
 
 
 def _load_profiles() -> dict[str, dict]:
@@ -1024,6 +1033,128 @@ def _save_profiles(profiles: dict[str, dict]) -> None:
     temp_path = PROFILES_STORE_PATH.with_suffix(".json.tmp")
     temp_path.write_text(json.dumps(profiles, ensure_ascii=False), encoding="utf-8")
     temp_path.replace(PROFILES_STORE_PATH)
+
+
+def _load_json_store(path: Path) -> dict[str, dict]:
+    try:
+        if not path.exists():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_json_store(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _token_from_header(authorization: str) -> str:
+    if authorization and authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+    return ""
+
+
+def _resolve_authenticated_user(authorization: str) -> AuthenticatedUser | None:
+    token = _token_from_header(authorization)
+    if not token:
+        return None
+    now = time.time()
+    with _tokens_lock:
+        tokens = _load_json_store(AUTH_TOKENS_PATH)
+        entry = tokens.get(token)
+        if not isinstance(entry, dict):
+            return None
+        try:
+            expires_at = float(entry.get("expires", 0))
+        except (TypeError, ValueError):
+            expires_at = 0
+        if expires_at <= now:
+            tokens.pop(token, None)
+            _save_json_store(AUTH_TOKENS_PATH, tokens)
+            return None
+
+    profile_id = str(entry.get("profile_id") or "")
+    if not profile_id:
+        return None
+    with _users_lock:
+        user = next(
+            (
+                value
+                for value in _load_json_store(USERS_STORE_PATH).values()
+                if isinstance(value, dict)
+                and str(value.get("profile_id") or "") == profile_id
+            ),
+            None,
+        )
+    if not isinstance(user, dict):
+        return None
+    return AuthenticatedUser(
+        profile_id=profile_id,
+        username=str(user.get("username") or entry.get("username") or ""),
+        session_expires_at=expires_at,
+    )
+
+
+def require_current_user(
+    authorization: str = Header(default=""),
+) -> AuthenticatedUser:
+    current_user = _resolve_authenticated_user(authorization)
+    if current_user is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Nao autenticado.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return current_user
+
+
+def require_owned_profile(
+    current_user: AuthenticatedUser,
+    profile_id: str,
+) -> None:
+    if not secrets.compare_digest(current_user.profile_id, str(profile_id or "")):
+        raise HTTPException(status_code=403, detail="Acesso negado a este perfil.")
+
+
+def require_profile_owner(
+    profile_id: str,
+    authorization: str = Header(default=""),
+) -> AuthenticatedUser:
+    current_user = _resolve_authenticated_user(authorization)
+    if current_user is not None:
+        require_owned_profile(current_user, profile_id)
+        return current_user
+    if not settings.is_web and not _token_from_header(authorization):
+        return AuthenticatedUser(
+            profile_id=profile_id,
+            username="desktop-local",
+            session_expires_at=0,
+        )
+    raise HTTPException(
+        status_code=401,
+        detail="Nao autenticado.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def _resolve_token(authorization: str) -> str | None:
+    """Retorna o profile_id de uma sessao Bearer valida, quando existir."""
+    current_user = _resolve_authenticated_user(authorization)
+    return current_user.profile_id if current_user else None
+
+
+def _revoke_token(authorization: str) -> None:
+    token = _token_from_header(authorization)
+    if not token:
+        return
+    with _tokens_lock:
+        tokens = _load_json_store(AUTH_TOKENS_PATH)
+        if tokens.pop(token, None) is not None:
+            _save_json_store(AUTH_TOKENS_PATH, tokens)
 
 
 def _profile_favorite(item: dict) -> dict | None:
@@ -4906,6 +5037,7 @@ def health() -> dict[str, str]:
 
 @app.post("/api/profiles")
 def create_profile(request: ProfileCreateRequest) -> dict:
+    _require_desktop_capability()
     display_name = request.display_name.strip() or "Leitor"
     now = time.time()
     profile = {
@@ -4924,14 +5056,23 @@ def create_profile(request: ProfileCreateRequest) -> dict:
 
 
 @app.get("/api/profiles/{profile_id}")
-def get_profile(profile_id: str) -> dict:
+def get_profile(
+    profile_id: str,
+    current_user: AuthenticatedUser = Depends(require_profile_owner),
+) -> dict:
+    del current_user
     with _profiles_lock:
         profile = _get_profile_or_404(profile_id, _load_profiles())
         return _profile_payload(profile)
 
 
 @app.put("/api/profiles/{profile_id}")
-def update_profile(profile_id: str, request: ProfileUpdateRequest) -> dict:
+def update_profile(
+    profile_id: str,
+    request: ProfileUpdateRequest,
+    current_user: AuthenticatedUser = Depends(require_profile_owner),
+) -> dict:
+    del current_user
     display_name = request.display_name.strip()
     if not display_name:
         raise HTTPException(status_code=422, detail="Nome do perfil vazio.")
@@ -4946,7 +5087,12 @@ def update_profile(profile_id: str, request: ProfileUpdateRequest) -> dict:
 
 
 @app.put("/api/profiles/{profile_id}/favorites")
-def update_profile_favorites(profile_id: str, request: ProfileFavoritesRequest) -> dict:
+def update_profile_favorites(
+    profile_id: str,
+    request: ProfileFavoritesRequest,
+    current_user: AuthenticatedUser = Depends(require_profile_owner),
+) -> dict:
+    del current_user
     favorites: list[dict] = []
     seen: set[str] = set()
     for raw_item in request.favorites:
@@ -4970,7 +5116,12 @@ def update_profile_favorites(profile_id: str, request: ProfileFavoritesRequest) 
 
 
 @app.put("/api/profiles/{profile_id}/library")
-def upsert_profile_library_entry(profile_id: str, request: ProfileLibraryEntryRequest) -> dict:
+def upsert_profile_library_entry(
+    profile_id: str,
+    request: ProfileLibraryEntryRequest,
+    current_user: AuthenticatedUser = Depends(require_profile_owner),
+) -> dict:
+    del current_user
     entry = _profile_library_item(request.item, request.status, request.score, request.review)
     if not entry:
         raise HTTPException(status_code=422, detail="Obra invalida para biblioteca.")
@@ -5000,7 +5151,12 @@ def upsert_profile_library_entry(profile_id: str, request: ProfileLibraryEntryRe
 
 
 @app.delete("/api/profiles/{profile_id}/library")
-def delete_profile_library_entry(profile_id: str, request: ProfileLibraryDeleteRequest) -> dict:
+def delete_profile_library_entry(
+    profile_id: str,
+    request: ProfileLibraryDeleteRequest,
+    current_user: AuthenticatedUser = Depends(require_profile_owner),
+) -> dict:
+    del current_user
     requested_key = str(
         request.item.get("source_url") or request.item.get("id") or ""
     ).strip()
@@ -5037,7 +5193,12 @@ def delete_profile_library_entry(profile_id: str, request: ProfileLibraryDeleteR
 # Aparencia do perfil: avatar (foto) e background (capa do painel).
 # ---------------------------------------------------------------------------
 @app.put("/api/profiles/{profile_id}/avatar")
-def set_profile_avatar(profile_id: str, request: ProfileImageRequest) -> dict:
+def set_profile_avatar(
+    profile_id: str,
+    request: ProfileImageRequest,
+    current_user: AuthenticatedUser = Depends(require_profile_owner),
+) -> dict:
+    del current_user
     with _profiles_lock:
         profiles = _load_profiles()
         profile = _get_profile_or_404(profile_id, profiles)
@@ -5049,7 +5210,12 @@ def set_profile_avatar(profile_id: str, request: ProfileImageRequest) -> dict:
 
 
 @app.put("/api/profiles/{profile_id}/background")
-def set_profile_background(profile_id: str, request: ProfileImageRequest) -> dict:
+def set_profile_background(
+    profile_id: str,
+    request: ProfileImageRequest,
+    current_user: AuthenticatedUser = Depends(require_profile_owner),
+) -> dict:
+    del current_user
     with _profiles_lock:
         profiles = _load_profiles()
         profile = _get_profile_or_404(profile_id, profiles)
@@ -5061,8 +5227,13 @@ def set_profile_background(profile_id: str, request: ProfileImageRequest) -> dic
 
 
 @app.put("/api/profiles/{profile_id}/home-background")
-def set_profile_home_background(profile_id: str, request: ProfileImageRequest) -> dict:
+def set_profile_home_background(
+    profile_id: str,
+    request: ProfileImageRequest,
+    current_user: AuthenticatedUser = Depends(require_profile_owner),
+) -> dict:
     """Imagem de fundo da HOME escolhida pelo leitor (customizacao de perfil)."""
+    del current_user
     with _profiles_lock:
         profiles = _load_profiles()
         profile = _get_profile_or_404(profile_id, profiles)
@@ -5592,7 +5763,12 @@ def _resolve_external_list_items(entries: list[dict]) -> list[tuple[dict, dict]]
 
 
 @app.post("/api/profiles/{profile_id}/link/{provider}")
-def start_account_link(profile_id: str, provider: str) -> dict:
+def start_account_link(
+    profile_id: str,
+    provider: str,
+    current_user: AuthenticatedUser = Depends(require_profile_owner),
+) -> dict:
+    del current_user
     if provider not in OAUTH_PROVIDERS:
         raise HTTPException(status_code=404, detail="Provedor desconhecido.")
     if not _oauth_provider_configured(provider):
@@ -5729,7 +5905,12 @@ def account_link_callback(
 
 
 @app.delete("/api/profiles/{profile_id}/link/{provider}")
-def unlink_account(profile_id: str, provider: str) -> dict:
+def unlink_account(
+    profile_id: str,
+    provider: str,
+    current_user: AuthenticatedUser = Depends(require_profile_owner),
+) -> dict:
+    del current_user
     if provider not in OAUTH_PROVIDERS:
         raise HTTPException(status_code=404, detail="Provedor desconhecido.")
     with _profiles_lock:
@@ -5748,8 +5929,12 @@ def unlink_account(profile_id: str, provider: str) -> dict:
 
 
 @app.get("/api/profiles/{profile_id}/link/status")
-def account_link_status(profile_id: str) -> dict:
+def account_link_status(
+    profile_id: str,
+    current_user: AuthenticatedUser = Depends(require_profile_owner),
+) -> dict:
     """Diz quais provedores estao CONFIGURADOS no servidor (habilita botoes no UI)."""
+    del current_user
     return {
         "providers": {
             provider: {
@@ -5762,7 +5947,12 @@ def account_link_status(profile_id: str) -> dict:
 
 
 @app.post("/api/profiles/{profile_id}/sync/{provider}")
-def sync_linked_manga_list(profile_id: str, provider: str) -> dict:
+def sync_linked_manga_list(
+    profile_id: str,
+    provider: str,
+    current_user: AuthenticatedUser = Depends(require_profile_owner),
+) -> dict:
+    del current_user
     if provider not in OAUTH_PROVIDERS:
         raise HTTPException(status_code=404, detail="Provedor desconhecido.")
     with _profiles_lock:
@@ -5908,28 +6098,9 @@ def list_preset_backgrounds() -> dict:
 
 # ---------------------------------------------------------------------------
 # Cadastro / Login (contas locais). Senha com PBKDF2; sessao via token Bearer.
-# Auth local: sem HTTPS/rate-limit; adequado ao uso local do app.
+# Auth local: persistencia JSON mantida para compatibilidade desktop/dev.
 # ---------------------------------------------------------------------------
-_users_lock = threading.RLock()
-_tokens_lock = threading.RLock()
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9_.]{3,32}$")
-
-
-def _load_json_store(path: Path) -> dict[str, dict]:
-    try:
-        if not path.exists():
-            return {}
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def _save_json_store(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(path)
 
 
 def _hash_password(password: str, salt: str) -> str:
@@ -5951,32 +6122,6 @@ def _issue_token(profile_id: str, username: str) -> str:
     return token
 
 
-def _token_from_header(authorization: str) -> str:
-    if authorization and authorization.lower().startswith("bearer "):
-        return authorization[7:].strip()
-    return ""
-
-
-def _resolve_token(authorization: str) -> str | None:
-    """profile_id do token Bearer valido, ou None."""
-    token = _token_from_header(authorization)
-    if not token:
-        return None
-    with _tokens_lock:
-        entry = _load_json_store(AUTH_TOKENS_PATH).get(token)
-    if not entry or float(entry.get("expires", 0)) <= time.time():
-        return None
-    return str(entry.get("profile_id") or "")
-
-
-def _revoke_token(authorization: str) -> None:
-    token = _token_from_header(authorization)
-    if not token:
-        return
-    with _tokens_lock:
-        tokens = _load_json_store(AUTH_TOKENS_PATH)
-        if tokens.pop(token, None) is not None:
-            _save_json_store(AUTH_TOKENS_PATH, tokens)
 
 
 class RegisterRequest(BaseModel):
@@ -6042,19 +6187,22 @@ def auth_login(request: LoginRequest) -> dict:
 
 
 @app.get("/api/auth/me")
-def auth_me(authorization: str = Header(default="")) -> dict:
-    profile_id = _resolve_token(authorization)
-    if not profile_id:
-        raise HTTPException(status_code=401, detail="Nao autenticado.")
+def auth_me(
+    current_user: AuthenticatedUser = Depends(require_current_user),
+) -> dict:
     with _profiles_lock:
-        profile = _load_profiles().get(profile_id)
+        profile = _load_profiles().get(current_user.profile_id)
     if not isinstance(profile, dict):
         raise HTTPException(status_code=401, detail="Sessao invalida.")
     return {"profile": _profile_payload(profile)}
 
 
 @app.post("/api/auth/logout")
-def auth_logout(authorization: str = Header(default="")) -> dict:
+def auth_logout(
+    authorization: str = Header(default=""),
+    current_user: AuthenticatedUser = Depends(require_current_user),
+) -> dict:
+    del current_user
     _revoke_token(authorization)
     return {"ok": True}
 

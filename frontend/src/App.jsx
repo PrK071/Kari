@@ -25,6 +25,11 @@ const PROFILE_STORAGE_KEY = "kari:profile-id:v1"
 const AUTH_TOKEN_KEY = "kari:auth-token:v1"
 const READER_SESSION_STORAGE_KEY = "kari:reader-session:v1"
 
+function authenticatedHeaders(headers = {}) {
+  const token = window.localStorage.getItem(AUTH_TOKEN_KEY) || ""
+  return token ? { ...headers, Authorization: `Bearer ${token}` } : headers
+}
+
 const HERO_GENRE_STYLES = [
   "border-emerald-300/30 bg-emerald-300/10 text-emerald-100",
   "border-violet-300/30 bg-violet-300/10 text-violet-100",
@@ -1483,7 +1488,9 @@ function ProfilePanel({ profile, historyCount, onClose, onSave, onProfileChange,
   useEffect(() => {
     if (!profile?.id) return undefined
     let cancelled = false
-    fetch(`${API_BASE_URL}/api/profiles/${encodeURIComponent(profile.id)}/link/status`)
+    fetch(`${API_BASE_URL}/api/profiles/${encodeURIComponent(profile.id)}/link/status`, {
+      headers: authenticatedHeaders(),
+    })
       .then((response) => (response.ok ? response.json() : null))
       .then((data) => { if (data && !cancelled) setProviderConfig(data.providers || {}) })
       .catch(() => {})
@@ -1510,7 +1517,9 @@ function ProfilePanel({ profile, historyCount, onClose, onSave, onProfileChange,
       if (data.ok) {
         setNotice(data.detail || "Conta vinculada!")
         setError("")
-        fetch(`${API_BASE_URL}/api/profiles/${encodeURIComponent(profile.id)}`)
+        fetch(`${API_BASE_URL}/api/profiles/${encodeURIComponent(profile.id)}`, {
+          headers: authenticatedHeaders(),
+        })
           .then((response) => (response.ok ? response.json() : null))
           .then((fresh) => { if (fresh) onProfileChange?.(fresh) })
           .catch(() => {})
@@ -1548,7 +1557,7 @@ function ProfilePanel({ profile, historyCount, onClose, onSave, onProfileChange,
     try {
       const response = await fetch(`${API_BASE_URL}/api/profiles/${encodeURIComponent(profile.id)}/${kind}`, {
         method: "PUT",
-        headers: { "Content-Type": "application/json" },
+        headers: authenticatedHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify(body),
       })
       const data = await response.json().catch(() => null)
@@ -1590,6 +1599,7 @@ function ProfilePanel({ profile, historyCount, onClose, onSave, onProfileChange,
     try {
       const response = await fetch(`${API_BASE_URL}/api/profiles/${encodeURIComponent(profile.id)}/link/${provider}`, {
         method: "POST",
+        headers: authenticatedHeaders(),
       })
       const data = await response.json().catch(() => null)
       if (!response.ok) {
@@ -1616,6 +1626,7 @@ function ProfilePanel({ profile, historyCount, onClose, onSave, onProfileChange,
     try {
       const response = await fetch(`${API_BASE_URL}/api/profiles/${encodeURIComponent(profile.id)}/link/${provider}`, {
         method: "DELETE",
+        headers: authenticatedHeaders(),
       })
       const data = await response.json().catch(() => null)
       if (!response.ok) {
@@ -1636,7 +1647,10 @@ function ProfilePanel({ profile, historyCount, onClose, onSave, onProfileChange,
     setError("")
     setNotice("")
     try {
-      const response = await fetch(`${API_BASE_URL}/api/profiles/${encodeURIComponent(profile.id)}/sync/${provider}`, { method: "POST" })
+      const response = await fetch(`${API_BASE_URL}/api/profiles/${encodeURIComponent(profile.id)}/sync/${provider}`, {
+        method: "POST",
+        headers: authenticatedHeaders(),
+      })
       const data = await response.json().catch(() => null)
       if (!response.ok) {
         setError((data && data.detail) || `Nao consegui sincronizar ${label}.`)
@@ -3202,7 +3216,17 @@ export default function App() {
         }
       }
 
-      // 2) Convidado: perfil anonimo local.
+      // 2) Convidado web permanece somente no navegador. Perfis anonimos no
+      // backend existem apenas para compatibilidade com o runtime desktop.
+      if (!LOCAL_CAPABILITIES_ENABLED) {
+        if (!cancelled) {
+          setFavorites(localFavorites)
+          setProfileReady(true)
+        }
+        return
+      }
+
+      // 3) Desktop: perfil anonimo local legado.
       const storedId = window.localStorage.getItem(PROFILE_STORAGE_KEY)
       let response = storedId
         ? await fetch(`${API_BASE_URL}/api/profiles/${encodeURIComponent(storedId)}`)
@@ -3245,7 +3269,7 @@ export default function App() {
     void fetch(`${API_BASE_URL}/api/profiles/${encodeURIComponent(profile.id)}/favorites`, {
       method: "PUT",
       signal: controller.signal,
-      headers: { "Content-Type": "application/json" },
+      headers: authenticatedHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ favorites }),
     })
       .then((response) => response.ok ? response.json() : null)
@@ -3429,7 +3453,9 @@ export default function App() {
     setLibraryView(view)
     setSelectedManga(null)
     if ((view === "library" || view === "favorites" || view === "history") && profile?.id) {
-      void fetch(`${API_BASE_URL}/api/profiles/${encodeURIComponent(profile.id)}`)
+      void fetch(`${API_BASE_URL}/api/profiles/${encodeURIComponent(profile.id)}`, {
+        headers: authenticatedHeaders(),
+      })
         .then((response) => response.ok ? response.json() : null)
         .then((data) => {
           if (!data) return
@@ -3555,7 +3581,7 @@ export default function App() {
     if (!profile?.id) throw new Error("profile")
     const response = await fetch(`${API_BASE_URL}/api/profiles/${encodeURIComponent(profile.id)}`, {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers: authenticatedHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ display_name: displayName }),
     })
     if (!response.ok) throw new Error("profile")
@@ -3570,7 +3596,9 @@ export default function App() {
 
   const refreshProfile = useCallback(async () => {
     if (!profile?.id) return
-    const response = await fetch(`${API_BASE_URL}/api/profiles/${encodeURIComponent(profile.id)}`)
+    const response = await fetch(`${API_BASE_URL}/api/profiles/${encodeURIComponent(profile.id)}`, {
+      headers: authenticatedHeaders(),
+    })
     if (!response.ok) return
     applyProfileChange(await response.json())
   }, [applyProfileChange, profile?.id])
@@ -3595,7 +3623,7 @@ export default function App() {
     if (!profile?.id) throw new Error("profile")
     const response = await fetch(`${API_BASE_URL}/api/profiles/${encodeURIComponent(profile.id)}/library`, {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers: authenticatedHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ item: manga, ...entry }),
     })
     const data = await response.json().catch(() => null)
@@ -3608,7 +3636,7 @@ export default function App() {
     if (!profile?.id) throw new Error("profile")
     const response = await fetch(`${API_BASE_URL}/api/profiles/${encodeURIComponent(profile.id)}/library`, {
       method: "DELETE",
-      headers: { "Content-Type": "application/json" },
+      headers: authenticatedHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ item: entry }),
     })
     const data = await response.json().catch(() => null)
