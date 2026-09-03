@@ -137,6 +137,7 @@ Ativação e diagnóstico:
 sudo systemctl daemon-reload
 sudo systemctl enable --now kari caddy
 curl https://api.DOMINIO_DO_KARI/health
+curl https://api.DOMINIO_DO_KARI/ready
 sudo journalctl -u kari -f
 ```
 

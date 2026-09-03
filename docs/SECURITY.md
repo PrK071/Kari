@@ -12,7 +12,7 @@ aprovado para exposição pública. Os bloqueadores atuais são:
 
 | Classe | Rotas |
 | --- | --- |
-| PUBLIC | `/health`, `/api/capabilities`, catálogo, busca, metadados e providers configurados |
+| PUBLIC | `/health`, `/ready`, `/api/capabilities`, catálogo, busca, metadados e providers configurados |
 | AUTHENTICATED | `/api/auth/me` e logout |
 | OWNER_ONLY | perfil, favoritos, biblioteca, mídia de perfil e integrações AniList/MyAnimeList |
 | DESKTOP ONLY | biblioteca/import/assets/delete de HQ e light novel local; fontes Sakura |
@@ -111,5 +111,10 @@ Bearer e comparar o `profile_id` com a identidade da sessão. No runtime web,
 ausência ou invalidade do token resulta em 401 e acesso cruzado resulta em 403.
 O runtime desktop preserva perfis anônimos apenas quando nenhum bearer é enviado.
 
-1. middleware de acesso com método, path normalizado, status e duração;
-2. testes de CORS, auth, IDOR, SSRF, upload e ambos os runtimes.
+Os logs de acesso incluem request ID, método, template normalizado da rota,
+status e duração. Query string, corpo, cookies e headers não são registrados;
+erros são reduzidos ao nome da classe para impedir vazamento vindo de mensagens
+de bibliotecas externas. `/health` verifica somente o processo. `/ready` testa a
+dependência de persistência e retorna apenas `ready` ou `not_ready`.
+
+1. testes de CORS, upload e ambos os runtimes.

@@ -193,6 +193,12 @@ DIRECT_IMAGE_HOSTS = {
 }
 
 logger = logging.getLogger("mangatemp")
+logger.setLevel(settings.log_level)
+
+
+def _safe_error(exc: Exception) -> str:
+    """Retorna somente a classe; mensagens externas podem conter tokens/URLs."""
+    return type(exc).__name__
 
 
 def _enforce_rate_limit(
@@ -760,7 +766,11 @@ def _refresh_chapters_source_payload(cache_key: str, source: str, lang: str) -> 
             chapters_cache[cache_key] = CacheEntry(time.time(), dict(payload))
         _save_chapters_snapshot()
     except Exception as exc:
-        logger.warning("Falha ao atualizar capitulos em background p/ %s: %s", source, exc)
+        logger.warning(
+            "Falha ao atualizar capitulos source=%s error=%s",
+            _scraper_source_name(source),
+            _safe_error(exc),
+        )
     finally:
         with _chapters_refresh_lock:
             _chapters_refreshing.discard(cache_key)
@@ -805,7 +815,10 @@ def _load_chapters_source_payload(source: str, lang: str) -> dict:
     except Exception:
         if cached is None or not isinstance(cached.data, dict) or not cached.data:
             raise
-        logger.warning("Fonte externa indisponivel p/ %s; servindo cache STALE.", source)
+        logger.warning(
+            "Fonte indisponivel source=%s; servindo cache stale",
+            _scraper_source_name(source),
+        )
         payload = dict(cached.data)
         payload["cached"] = True
         payload["stale"] = True
@@ -853,8 +866,12 @@ def _resilient_list_chapters_unbounded(
             if attempt < attempts - 1:
                 wait = CHAPTERS_BACKOFF_START * (CHAPTERS_BACKOFF_BASE ** attempt)
                 logger.warning(
-                    "list_chapters tentativa %d/%d falhou p/ %s (%s); retry em %.1fs",
-                    attempt + 1, attempts, source, exc, wait,
+                    "list_chapters tentativa=%d/%d source=%s error=%s retry_s=%.1f",
+                    attempt + 1,
+                    attempts,
+                    _scraper_source_name(source),
+                    _safe_error(exc),
+                    wait,
                 )
                 time.sleep(wait)
     raise last_exc if last_exc else RuntimeError("Falha desconhecida ao buscar capitulos.")
@@ -878,11 +895,59 @@ app = FastAPI(
     description="API REST local com fontes reais para alimentar o front-end React do MangaTemp.",
 )
 
+
+_REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def _request_id(request: Request) -> str:
+    candidate = request.headers.get("X-Request-ID", "").strip()
+    if _REQUEST_ID_PATTERN.fullmatch(candidate):
+        return candidate
+    return uuid4().hex
+
+
+def _normalized_route(request: Request) -> str:
+    route = request.scope.get("route")
+    path = getattr(route, "path", "")
+    return str(path or "<unmatched>")
+
+
+@app.middleware("http")
+async def access_log_middleware(request: Request, call_next):
+    request_id = _request_id(request)
+    request.state.request_id = request_id
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        logger.error(
+            "request id=%s method=%s route=%s status=500 duration_ms=%.1f error=%s",
+            request_id,
+            request.method,
+            _normalized_route(request),
+            elapsed_ms,
+            _safe_error(exc),
+        )
+        raise
+    response.headers["X-Request-ID"] = request_id
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    logger.info(
+        "request id=%s method=%s route=%s status=%d duration_ms=%.1f",
+        request_id,
+        request.method,
+        _normalized_route(request),
+        response.status_code,
+        elapsed_ms,
+    )
+    return response
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=list(settings.allowed_origins),
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
-    allow_headers=["Accept", "Authorization", "Content-Type"],
+    allow_headers=["Accept", "Authorization", "Content-Type", "X-Request-ID"],
+    expose_headers=["X-Request-ID"],
     allow_credentials=False,
 )
 
@@ -2388,7 +2453,11 @@ def _partner_catalog_sections(limit: int = PARTNER_CATALOG_LIMIT) -> tuple[list[
             try:
                 items, section = future.result()
             except Exception as exc:
-                logger.warning("Falha ao atualizar catalogo %s: %s", provider, exc)
+                logger.warning(
+                    "Falha ao atualizar catalogo source=%s error=%s",
+                    provider,
+                    _safe_error(exc),
+                )
                 continue
             all_items.extend(items)
             if section:
@@ -2433,12 +2502,18 @@ def _refresh_catalog_cache(limit: int = DEFAULT_LIMIT) -> None:
         try:
             partner_items, partner_sections = partner_future.result(timeout=30)
         except Exception as exc:
-            logger.warning("Falha ao atualizar catalogos parceiros; mantendo snapshot: %s", exc)
+            logger.warning(
+                "Falha ao atualizar catalogos parceiros; mantendo snapshot error=%s",
+                _safe_error(exc),
+            )
             partner_items, partner_sections = [], previous_partner_sections
         try:
             items, sections = mangadex_future.result(timeout=30)
         except Exception as exc:
-            logger.warning("MangaDex demorou; mantendo snapshot durante este ciclo: %s", exc)
+            logger.warning(
+                "MangaDex indisponivel; mantendo snapshot error=%s",
+                _safe_error(exc),
+            )
             items = previous_items
             sections = [
                 section
@@ -5126,6 +5201,14 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/ready")
+def readiness(response: Response) -> dict[str, str]:
+    if repositories.ready():
+        return {"status": "ready"}
+    response.status_code = 503
+    return {"status": "not_ready"}
+
+
 @app.post("/api/profiles")
 def create_profile(request: ProfileCreateRequest) -> dict:
     _require_desktop_capability()
@@ -5417,7 +5500,7 @@ def _refresh_mal_access_token(tokens: dict) -> tuple[str, dict]:
         response.raise_for_status()
         refreshed = response.json()
     except (requests.RequestException, ValueError) as exc:
-        logger.warning("Refresh MyAnimeList falhou: %s", exc)
+        logger.warning("Refresh MyAnimeList falhou error=%s", _safe_error(exc))
         raise HTTPException(status_code=502, detail="Nao consegui renovar acesso ao MyAnimeList.") from exc
     updated = {
         "access_token": str(refreshed.get("access_token") or ""),
@@ -5567,7 +5650,7 @@ def _fetch_anilist_manga_list(access_token: str, user_id: object) -> list[dict]:
         response.raise_for_status()
         payload = response.json()
     except (requests.RequestException, ValueError, TypeError) as exc:
-        logger.warning("Lista AniList falhou: %s", exc)
+        logger.warning("Lista AniList falhou error=%s", _safe_error(exc))
         raise HTTPException(status_code=502, detail="Nao consegui carregar lista do AniList.") from exc
     if payload.get("errors"):
         raise HTTPException(status_code=502, detail="AniList recusou consulta da lista.")
@@ -5616,7 +5699,7 @@ def _fetch_mal_manga_list(access_token: str) -> list[dict]:
         response.raise_for_status()
         payload = response.json()
     except (requests.RequestException, ValueError) as exc:
-        logger.warning("Lista MyAnimeList falhou: %s", exc)
+        logger.warning("Lista MyAnimeList falhou error=%s", _safe_error(exc))
         raise HTTPException(status_code=502, detail="Nao consegui carregar lista do MyAnimeList.") from exc
     entries: list[dict] = []
     for row in payload.get("data") or []:
@@ -5780,7 +5863,7 @@ def _resolve_external_list_items(entries: list[dict]) -> list[tuple[dict, dict]]
             try:
                 candidates = _search_mangas(query, limit=8).get("items") or []
             except Exception as exc:  # noqa: BLE001 - fonte instavel nao aborta sync inteiro
-                logger.info("Sync search falhou para %s: %s", query, exc)
+                logger.info("Sync search falhou error=%s", _safe_error(exc))
                 continue
             best = max(
                 candidates,
@@ -5951,7 +6034,7 @@ def account_link_callback(
             tokens = token_response.json()
             viewer = _fetch_mal_viewer(tokens.get("access_token", ""))
     except requests.RequestException as exc:
-        logger.warning("OAuth %s falhou: %s", provider, exc)
+        logger.warning("OAuth provider=%s falhou error=%s", provider, _safe_error(exc))
         return _oauth_html({"ok": False, "provider": provider, "detail": "Falha ao trocar o codigo por token."})
 
     link_info = {**viewer, "linked_at": time.time()}
@@ -6494,7 +6577,7 @@ def auth_discord_callback(
         user_resp.raise_for_status()
         duser = user_resp.json()
     except requests.RequestException as exc:
-        logger.warning("Discord login falhou: %s", exc)
+        logger.warning("Discord login falhou error=%s", _safe_error(exc))
         return _auth_html({"ok": False, "detail": "Falha ao autenticar com o Discord."})
 
     discord_id = str(duser.get("id") or "")
@@ -6562,7 +6645,7 @@ def auth_google_callback(
         user_resp.raise_for_status()
         google_user = user_resp.json()
     except (requests.RequestException, ValueError) as exc:
-        logger.warning("Google login falhou: %s", exc)
+        logger.warning("Google login falhou error=%s", _safe_error(exc))
         return _auth_html({"ok": False, "detail": "Falha ao autenticar com o Google."})
 
     google_id = str(google_user.get("sub") or "")

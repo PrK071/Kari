@@ -13,6 +13,7 @@ class ConfigurationError(RuntimeError):
 _ENVIRONMENTS = {"development", "production"}
 _RUNTIMES = {"desktop", "web"}
 _PERSISTENCE_BACKENDS = {"json", "postgres"}
+_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR"}
 _DEVELOPMENT_ORIGINS = (
     "http://localhost:5173",
     "http://127.0.0.1:5173",
@@ -77,6 +78,7 @@ class Settings:
     rate_limit_backend: str
     scraper_max_concurrency: int
     scraper_max_per_source: int
+    log_level: str
 
     @property
     def is_production(self) -> bool:
@@ -181,6 +183,11 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         raise ConfigurationError(
             "KARI_SCRAPER_MAX_PER_SOURCE deve estar entre 1 e o limite global."
         )
+    log_level = source.get("KARI_LOG_LEVEL", "INFO").strip().upper()
+    if log_level not in _LOG_LEVELS:
+        raise ConfigurationError(
+            "KARI_LOG_LEVEL deve ser DEBUG, INFO, WARNING ou ERROR."
+        )
 
     return Settings(
         environment=environment,
@@ -196,4 +203,5 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         rate_limit_backend=rate_limit_backend,
         scraper_max_concurrency=scraper_max_concurrency,
         scraper_max_per_source=scraper_max_per_source,
+        log_level=log_level,
     )
