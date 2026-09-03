@@ -6,7 +6,6 @@ O runtime web já desliga bibliotecas locais e Sakura, mas o backend ainda não 
 aprovado para exposição pública. Os bloqueadores atuais são:
 
 - mídia persistente de perfil ainda gravada no filesystem da VPS;
-- advisories HIGH do frontend ainda precisam de triagem/correção;
 - integração precisa ser validada contra PostgreSQL real no staging.
 
 ## Classificação atual das rotas
@@ -78,6 +77,20 @@ continuam capazes de chamar a API.
 Secrets vivem apenas no ambiente da VPS. `.env` é ignorado; `.env.example`
 contém somente nomes e placeholders. Nunca registrar senha, token, cookie,
 `Authorization`, client secret ou URL que contenha credenciais.
+
+## Dependências do frontend
+
+A triagem de `npm audit` em 3 de setembro de 2026 encontrou quatro advisories,
+todos no toolchain de build e sem processamento de entrada pública em runtime.
+Mesmo com exposição prática baixa no bundle publicado, as versões foram
+atualizadas dentro das faixas compatíveis e o audit passou sem vulnerabilidades.
+
+| Pacote | Advisory | Relação | Impacto no Kari | Correção |
+| --- | --- | --- | --- | --- |
+| `browserslist` | GHSA-c83g-rgw3-j3cx e GHSA-73wf-gq98-2v4g (HIGH) | transitivo | build; consultas e stats não vêm do usuário | 4.28.8 |
+| `nanoid` | GHSA-28wg-ghj8-5hjv e GHSA-2v37-7h3g-55p8 (HIGH) | transitivo de PostCSS | build; Kari não chama os geradores afetados | 3.3.18 |
+| `postcss` | GHSA-fxqj-rqcc-2cmp e GHSA-r28c-9q8g-f849 (HIGH agregado) | direto de desenvolvimento | build com CSS controlado pelo repositório | 8.5.28 |
+| `postcss-selector-parser` | GHSA-w9m9-85wc-3x92 (LOW) | transitivo de Tailwind | build com seletores controlados pelo repositório | 6.1.4 |
 
 ## Próximos controles
 
