@@ -57,6 +57,11 @@ estado global `/api/reader-image/{index}` retorna 404 em web e continua disponí
 apenas no desktop. Duas aberturas concorrentes são serializadas durante a coleta,
 mas seus payloads não compartilham estado após a resposta.
 
+No frontend, histórico, favoritos auxiliares e retomada do leitor usam chaves
+separadas pelo ID do perfil. O runtime web nunca importa as antigas chaves
+globais; somente o desktop faz essa leitura de compatibilidade. Assim, trocar de
+conta no mesmo navegador não reutiliza o contexto local da conta anterior.
+
 ## Regras de autenticação alvo
 
 - Toda mutação e leitura privada deve derivar o usuário da sessão, nunca confiar
@@ -138,4 +143,7 @@ erros são reduzidos ao nome da classe para impedir vazamento vindo de mensagens
 de bibliotecas externas. `/health` verifica somente o processo. `/ready` testa a
 dependência de persistência e retorna apenas `ready` ou `not_ready`.
 
-1. testes de CORS, upload e ambos os runtimes.
+Antes da exposição pública, o staging ainda precisa executar o teste de integração
+em PostgreSQL real, validar upload/leitura/exclusão no bucket real e confirmar as
+regras de egress da VPS. Esses gates operacionais não podem ser simulados apenas
+pelos adaptadores usados na suíte local.

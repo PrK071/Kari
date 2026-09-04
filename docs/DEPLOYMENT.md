@@ -23,7 +23,8 @@ então um rewrite de SPA e um teste de refresh de rota.
 
 ## Backend na VPS
 
-Exemplo de instalação em Ubuntu:
+Exemplo de instalação em Ubuntu (use Caddy 2.10 ou posterior para o limite de
+corpo documentado abaixo):
 
 ```bash
 sudo apt update
@@ -51,7 +52,17 @@ DATABASE_URL=postgresql+psycopg://USUARIO:SENHA@HOST:5432/kari
 KARI_SECRET_KEY=GERAR_FORA_DO_GIT_COM_PELO_MENOS_32_CARACTERES
 KARI_SESSION_TTL_HOURS=720
 KARI_RATE_LIMIT_BACKEND=memory
-KARI_STORAGE_BACKEND=filesystem
+KARI_SCRAPER_MAX_CONCURRENCY=12
+KARI_SCRAPER_MAX_PER_SOURCE=2
+KARI_BACKGROUND_MAX_CONCURRENCY=4
+KARI_LOG_LEVEL=INFO
+KARI_STORAGE_BACKEND=object_storage
+KARI_OBJECT_STORAGE_BUCKET=NOME_DO_BUCKET
+KARI_OBJECT_STORAGE_ENDPOINT=https://NAMESPACE.compat.objectstorage.REGIAO.oraclecloud.com
+KARI_OBJECT_STORAGE_REGION=REGIAO
+KARI_OBJECT_STORAGE_ACCESS_KEY_ID=CHAVE_FORA_DO_GIT
+KARI_OBJECT_STORAGE_SECRET_ACCESS_KEY=SEGREDO_FORA_DO_GIT
+KARI_OBJECT_STORAGE_PUBLIC_BASE_URL=https://ORIGEM_PUBLICA_DA_MIDIA
 ```
 
 Crie o schema explicitamente antes de iniciar a API. O startup não executa DDL:
@@ -148,15 +159,23 @@ Proxy `/etc/caddy/Caddyfile`:
 
 ```caddyfile
 api.DOMINIO_DO_KARI {
+    request_body {
+        max_size 96MB
+    }
     reverse_proxy 127.0.0.1:8000
 }
 ```
+
+O limite de corpo no proxy interrompe uploads abusivos antes de o FastAPI
+materializar o JSON/base64. Os validadores da aplicação continuam impondo os
+limites menores específicos de cada tipo de mídia.
 
 Ativação e diagnóstico:
 
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now kari caddy
+caddy version
 curl https://api.DOMINIO_DO_KARI/health
 curl https://api.DOMINIO_DO_KARI/ready
 sudo journalctl -u kari -f
@@ -172,15 +191,25 @@ Caches não entram no backup. Registre o commit atual, instale dependências e
 reinicie somente depois dos testes:
 
 ```bash
+install -d -m 0700 /var/backups/kari/postgres
+pg_dump --format=custom --file=/var/backups/kari/postgres/kari-AAAA-MM-DD.dump kari
+# Habilite versionamento/retencao no bucket e valide periodicamente a restauracao.
+
 cd /opt/kari/app
 git fetch origin
 git checkout COMMIT_TESTADO
 /opt/kari/venv/bin/pip install -r requirements.txt
-/opt/kari/venv/bin/python -m unittest discover -s tests -v
+/opt/kari/venv/bin/python -m pytest -q
+(cd frontend && npm ci && npm test && npm run build)
 sudo systemctl restart kari
 ```
+
+Configure a conexão do `pg_dump` por `.pgpass` (modo `0600`) ou variáveis libpq;
+não coloque a senha na linha de comando nem nos logs.
 
 Para rollback, faça checkout do commit anterior, execute o downgrade de schema
 correspondente quando existir, reinstale dependências e reinicie. Restaure banco
 ou Object Storage somente em caso de migração de dados incompatível e após
-confirmar o alvo do backup.
+confirmar o alvo do backup. Antes da primeira publicação, restaure uma cópia em
+um banco isolado e confirme contagens e integridade; backup nunca testado não é
+um plano de recuperação.

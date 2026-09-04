@@ -60,6 +60,10 @@ A implementação PostgreSQL deve entrar nesta ordem:
 4. favoritos e biblioteca;
 5. histórico sincronizado.
 
+Os quatro primeiros grupos já possuem persistência PostgreSQL. O histórico
+continua local ao navegador, mas é separado por perfil; sincronização entre
+dispositivos permanece uma evolução posterior e não usa filesystem da VPS.
+
 IDs devem ser estáveis, timestamps em UTC e relações protegidas por chaves
 estrangeiras. Migrações de schema precisam de upgrade e downgrade testados. Os
 arquivos `catalog.json`, `chapters.json` e capas baixadas são caches
