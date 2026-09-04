@@ -92,6 +92,30 @@ class ProfileAuthorizationTests(unittest.TestCase):
                 )
                 self.assertEqual(response.status_code, 403, response.text)
 
+        reverse = self.client.get(
+            f"/api/profiles/{self.alice['profile']['id']}",
+            headers=self._bearer(self.bob["token"]),
+        )
+        self.assertEqual(reverse.status_code, 403, reverse.text)
+
+    def test_owner_can_update_own_private_collections(self) -> None:
+        profile_id = self.alice["profile"]["id"]
+        headers = self._bearer(self.alice["token"])
+        favorite = {"id": "manga-1", "title": "Owned favorite"}
+
+        updated = self.client.put(
+            f"/api/profiles/{profile_id}/favorites",
+            headers=headers,
+            json={"favorites": [favorite]},
+        )
+
+        self.assertEqual(updated.status_code, 200, updated.text)
+        loaded = self.client.get(f"/api/profiles/{profile_id}", headers=headers)
+        self.assertEqual(loaded.status_code, 200)
+        self.assertEqual(len(loaded.json()["favorites"]), 1)
+        self.assertEqual(loaded.json()["favorites"][0]["id"], favorite["id"])
+        self.assertEqual(loaded.json()["favorites"][0]["title"], favorite["title"])
+
     def test_missing_and_invalid_tokens_are_rejected(self) -> None:
         path = f"/api/profiles/{self.alice['profile']['id']}"
         self.assertEqual(self.client.get(path).status_code, 401)
