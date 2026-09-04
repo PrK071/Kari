@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query"
 import { FixedSizeGrid as Grid } from "react-window"
 import { ArrowUpDown, BookOpen, BookText, Camera, ExternalLink, FileArchive, Grid2X2, Heart, History, Home, ImagePlus, LibraryBig, Link2, Loader2, PanelLeftClose, PanelLeftOpen, Puzzle, Search, Trash2, Unlink, Upload, UserRound, X } from "lucide-react"
 import MangaCard, { MangaCardSkeleton } from "./components/MangaCard.jsx"
+import { scopedStorageKey } from "./profileStorage.js"
 
 const API_BASE_URL = import.meta.env.VITE_DESKTOP_BUILD === "1"
   ? window.location.origin
@@ -922,9 +923,12 @@ const LOCAL_LIBRARY_CONFIG = {
   },
 }
 
-function readReaderSession() {
+function readReaderSession(profileId, allowLegacy = false) {
   try {
-    const value = JSON.parse(window.localStorage.getItem(READER_SESSION_STORAGE_KEY) || "null")
+    const key = scopedStorageKey(READER_SESSION_STORAGE_KEY, profileId)
+    const rawValue = window.localStorage.getItem(key)
+      ?? (allowLegacy ? window.localStorage.getItem(READER_SESSION_STORAGE_KEY) : null)
+    const value = JSON.parse(rawValue || "null")
     if (!value?.manga || !mangaStorageKey(value.manga) || !value.chapter_url) return null
     return value
   } catch {
@@ -932,8 +936,8 @@ function readReaderSession() {
   }
 }
 
-function clearReaderSession() {
-  window.localStorage.removeItem(READER_SESSION_STORAGE_KEY)
+function clearReaderSession(profileId) {
+  window.localStorage.removeItem(scopedStorageKey(READER_SESSION_STORAGE_KEY, profileId))
 }
 
 function chapterTextBlocks(content) {
@@ -1986,7 +1990,7 @@ function ProfilePanel({ profile, historyCount, onClose, onSave, onProfileChange,
   )
 }
 
-function MangaDetailPanel({ manga, onClose, onGenreSelect, isFavorite, onToggleFavorite, onRead, libraryEntry, onSaveLibrary, onDeleteLibrary }) {
+function MangaDetailPanel({ manga, storageScope, onClose, onGenreSelect, isFavorite, onToggleFavorite, onRead, libraryEntry, onSaveLibrary, onDeleteLibrary }) {
   const [chapters, setChapters] = useState([])
   const [loadingChapters, setLoadingChapters] = useState(false)
   const [showChaptersLoader, setShowChaptersLoader] = useState(false)
@@ -2215,7 +2219,7 @@ function MangaDetailPanel({ manga, onClose, onGenreSelect, isFavorite, onToggleF
       return
     }
     try {
-      window.localStorage.setItem(READER_SESSION_STORAGE_KEY, JSON.stringify({
+      window.localStorage.setItem(scopedStorageKey(READER_SESSION_STORAGE_KEY, storageScope), JSON.stringify({
         manga,
         manga_key: mangaStorageKey(manga),
         chapter_url: chapter.url,
@@ -2257,10 +2261,10 @@ function MangaDetailPanel({ manga, onClose, onGenreSelect, isFavorite, onToggleF
     } finally {
       setLoadingChapter(false)
     }
-  }, [chapterLang, manga, onRead])
+  }, [chapterLang, manga, onRead, storageScope])
 
   useEffect(() => {
-    const session = readReaderSession()
+    const session = readReaderSession(storageScope)
     if (!session || session.manga_key !== mangaStorageKey(manga)) return
     if (session.chapter_lang && session.chapter_lang !== chapterLang) {
       setChapterLang(session.chapter_lang)
@@ -2270,7 +2274,7 @@ function MangaDetailPanel({ manga, onClose, onGenreSelect, isFavorite, onToggleF
     if (restoredReaderKey.current === restoreKey) return
     restoredReaderKey.current = restoreKey
     void openChapter({ url: session.chapter_url })
-  }, [chapterLang, manga, openChapter])
+  }, [chapterLang, manga, openChapter, storageScope])
 
   const openAuthor = useCallback(async (name) => {
     const cleanName = authorName(name)
@@ -2323,12 +2327,12 @@ function MangaDetailPanel({ manga, onClose, onGenreSelect, isFavorite, onToggleF
 
   const closeReader = useCallback(() => {
     // Fecha so leitor fullscreen. Painel da obra continua aberto com capitulos.
-    clearReaderSession()
+    clearReaderSession(storageScope)
     setOpenedChapter(null)
     setLoadingChapter(false)
     setFirstChapterPageLoaded(false)
     setOpenChapterError("")
-  }, [])
+  }, [storageScope])
 
   useEffect(() => {
     if (!openedChapter) return undefined
@@ -3087,14 +3091,14 @@ function AuthPanel({ onClose, onSubmit }) {
 export default function App() {
   const [query, setQuery] = useState("")
   const [debouncedQuery, setDebouncedQuery] = useState("")
-  const [selectedManga, setSelectedManga] = useState(() => readReaderSession()?.manga ?? null)
+  const [selectedManga, setSelectedManga] = useState(null)
   const [catalogView, setCatalogView] = useState(false)
   const [libraryView, setLibraryView] = useState("")
   const [genreFilter, setGenreFilter] = useState("")
   const [catalogOffset, setCatalogOffset] = useState(0)
   const [catalogPages, setCatalogPages] = useState([])
-  const [favorites, setFavorites] = useState(() => readStoredMangaList(FAVORITES_STORAGE_KEY))
-  const [history, setHistory] = useState(() => readStoredMangaList(HISTORY_STORAGE_KEY))
+  const [favorites, setFavorites] = useState([])
+  const [history, setHistory] = useState([])
   const [historyChapterUpdates, setHistoryChapterUpdates] = useState({})
   const [profile, setProfile] = useState(null)
   const [profileReady, setProfileReady] = useState(false)
@@ -3104,6 +3108,7 @@ export default function App() {
   const [headerHidden, setHeaderHidden] = useState(false)
   const [authToken, setAuthToken] = useState(() => window.localStorage.getItem(AUTH_TOKEN_KEY) || "")
   const [authOpen, setAuthOpen] = useState(false)
+  const [storageScope, setStorageScope] = useState("")
   const authed = Boolean(authToken)
 
   const headerHideTimer = useRef(null)
@@ -3178,13 +3183,34 @@ export default function App() {
   }, [selectedManga])
   const profileBootstrapStarted = useRef(false)
 
-  useEffect(() => {
-    window.localStorage.setItem(FAVORITES_STORAGE_KEY, JSON.stringify(favorites))
-  }, [favorites])
+  const activateBrowserState = useCallback((scope, profileFavorites, allowLegacy = false) => {
+    const favoritesKey = scopedStorageKey(FAVORITES_STORAGE_KEY, scope)
+    const historyKey = scopedStorageKey(HISTORY_STORAGE_KEY, scope)
+    const scopedFavorites = readStoredMangaList(favoritesKey)
+    const scopedHistory = readStoredMangaList(historyKey)
+    const legacyFavorites = allowLegacy && window.localStorage.getItem(favoritesKey) === null
+      ? readStoredMangaList(FAVORITES_STORAGE_KEY)
+      : []
+    const legacyHistory = allowLegacy && window.localStorage.getItem(historyKey) === null
+      ? readStoredMangaList(HISTORY_STORAGE_KEY)
+      : []
+    const readerSession = readReaderSession(scope, allowLegacy)
+
+    setFavorites(Array.isArray(profileFavorites) ? profileFavorites : (scopedFavorites.length ? scopedFavorites : legacyFavorites))
+    setHistory(scopedHistory.length ? scopedHistory : legacyHistory)
+    setSelectedManga(readerSession?.manga ?? null)
+    setStorageScope(scope || "guest")
+  }, [])
 
   useEffect(() => {
-    window.localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(history))
-  }, [history])
+    if (!storageScope) return
+    window.localStorage.setItem(scopedStorageKey(FAVORITES_STORAGE_KEY, storageScope), JSON.stringify(favorites))
+  }, [favorites, storageScope])
+
+  useEffect(() => {
+    if (!storageScope) return
+    window.localStorage.setItem(scopedStorageKey(HISTORY_STORAGE_KEY, storageScope), JSON.stringify(history))
+  }, [history, storageScope])
 
   useEffect(() => {
     if (profileBootstrapStarted.current) return undefined
@@ -3192,8 +3218,6 @@ export default function App() {
     let cancelled = false
 
     const bootstrap = async () => {
-      const localFavorites = readStoredMangaList(FAVORITES_STORAGE_KEY)
-
       // 1) Conta logada: usa o perfil da conta (token Bearer).
       const token = window.localStorage.getItem(AUTH_TOKEN_KEY) || ""
       if (token) {
@@ -3204,7 +3228,7 @@ export default function App() {
           if (meResp.ok) {
             const me = await meResp.json()
             if (cancelled) return
-            setFavorites(me.profile.favorites ?? [])
+            activateBrowserState(me.profile.id, me.profile.favorites ?? [])
             setProfile(me.profile)
             setProfileReady(true)
             return
@@ -3213,6 +3237,7 @@ export default function App() {
           if (!cancelled) setAuthToken("")
         } catch {
           window.localStorage.removeItem(AUTH_TOKEN_KEY)
+          if (!cancelled) setAuthToken("")
         }
       }
 
@@ -3220,7 +3245,7 @@ export default function App() {
       // backend existem apenas para compatibilidade com o runtime desktop.
       if (!LOCAL_CAPABILITIES_ENABLED) {
         if (!cancelled) {
-          setFavorites(localFavorites)
+          activateBrowserState("guest")
           setProfileReady(true)
         }
         return
@@ -3242,7 +3267,12 @@ export default function App() {
       let data = await response.json()
       window.localStorage.setItem(PROFILE_STORAGE_KEY, data.id)
 
-      const mergedFavorites = mergeMangaLists(data.favorites, localFavorites)
+      const favoritesKey = scopedStorageKey(FAVORITES_STORAGE_KEY, data.id)
+      const localFavorites = readStoredMangaList(favoritesKey)
+      const legacyFavorites = window.localStorage.getItem(favoritesKey) === null
+        ? readStoredMangaList(FAVORITES_STORAGE_KEY)
+        : []
+      const mergedFavorites = mergeMangaLists(data.favorites, localFavorites, legacyFavorites)
       if (mergedFavorites.length !== (data.favorites ?? []).length) {
         const sync = await fetch(`${API_BASE_URL}/api/profiles/${encodeURIComponent(data.id)}/favorites`, {
           method: "PUT",
@@ -3252,7 +3282,7 @@ export default function App() {
         if (sync.ok) data = await sync.json()
       }
       if (cancelled) return
-      setFavorites(mergedFavorites)
+      activateBrowserState(data.id, mergedFavorites, true)
       setProfile(data)
       setProfileReady(true)
     }
@@ -3261,7 +3291,7 @@ export default function App() {
       if (!cancelled) setProfileReady(true)
     })
     return () => { cancelled = true }
-  }, [])
+  }, [activateBrowserState])
 
   useEffect(() => {
     if (!profileReady || !profile?.id) return undefined
@@ -3402,7 +3432,7 @@ export default function App() {
   }, [catalogQuery.isPlaceholderData, pagedCatalog, payload, requestOffset])
 
   const handleHome = useCallback(() => {
-    clearReaderSession()
+    clearReaderSession(storageScope)
     setQuery("")
     setDebouncedQuery("")
     setCatalogView(false)
@@ -3411,7 +3441,7 @@ export default function App() {
     setGenreFilter("")
     setSelectedManga(null)
     window.scrollTo({ top: 0, behavior: "smooth" })
-  }, [])
+  }, [storageScope])
 
   const handleCatalog = useCallback(() => {
     setQuery("")
@@ -3530,9 +3560,9 @@ export default function App() {
     window.localStorage.setItem(AUTH_TOKEN_KEY, data.token)
     setAuthToken(data.token)
     setProfile(data.profile)
-    setFavorites(data.profile.favorites ?? [])
+    activateBrowserState(data.profile.id, data.profile.favorites ?? [])
     setAuthOpen(false)
-  }, [])
+  }, [activateBrowserState])
 
   const handleLogout = useCallback(() => {
     const token = window.localStorage.getItem(AUTH_TOKEN_KEY)
@@ -3559,13 +3589,13 @@ export default function App() {
       if (resp.ok) {
         const me = await resp.json()
         setProfile(me.profile)
-        setFavorites(me.profile.favorites ?? [])
+        activateBrowserState(me.profile.id, me.profile.favorites ?? [])
       }
     } catch {
       /* ignore */
     }
     setAuthOpen(false)
-  }, [])
+  }, [activateBrowserState])
 
   useEffect(() => {
     const onMessage = (event) => {
@@ -3650,11 +3680,11 @@ export default function App() {
   ))
 
   const handleDetailClose = useCallback(() => {
-    clearReaderSession()
+    clearReaderSession(storageScope)
     setSelectedManga(null)
     void refreshProfile()
     void catalogQuery.refetch()
-  }, [catalogQuery, refreshProfile])
+  }, [catalogQuery, refreshProfile, storageScope])
 
   const homeBackground = profile?.home_background_url
     ? resolveApiUrl(profile.home_background_url)
@@ -3766,6 +3796,7 @@ export default function App() {
       )}
       <MangaDetailPanel
         manga={selectedManga}
+        storageScope={storageScope}
         onClose={handleDetailClose}
         onGenreSelect={handleGenreSelect}
         isFavorite={selectedIsFavorite}
