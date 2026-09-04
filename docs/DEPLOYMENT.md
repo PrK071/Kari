@@ -90,6 +90,12 @@ Confirme que `users_migrated`, `profiles_migrated` e `sessions_migrated`
 correspondem às respectivas contagens `*_found` e que `errors` está vazio antes
 de trocar o serviço para `KARI_PERSISTENCE_BACKEND=postgres`.
 
+No staging, configure um banco PostgreSQL descartável em
+`KARI_TEST_POSTGRES_URL` e execute `python -m pytest -q`. O teste cria um schema
+com nome aleatório, valida profiles/users/sessions no adaptador real e remove
+esse schema no final. Sem a variável, o gate é marcado como ignorado; isso não
+constitui validação de PostgreSQL.
+
 O filesystem ainda não deve ser tratado como storage persistente multiusuário
 para avatares e backgrounds; essa migração permanece separada do banco.
 
