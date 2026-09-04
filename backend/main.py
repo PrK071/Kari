@@ -160,7 +160,7 @@ CHAPTERS_DISK_TTL_SECONDS = 24 * 60 * 60
 CHAPTERS_CACHE_VERSION = 6
 CHAPTERS_SNAPSHOT_PATH = KARI_DATA_DIR / "chapters.json"
 PROFILES_STORE_PATH = KARI_DATA_DIR / "profiles.json"
-# Contas de usuario (cadastro/login) e sessoes. Local, senha com PBKDF2.
+# Contas e sessoes; Argon2id novo, com verificacao/rehash de PBKDF2 legado.
 USERS_STORE_PATH = KARI_DATA_DIR / "users.json"
 AUTH_TOKENS_PATH = KARI_DATA_DIR / "tokens.json"
 PBKDF2_ITERATIONS = 200_000

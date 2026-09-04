@@ -42,6 +42,11 @@ esperas por capacidade têm timeout. Os valores podem ser reduzidos por
 ou usuário continua sendo aplicado antes desse coordenador pelas políticas
 acima.
 
+O fan-out das buscas públicas também usa um único `BoundedExecutor` compartilhado:
+no máximo `KARI_SCRAPER_MAX_CONCURRENCY` threads e o dobro desse valor entre
+trabalhos ativos e pendentes. Ao atingir a capacidade, novas fontes falham de
+forma controlada em vez de cada requisição criar outro pool de threads.
+
 Refresh de catálogo/capítulos, resolução de fonte e auditoria da home usam a
 abstração `BackgroundTaskRunner`: quatro threads daemon no máximo, sem fila
 ilimitada e com deduplicação por chave. Saturação mantém cache existente e não
