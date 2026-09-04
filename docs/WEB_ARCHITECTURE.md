@@ -65,10 +65,13 @@ estrangeiras. Migrações de schema precisam de upgrade e downgrade testados. Os
 arquivos `catalog.json`, `chapters.json` e capas baixadas são caches
 reconstruíveis e não precisam ir para PostgreSQL.
 
-Avatar e backgrounds são dados persistentes. Antes de produção pública, o acesso
-a eles deve passar por uma interface de storage com implementações filesystem
-(local) e Object Storage. HQs e novels importadas pelo usuário continuam locais
-enquanto a capability web estiver desligada.
+Avatar e backgrounds passam por `ProfileMediaStorage`. Desktop usa filesystem.
+No runtime web, `filesystem` é deliberadamente somente leitura para mídia de
+perfil: uploads retornam 503 e arquivos legados em `/static/profiles` não são
+servidos. Para habilitar upload web, configure o adaptador S3 compatível com
+Oracle Object Storage e uma base pública HTTPS; bytes nunca são gravados na VPS.
+HQs e novels importadas pelo usuário continuam locais enquanto a capability web
+estiver desligada.
 
 ## Restrições conhecidas
 
@@ -76,5 +79,5 @@ O runtime web usa capítulos autocontidos e descarta o estado mutável depois de
 montar cada resposta. Fontes que dependem de arquivos/cache corrente são
 rejeitadas em web e continuam no desktop. Scrapers possuem limites globais e por
 fonte, além de deduplicação das chamadas idênticas em voo. O backend ainda não
-deve ser publicado antes de resolver mídia persistente e concluir os demais
-gates de `SECURITY.md`.
+deve ser publicado antes de validar PostgreSQL e Object Storage reais no staging
+e concluir os demais gates de `SECURITY.md`.

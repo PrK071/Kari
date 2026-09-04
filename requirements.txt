@@ -16,4 +16,5 @@ SQLAlchemy>=2.0.43,<3
 alembic>=1.16.5,<2
 psycopg[binary]>=3.2.9,<4
 cryptography>=45.0.7,<50
+boto3>=1.40.0,<2
 argon2-cffi>=25.1.0,<26

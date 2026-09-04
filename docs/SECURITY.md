@@ -5,7 +5,6 @@
 O runtime web já desliga bibliotecas locais e Sakura, mas o backend ainda não está
 aprovado para exposição pública. Os bloqueadores atuais são:
 
-- mídia persistente de perfil ainda gravada no filesystem da VPS;
 - integração precisa ser validada contra PostgreSQL real no staging.
 
 ## Classificação atual das rotas
@@ -77,6 +76,13 @@ continuam capazes de chamar a API.
 Secrets vivem apenas no ambiente da VPS. `.env` é ignorado; `.env.example`
 contém somente nomes e placeholders. Nunca registrar senha, token, cookie,
 `Authorization`, client secret ou URL que contenha credenciais.
+
+Uploads de perfil no runtime web somente são aceitos com
+`KARI_STORAGE_BACKEND=object_storage`. O adaptador usa chaves confinadas a
+`profiles/<profile_id>/<kind>.<ext>`, valida todos os componentes e envia os
+bytes diretamente ao endpoint S3 compatível. Com `filesystem`, upload retorna
+503 e `/static/profiles` retorna 404 em web; o comportamento local continua
+disponível no desktop.
 
 ## Dependências do frontend
 

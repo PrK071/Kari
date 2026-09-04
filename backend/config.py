@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Mapping
 from urllib.parse import urlparse
 
@@ -40,6 +40,18 @@ def _http_url(name: str, value: str, *, require_https: bool) -> str:
     return normalized
 
 
+def _public_asset_url(name: str, value: str, *, require_https: bool) -> str:
+    normalized = value.strip().rstrip("/")
+    parsed = urlparse(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ConfigurationError(f"{name} deve ser uma URL http(s) absoluta.")
+    if require_https and parsed.scheme != "https":
+        raise ConfigurationError(f"{name} deve usar HTTPS em producao.")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ConfigurationError(f"{name} nao aceita credenciais, query ou fragmento.")
+    return normalized
+
+
 def _allowed_origins(raw: str, *, production: bool) -> tuple[str, ...]:
     values = [value.strip() for value in raw.split(",") if value.strip()]
     if not values:
@@ -70,10 +82,16 @@ class Settings:
     backend_url: str
     frontend_url: str
     allowed_origins: tuple[str, ...]
-    database_url: str
+    database_url: str = field(repr=False)
     persistence_backend: str
     storage_backend: str
-    secret_key: str
+    object_storage_bucket: str
+    object_storage_endpoint: str
+    object_storage_region: str
+    object_storage_access_key_id: str = field(repr=False)
+    object_storage_secret_access_key: str = field(repr=False)
+    object_storage_public_base_url: str
+    secret_key: str = field(repr=False)
     session_ttl_seconds: int
     rate_limit_backend: str
     scraper_max_concurrency: int
@@ -142,6 +160,38 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         raise ConfigurationError(
             "KARI_STORAGE_BACKEND deve ser filesystem ou object_storage."
         )
+    object_storage_bucket = source.get("KARI_OBJECT_STORAGE_BUCKET", "").strip()
+    object_storage_endpoint_raw = source.get("KARI_OBJECT_STORAGE_ENDPOINT", "").strip()
+    object_storage_region = source.get("KARI_OBJECT_STORAGE_REGION", "").strip()
+    object_storage_access_key_id = source.get("KARI_OBJECT_STORAGE_ACCESS_KEY_ID", "").strip()
+    object_storage_secret_access_key = source.get("KARI_OBJECT_STORAGE_SECRET_ACCESS_KEY", "").strip()
+    object_storage_public_base_raw = source.get("KARI_OBJECT_STORAGE_PUBLIC_BASE_URL", "").strip()
+    object_storage_endpoint = ""
+    object_storage_public_base_url = ""
+    if storage_backend == "object_storage":
+        required = {
+            "KARI_OBJECT_STORAGE_BUCKET": object_storage_bucket,
+            "KARI_OBJECT_STORAGE_ENDPOINT": object_storage_endpoint_raw,
+            "KARI_OBJECT_STORAGE_REGION": object_storage_region,
+            "KARI_OBJECT_STORAGE_ACCESS_KEY_ID": object_storage_access_key_id,
+            "KARI_OBJECT_STORAGE_SECRET_ACCESS_KEY": object_storage_secret_access_key,
+            "KARI_OBJECT_STORAGE_PUBLIC_BASE_URL": object_storage_public_base_raw,
+        }
+        missing = [name for name, value in required.items() if not value]
+        if missing:
+            raise ConfigurationError(
+                "Configuracao de Object Storage incompleta: " + ", ".join(missing)
+            )
+        object_storage_endpoint = _http_url(
+            "KARI_OBJECT_STORAGE_ENDPOINT",
+            object_storage_endpoint_raw,
+            require_https=production,
+        )
+        object_storage_public_base_url = _public_asset_url(
+            "KARI_OBJECT_STORAGE_PUBLIC_BASE_URL",
+            object_storage_public_base_raw,
+            require_https=production,
+        )
 
     persistence_default = "postgres" if production else "json"
     persistence_backend = _choice(
@@ -198,6 +248,12 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         database_url=database_url,
         persistence_backend=persistence_backend,
         storage_backend=storage_backend,
+        object_storage_bucket=object_storage_bucket,
+        object_storage_endpoint=object_storage_endpoint,
+        object_storage_region=object_storage_region,
+        object_storage_access_key_id=object_storage_access_key_id,
+        object_storage_secret_access_key=object_storage_secret_access_key,
+        object_storage_public_base_url=object_storage_public_base_url,
         secret_key=secret_key,
         session_ttl_seconds=session_ttl_hours * 60 * 60,
         rate_limit_backend=rate_limit_backend,

@@ -123,6 +123,13 @@ limites independentes. Antes de escalar horizontalmente, implemente um
 `RateLimitBackend` e um coordenador de trabalho compartilhados e execute os
 testes de políticas contra eles.
 
+Para uploads de avatar/background, use um bucket dedicado compatível com S3 e
+configure `KARI_STORAGE_BACKEND=object_storage` mais as seis variáveis
+`KARI_OBJECT_STORAGE_*` do `.env.example`. `KARI_OBJECT_STORAGE_PUBLIC_BASE_URL`
+deve apontar para a origem pública HTTPS do bucket/CDN. Restrinja a credencial do
+serviço a listar, criar e excluir objetos somente nesse bucket. Se o backend
+continuar em `filesystem`, uploads web permanecem indisponíveis por segurança.
+
 Proxy `/etc/caddy/Caddyfile`:
 
 ```caddyfile

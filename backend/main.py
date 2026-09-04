@@ -37,6 +37,7 @@ from pydantic import BaseModel, Field
 
 from backend.config import load_settings
 from backend.concurrency import BoundedWorkCoordinator
+from backend.media_storage import MediaStorageUnavailable, build_profile_media_storage
 from backend.network_security import UnsafeRemoteURLError, validate_public_http_url
 from backend.rate_limit import MemoryRateLimitBackend, RateLimiter, RateLimitPolicy
 from backend.persistence import (
@@ -250,10 +251,8 @@ STATIC_DIR = Path(
 COVERS_DIR = STATIC_DIR / "covers"
 COVERS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Imagens de perfil (avatar/background) enviadas pelo usuario ficam salvas
-# localmente em static/profiles/<profile_id>/ e servidas por /static/profiles/...
-PROFILE_MEDIA_DIR = STATIC_DIR / "profiles"
-PROFILE_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+# Desktop usa filesystem; web desabilita uploads locais ou usa Object Storage.
+profile_media_storage = build_profile_media_storage(settings, STATIC_DIR)
 
 # Backgrounds pre-definidos (o leitor escolhe). Qualquer imagem/video colocado
 # em static/backgrounds/ aparece automaticamente no seletor do perfil.
@@ -956,6 +955,11 @@ app.add_middleware(
 # revalida (immutable). Como o nome do arquivo e estavel por manga_id, isso e
 # seguro; se um dia precisar trocar a capa de um id, versione o nome do arquivo.
 class CachedStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope):
+        if settings.is_web and (path == "profiles" or path.startswith("profiles/")):
+            return Response(status_code=404)
+        return await super().get_response(path, scope)
+
     def file_response(self, *args, **kwargs):
         response = super().file_response(*args, **kwargs)
         response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
@@ -1084,29 +1088,29 @@ def _save_profile_video(profile_id: str, kind: str, blob: bytes, mime: str) -> s
         raise HTTPException(status_code=413, detail=f"Video excede {PROFILE_VIDEO_MAX_BYTES // (1024 * 1024)}MB.")
     is_webm = "webm" in mime or blob[:4] == b"\x1a\x45\xdf\xa3"
     suffix = ".webm" if is_webm else ".mp4"
-    directory = PROFILE_MEDIA_DIR / profile_id
-    directory.mkdir(parents=True, exist_ok=True)
-    _clear_profile_image_files(profile_id, kind)
-    target = directory / f"{kind}{suffix}"
-    target.write_bytes(blob)
-    rel = target.relative_to(STATIC_DIR).as_posix()
-    return f"/static/{rel}?v={int(time.time())}"
+    content_type = "video/webm" if is_webm else "video/mp4"
+    try:
+        url = profile_media_storage.replace(
+            profile_id,
+            kind,
+            suffix,
+            blob,
+            content_type,
+        )
+    except (MediaStorageUnavailable, OSError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return f"{url}?v={int(time.time())}"
 
 
 def _clear_profile_image_files(profile_id: str, kind: str) -> None:
-    directory = PROFILE_MEDIA_DIR / profile_id
-    if not directory.exists():
-        return
-    for existing in directory.glob(f"{kind}.*"):
-        try:
-            existing.unlink()
-        except OSError:
-            pass
+    try:
+        profile_media_storage.delete(profile_id, kind)
+    except (MediaStorageUnavailable, OSError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 def _save_profile_image(profile_id: str, kind: str, blob: bytes) -> str:
-    """Valida (Pillow), redimensiona se preciso e salva localmente.
-    Retorna a URL /static/... (com cache-buster) para o frontend."""
+    """Valida, normaliza e persiste uma imagem no backend configurado."""
     if Image is None:
         raise HTTPException(status_code=503, detail="Pillow indisponivel no servidor.")
     max_bytes, max_dim = _PROFILE_IMAGE_KIND[kind]
@@ -1123,14 +1127,11 @@ def _save_profile_image(profile_id: str, kind: str, blob: bytes) -> str:
 
     image_format = (image.format or "").upper()
     is_animated = getattr(image, "is_animated", False)
-    directory = PROFILE_MEDIA_DIR / profile_id
-    directory.mkdir(parents=True, exist_ok=True)
-    _clear_profile_image_files(profile_id, kind)
 
     # GIF animado: preserva os bytes originais (nao reamostra os frames).
     if image_format == "GIF" and is_animated:
-        target = directory / f"{kind}.gif"
-        target.write_bytes(blob)
+        suffix = ".gif"
+        output = blob
     else:
         if max(image.size) > max_dim:
             image.thumbnail((max_dim, max_dim), Image.LANCZOS)
@@ -1140,17 +1141,33 @@ def _save_profile_image(profile_id: str, kind: str, blob: bytes) -> str:
         else:
             image = image.convert("RGB")
             out_format, suffix = "JPEG", ".jpg"
-        target = directory / f"{kind}{suffix}"
         if out_format == "JPEG":
             # Background em tela cheia sofre com recompressao: qualidade alta.
             quality = 95 if kind in ("background", "home_background") else 90
             save_kwargs = {"quality": quality, "subsampling": 0, "optimize": True}
         else:
             save_kwargs = {"optimize": True}
-        image.save(target, out_format, **save_kwargs)
+        buffer = io.BytesIO()
+        image.save(buffer, out_format, **save_kwargs)
+        output = buffer.getvalue()
 
-    rel = target.relative_to(STATIC_DIR).as_posix()
-    return f"/static/{rel}?v={int(time.time())}"
+    content_type = {
+        ".jpg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+    }[suffix]
+    try:
+        url = profile_media_storage.replace(
+            profile_id,
+            kind,
+            suffix,
+            output,
+            content_type,
+        )
+    except (MediaStorageUnavailable, OSError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return f"{url}?v={int(time.time())}"
 
 
 def _apply_profile_image(profile: dict, kind: str, request: "ProfileImageRequest") -> str:
@@ -1161,6 +1178,11 @@ def _apply_profile_image(profile: dict, kind: str, request: "ProfileImageRequest
     url = (request.url or "").strip()
 
     if data:
+        if not profile_media_storage.writable:
+            raise HTTPException(
+                status_code=503,
+                detail="Uploads web exigem Object Storage configurado.",
+            )
         mime = _data_uri_mime(data)
         blob = _decode_data_uri(data)
         # Background animado (mp4/webm) so p/ backgrounds, nao p/ avatar.
@@ -1170,6 +1192,13 @@ def _apply_profile_image(profile: dict, kind: str, request: "ProfileImageRequest
     if url:
         if not url.startswith(("http://", "https://", "/static/")):
             raise HTTPException(status_code=422, detail="URL de imagem invalida.")
+        if settings.is_web and not (
+            url.startswith("https://") or url.startswith("/static/backgrounds/")
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="Imagem web deve usar HTTPS ou um background predefinido.",
+            )
         _clear_profile_image_files(profile_id, kind)  # troca upload local por remota
         return url
     # Sem url e sem data => limpar imagem.
