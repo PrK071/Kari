@@ -21,15 +21,26 @@ Não usar dados reais do desktop: fixtures sintéticas para a migração JSON.
 
 ## Configuração base
 
+O código só aceita `KARI_ENV=development|production` (não existe `staging`).
+Staging usa `production` + `KARI_RUNTIME=web` para exercitar os mesmos guards de
+produção; isso exige HTTPS nas URLs de backend/frontend/origins antes do
+primeiro boot (subir Caddy primeiro, ou bootar com `development` e trocar
+depois — documentar qual caminho foi usado).
+
 ```dotenv
-KARI_ENV=staging
+KARI_ENV=production
 KARI_RUNTIME=web
 KARI_PERSISTENCE_BACKEND=postgres
 KARI_STORAGE_BACKEND=object_storage
-DATABASE_URL=postgresql+psycopg://USUARIO:SENHA@127.0.0.1:5432/kari_staging
+DATABASE_URL=postgresql+psycopg://USUARIO:SENHA@HOST:5432/kari_staging
 KARI_ALLOWED_ORIGINS=https://<frontend-staging>
-KARI_TEST_POSTGRES_URL=postgresql+psycopg://USUARIO:SENHA@127.0.0.1:5432/kari_staging
+KARI_TEST_POSTGRES_URL=postgresql+psycopg://USUARIO:SENHA@HOST:5432/kari_staging
 ```
+
+O usuário do banco usado em `KARI_TEST_POSTGRES_URL` precisa de direito de
+`CREATE SCHEMA`/`DROP SCHEMA` no banco de staging (o gate cria e remove um
+schema aleatório). O usuário da aplicação precisa de DDL para `alembic upgrade
+head` (CREATE TABLE) e DML nas tabelas de identidade.
 
 ## Fases e evidências
 
