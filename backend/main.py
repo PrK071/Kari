@@ -159,6 +159,7 @@ USERS_STORE_PATH = KARI_DATA_DIR / "users.json"
 AUTH_TOKENS_PATH = KARI_DATA_DIR / "tokens.json"
 PBKDF2_ITERATIONS = 200_000
 _password_hasher = PasswordHasher()
+_DUMMY_PASSWORD_HASH = _password_hasher.hash("kari-login-timing-sentinel")
 
 repositories = build_repositories(
     backend=settings.persistence_backend,
@@ -6524,9 +6525,14 @@ def auth_login(request: LoginRequest, http_request: Request) -> dict:
     )
     with _users_lock:
         user = user_repository.get(key)
-        password_valid = bool(
-            user and _verify_password_and_rehash(key, user, request.password)
-        )
+        if user:
+            password_valid = _verify_password_and_rehash(key, user, request.password)
+        else:
+            try:
+                _password_hasher.verify(_DUMMY_PASSWORD_HASH, request.password)
+            except VerificationError:
+                pass
+            password_valid = False
     if not password_valid:
         raise HTTPException(status_code=401, detail="Usuario ou senha invalidos.")
     with _profiles_lock:

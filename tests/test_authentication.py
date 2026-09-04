@@ -99,6 +99,12 @@ class AuthenticationTests(unittest.TestCase):
             self.client.get("/api/auth/me", headers=self._bearer("invalid")).status_code,
             401,
         )
+        unknown_user = self.client.post(
+            "/api/auth/login",
+            json={"username": "does-not-exist", "password": "irrelevant"},
+        )
+        self.assertEqual(unknown_user.status_code, 401)
+        self.assertEqual(unknown_user.json()["detail"], "Usuario ou senha invalidos.")
 
     def test_legacy_pbkdf2_hash_is_rehashed_after_login(self) -> None:
         password = "legacy password is still valid"
