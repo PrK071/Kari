@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import atexit
 import time
 import mimetypes
 import html
@@ -37,7 +38,7 @@ from pydantic import BaseModel, Field
 
 from backend.config import load_settings
 from backend.background import BackgroundTaskRunner
-from backend.concurrency import BoundedWorkCoordinator
+from backend.concurrency import BoundedExecutor, BoundedWorkCoordinator, WorkCapacityExceeded
 from backend.media_storage import MediaStorageUnavailable, build_profile_media_storage
 from backend.network_security import UnsafeRemoteURLError, validate_public_http_url
 from backend.rate_limit import MemoryRateLimitBackend, RateLimiter, RateLimitPolicy
@@ -93,6 +94,11 @@ scraper_coordinator = BoundedWorkCoordinator(
     max_global=settings.scraper_max_concurrency,
     max_per_source=settings.scraper_max_per_source,
 )
+scraper_executor = BoundedExecutor(
+    max_workers=settings.scraper_max_concurrency,
+    max_pending=settings.scraper_max_concurrency * 2,
+)
+atexit.register(scraper_executor.shutdown, wait=False, cancel_futures=True)
 background_task_runner = BackgroundTaskRunner(settings.background_max_concurrency)
 
 REGISTER_RATE_LIMIT = RateLimitPolicy(limit=30, window_seconds=60 * 60)
@@ -2907,25 +2913,23 @@ def _search_sources_with_timeout(
 
     items: list[dict] = []
     errors: list[str] = []
-    executor = ThreadPoolExecutor(max_workers=len(sources))
-    futures = {
-        executor.submit(_search_source, source, query, limit): source
-        for source in sources
-    }
-    try:
-        done, pending = wait(futures, timeout=timeout)
-        for future in done:
-            source = futures[future]
-            try:
-                items.extend(future.result())
-            except Exception as exc:
-                errors.append(f"{_source_label(source)}: {exc}")
-        for future in pending:
-            source = futures[future]
-            future.cancel()
-            errors.append(f"{_source_label(source)}: timeout")
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+    futures = {}
+    for source in sources:
+        try:
+            futures[scraper_executor.submit(_search_source, source, query, limit)] = source
+        except WorkCapacityExceeded:
+            errors.append(f"{_source_label(source)}: capacity")
+    done, pending = wait(futures, timeout=timeout)
+    for future in done:
+        source = futures[future]
+        try:
+            items.extend(future.result())
+        except Exception as exc:
+            errors.append(f"{_source_label(source)}: {_safe_error(exc)}")
+    for future in pending:
+        source = futures[future]
+        future.cancel()
+        errors.append(f"{_source_label(source)}: timeout")
     return items, errors
 
 

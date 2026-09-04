@@ -5,10 +5,30 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
-from backend.concurrency import BoundedWorkCoordinator, WorkCapacityExceeded
+from backend.concurrency import BoundedExecutor, BoundedWorkCoordinator, WorkCapacityExceeded
 
 
 class ScraperConcurrencyTests(unittest.TestCase):
+    def test_shared_executor_bounds_workers_and_pending_work(self) -> None:
+        executor = BoundedExecutor(max_workers=2, max_pending=2)
+        started = threading.Barrier(3)
+        release = threading.Event()
+
+        def blocking_operation(value: int) -> int:
+            started.wait(timeout=1)
+            release.wait(timeout=1)
+            return value
+
+        first = executor.submit(blocking_operation, 1)
+        second = executor.submit(blocking_operation, 2)
+        started.wait(timeout=1)
+        with self.assertRaises(WorkCapacityExceeded):
+            executor.submit(lambda: 3)
+        release.set()
+        self.assertEqual({first.result(timeout=1), second.result(timeout=1)}, {1, 2})
+        self.assertEqual(executor.submit(lambda: 4).result(timeout=1), 4)
+        executor.shutdown()
+
     def test_duplicate_operations_share_one_execution(self) -> None:
         coordinator = BoundedWorkCoordinator(max_global=4, max_per_source=2)
         calls = 0

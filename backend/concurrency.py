@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable, Generic, TypeVar
 
@@ -12,6 +13,33 @@ T = TypeVar("T")
 
 class WorkCapacityExceeded(RuntimeError):
     pass
+
+
+class BoundedExecutor:
+    """Pool compartilhado que limita threads e trabalhos pendentes."""
+
+    def __init__(self, *, max_workers: int, max_pending: int) -> None:
+        if max_workers < 1 or max_pending < max_workers:
+            raise ValueError("Capacidade do executor deve comportar os workers.")
+        self._slots = threading.BoundedSemaphore(max_pending)
+        self._executor = ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="kari-scraper",
+        )
+
+    def submit(self, operation: Callable[..., T], *args, **kwargs) -> Future[T]:
+        if not self._slots.acquire(blocking=False):
+            raise WorkCapacityExceeded("Fila global de scrapers atingiu o limite.")
+        try:
+            future = self._executor.submit(operation, *args, **kwargs)
+        except Exception:
+            self._slots.release()
+            raise
+        future.add_done_callback(lambda _future: self._slots.release())
+        return future
+
+    def shutdown(self, *, wait: bool = True, cancel_futures: bool = False) -> None:
+        self._executor.shutdown(wait=wait, cancel_futures=cancel_futures)
 
 
 @dataclass
