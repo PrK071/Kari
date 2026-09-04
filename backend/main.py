@@ -36,6 +36,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from backend.config import load_settings
+from backend.background import BackgroundTaskRunner
 from backend.concurrency import BoundedWorkCoordinator
 from backend.media_storage import MediaStorageUnavailable, build_profile_media_storage
 from backend.network_security import UnsafeRemoteURLError, validate_public_http_url
@@ -92,6 +93,7 @@ scraper_coordinator = BoundedWorkCoordinator(
     max_global=settings.scraper_max_concurrency,
     max_per_source=settings.scraper_max_per_source,
 )
+background_task_runner = BackgroundTaskRunner(settings.background_max_concurrency)
 
 REGISTER_RATE_LIMIT = RateLimitPolicy(limit=30, window_seconds=60 * 60)
 LOGIN_RATE_LIMIT = RateLimitPolicy(limit=30, window_seconds=5 * 60)
@@ -769,6 +771,7 @@ _home_chapter_audit_running = False
 # home ja esta rodando. A tela que o usuario abriu entra na frente da fila.
 _home_chapter_audit_pending: dict[str, dict] = {}
 HOME_CHAPTER_AUDIT_BATCH_SIZE = 24
+HOME_CHAPTER_AUDIT_MAX_PENDING = 500
 
 _image_http = requests.Session()
 _image_http_adapter = HTTPAdapter(pool_connections=32, pool_maxsize=64, max_retries=0)
@@ -829,11 +832,15 @@ def _schedule_chapters_refresh(cache_key: str, source: str, lang: str) -> None:
         if cache_key in _chapters_refreshing:
             return
         _chapters_refreshing.add(cache_key)
-    threading.Thread(
-        target=_refresh_chapters_source_payload,
-        args=(cache_key, source, lang),
-        daemon=True,
-    ).start()
+    if not background_task_runner.submit(
+        f"chapters:{cache_key}",
+        _refresh_chapters_source_payload,
+        cache_key,
+        source,
+        lang,
+    ):
+        with _chapters_refresh_lock:
+            _chapters_refreshing.discard(cache_key)
 
 
 def _load_chapters_source_payload(source: str, lang: str) -> dict:
@@ -2675,8 +2682,13 @@ def _schedule_catalog_refresh(limit: int = DEFAULT_LIMIT) -> None:
         if catalog_refreshing:
             return
         catalog_refreshing = True
-    thread = threading.Thread(target=_refresh_catalog_cache, args=(limit,), daemon=True)
-    thread.start()
+    if not background_task_runner.submit(
+        "catalog-refresh",
+        _refresh_catalog_cache,
+        limit,
+    ):
+        with catalog_refresh_lock:
+            catalog_refreshing = False
 
 
 def _apply_curated_source_overrides(items: list[dict], query: str) -> list[dict]:
@@ -3214,7 +3226,7 @@ def _refresh_source_resolution(title: str, source_url: str, lang: str, key: str)
     try:
         _resolve_best_source_for_title(title, source_url, lang)
     except Exception as exc:
-        logger.debug("Falha ao resolver fonte em background p/ %s: %s", title, exc)
+        logger.debug("Falha ao resolver fonte em background error=%s", _safe_error(exc))
     finally:
         with _source_resolution_refresh_lock:
             _source_resolution_refreshing.discard(key)
@@ -3226,11 +3238,16 @@ def _schedule_source_resolution(title: str, source_url: str, lang: str) -> None:
         if key in _source_resolution_refreshing:
             return
         _source_resolution_refreshing.add(key)
-    threading.Thread(
-        target=_refresh_source_resolution,
-        args=(title, source_url, lang, key),
-        daemon=True,
-    ).start()
+    if not background_task_runner.submit(
+        f"source-resolution:{key}",
+        _refresh_source_resolution,
+        title,
+        source_url,
+        lang,
+        key,
+    ):
+        with _source_resolution_refresh_lock:
+            _source_resolution_refreshing.discard(key)
 
 
 def _search_match_score(query: str, item: dict) -> float:
@@ -5093,6 +5110,10 @@ def _schedule_home_chapter_audit(items: list[dict], *, priority: bool = False) -
             _home_chapter_audit_pending = {**queued, **_home_chapter_audit_pending}
         else:
             _home_chapter_audit_pending.update(queued)
+        if len(_home_chapter_audit_pending) > HOME_CHAPTER_AUDIT_MAX_PENDING:
+            _home_chapter_audit_pending = dict(
+                list(_home_chapter_audit_pending.items())[:HOME_CHAPTER_AUDIT_MAX_PENDING]
+            )
         if _home_chapter_audit_running:
             return True
         _home_chapter_audit_running = True
@@ -5112,7 +5133,10 @@ def _schedule_home_chapter_audit(items: list[dict], *, priority: bool = False) -
             # isolando hosts lentos para nao prender a fila inteira.
             _prewarm_chapters(batch, limit=len(batch), max_workers=8)
 
-    threading.Thread(target=run, daemon=True).start()
+    if not background_task_runner.submit("home-chapter-audit", run):
+        with _home_chapter_audit_lock:
+            _home_chapter_audit_running = False
+        return False
     return True
 
 

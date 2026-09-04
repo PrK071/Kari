@@ -96,6 +96,7 @@ class Settings:
     rate_limit_backend: str
     scraper_max_concurrency: int
     scraper_max_per_source: int
+    background_max_concurrency: int
     log_level: str
 
     @property
@@ -234,6 +235,14 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         raise ConfigurationError(
             "KARI_SCRAPER_MAX_PER_SOURCE deve estar entre 1 e o limite global."
         )
+    try:
+        background_max_concurrency = int(source.get("KARI_BACKGROUND_MAX_CONCURRENCY", "4"))
+    except ValueError as exc:
+        raise ConfigurationError("KARI_BACKGROUND_MAX_CONCURRENCY deve ser inteiro.") from exc
+    if not 1 <= background_max_concurrency <= 16:
+        raise ConfigurationError(
+            "KARI_BACKGROUND_MAX_CONCURRENCY deve estar entre 1 e 16."
+        )
     log_level = source.get("KARI_LOG_LEVEL", "INFO").strip().upper()
     if log_level not in _LOG_LEVELS:
         raise ConfigurationError(
@@ -260,5 +269,6 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         rate_limit_backend=rate_limit_backend,
         scraper_max_concurrency=scraper_max_concurrency,
         scraper_max_per_source=scraper_max_per_source,
+        background_max_concurrency=background_max_concurrency,
         log_level=log_level,
     )

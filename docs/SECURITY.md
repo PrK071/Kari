@@ -42,6 +42,12 @@ esperas por capacidade têm timeout. Os valores podem ser reduzidos por
 ou usuário continua sendo aplicado antes desse coordenador pelas políticas
 acima.
 
+Refresh de catálogo/capítulos, resolução de fonte e auditoria da home usam a
+abstração `BackgroundTaskRunner`: quatro threads daemon no máximo, sem fila
+ilimitada e com deduplicação por chave. Saturação mantém cache existente e não
+cria novas threads. Uma fila persistente continua desnecessária na implantação
+inicial de uma instância.
+
 ## Isolamento do leitor
 
 No runtime web, a abertura do capítulo é stateless: o `ChapterState` é descartado

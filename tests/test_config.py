@@ -73,6 +73,8 @@ class SettingsTests(unittest.TestCase):
         with self.assertRaises(ConfigurationError):
             load_settings({"KARI_SCRAPER_MAX_CONCURRENCY": "0"})
         with self.assertRaises(ConfigurationError):
+            load_settings({"KARI_BACKGROUND_MAX_CONCURRENCY": "17"})
+        with self.assertRaises(ConfigurationError):
             load_settings(
                 {
                     "KARI_SCRAPER_MAX_CONCURRENCY": "2",
