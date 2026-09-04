@@ -107,6 +107,13 @@ revalida redirects, limita portas no runtime web, restringe o tamanho a 25 MB e
 aceita somente formatos raster reconhecidos por assinatura. A VPS ainda deve
 aplicar regras de egress como defesa adicional contra DNS rebinding.
 
+Parâmetros `source_url` seguem uma barreira separada: em web, somente IDs
+internos conhecidos ou URLs HTTPS em hosts de providers explicitamente
+permitidos chegam ao leitor. A resolução DNS ainda precisa resultar apenas em
+endereços públicos. A verificação é repetida na camada central que lista e abre
+capítulos, inclusive depois de resolução automática e fallback. DragonTea e
+Sakura são bloqueados como fontes dependentes de navegador local.
+
 Em 3 de setembro de 2026, a API pública conhecida do MangaGeek respondeu por
 HTTP, mas recusou conexão em HTTPS. Ela não recebe credenciais de usuário, porém
 seu conteúdo não possui garantia de confidencialidade ou integridade no

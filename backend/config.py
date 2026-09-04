@@ -115,6 +115,7 @@ class Settings:
             "local_libraries": desktop,
             "local_file_imports": desktop,
             "sakura": desktop,
+            "dragontea": desktop,
         }
 
 

@@ -27,6 +27,7 @@ class RuntimeCapabilitiesTests(unittest.TestCase):
         capabilities = main.capabilities()
         self.assertFalse(capabilities["local_libraries"])
         self.assertFalse(capabilities["sakura"])
+        self.assertFalse(capabilities["dragontea"])
         self.assertNotIn("sakura", main._search_sources())
         self.assertNotIn("mangageek", main._search_sources())
         self.assertIsNone(
@@ -42,6 +43,7 @@ class RuntimeCapabilitiesTests(unittest.TestCase):
             "hq-local://comic/example",
             "light-novel://novel/example",
             "https://sakuramangas.org/obras/example",
+            "https://dragontea.ink/series/example",
             "mangageek://manga/4288",
         ):
             with self.assertRaises(HTTPException) as raised:
@@ -58,6 +60,7 @@ class RuntimeCapabilitiesTests(unittest.TestCase):
         main._ensure_source_allowed("mangageek://manga/4288")
         self.assertTrue(main.capabilities()["local_libraries"])
         self.assertTrue(main.capabilities()["sakura"])
+        self.assertTrue(main.capabilities()["dragontea"])
 
 
 if __name__ == "__main__":

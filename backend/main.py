@@ -550,7 +550,37 @@ reader = MangaReader(
 )
 
 
-DESKTOP_ONLY_PROVIDERS = {"hq_local", "light_novel_local", "sakura"}
+DESKTOP_ONLY_PROVIDERS = {"hq_local", "light_novel_local", "sakura", "dragontea"}
+_WEB_SOURCE_SCHEMES = {
+    "hq-now",
+    "mangadex",
+    "mangalivre",
+    "mangasbrasuka",
+    "nexus",
+    "mangakatana",
+    "readfull",
+    "noveltoon",
+    "pieceproject",
+    "toomics",
+}
+_WEB_SOURCE_HOSTS = {
+    "mangadex.org",
+    "fliptru.com.br",
+    "novelmania.com.br",
+    "centralnovel.com",
+    "tensurafan.github.io",
+    "pleiadestranslations.wordpress.com",
+    "global.toomics.com",
+    "toomics.com",
+    "mangalivre.blog",
+    "mangasbrasuka.com.br",
+    "nexusmangas.com",
+    "mangakatana.com",
+    "readfullapi.herokuapp.com",
+    "pieceproject.xyz",
+    "onepieceproject.com.br",
+    "noveltoon.mobi",
+}
 
 
 def _provider_enabled(provider: str) -> bool:
@@ -576,9 +606,27 @@ def _ensure_source_allowed(source_url: str) -> None:
         reader.hq_plugin.is_source(source_url)
         or reader.light_novel_plugin.is_source(source_url)
         or reader._is_sakura_source(source_url)
+        or reader._is_dragontea_source(source_url)
         or (reader._is_mangageek_source(source_url) and not _provider_enabled("mangageek"))
     ):
         _require_desktop_capability()
+    value = source_url.strip()
+    parsed = urlparse(value)
+    if parsed.scheme.casefold() in _WEB_SOURCE_SCHEMES:
+        return
+    if re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,}", value):
+        return
+    hostname = (parsed.hostname or "").rstrip(".").casefold()
+    host_allowed = any(
+        hostname == allowed or hostname.endswith(f".{allowed}")
+        for allowed in _WEB_SOURCE_HOSTS
+    )
+    if parsed.scheme.casefold() != "https" or not host_allowed:
+        raise HTTPException(status_code=422, detail="Fonte remota nao permitida no runtime web.")
+    try:
+        validate_public_http_url(value, allowed_ports={443})
+    except UnsafeRemoteURLError as exc:
+        raise HTTPException(status_code=422, detail="Fonte remota nao permitida no runtime web.") from exc
 
 
 def _tcp_port_open(host: str, port: int, timeout: float = 0.15) -> bool:
@@ -640,6 +688,7 @@ def _coordinated_chapter_metadata(
     *,
     include_neighbors: bool = True,
 ) -> dict:
+    _ensure_source_allowed(chapter_url)
     return scraper_coordinator.run(
         _scraper_source_name(chapter_url),
         f"chapter-open:{chapter_url}:{include_neighbors}",
@@ -881,6 +930,7 @@ def _resilient_list_chapters(
     lang: str,
     preferred_chapter: str | None = None,
 ) -> dict:
+    _ensure_source_allowed(source)
     return scraper_coordinator.run(
         _scraper_source_name(source),
         f"chapters:{source}:{lang}:{preferred_chapter or ''}",
@@ -7184,6 +7234,14 @@ def author_lookup(
     title: str = Query(default="", description="Titulo da obra para casar staff no AniList."),
     source_url: str = Query(default="", description="Fonte da obra para fallback nativo."),
 ) -> dict:
+    _enforce_rate_limit(
+        request,
+        "author-lookup",
+        EXPENSIVE_RATE_LIMIT,
+        resource=normalize_match_text(name),
+    )
+    if source_url.strip():
+        _ensure_source_allowed(unquote(source_url).strip())
     try:
         return _lookup_author_profile(name, title, source_url)
     except ValueError as exc:
@@ -7411,6 +7469,7 @@ def _build_manga_meta(item: dict | None, source_url: str, title: str = "") -> di
     autores, status, rating e idiomas de capitulo. Vem do catalogo (preferido)
     ou, em ultimo caso, de uma consulta de metadata externa best-effort.
     """
+    _ensure_source_allowed(source_url)
     enriched: dict | None = None
     if item:
         enriched = dict(item)
@@ -7510,7 +7569,6 @@ def manga_meta(
     source_url: str = Query(..., description="URL ou source id da obra."),
     title: str = Query(default=""),
 ) -> dict:
-    _enforce_rate_limit(request, "author-lookup", EXPENSIVE_RATE_LIMIT, resource=name.lower())
     source = unquote(source_url).strip()
     _enforce_rate_limit(request, "manga-meta", EXPENSIVE_RATE_LIMIT, resource=source)
     if not source:
