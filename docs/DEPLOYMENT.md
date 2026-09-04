@@ -76,6 +76,7 @@ source /etc/kari.env
 set +a
 /opt/kari/venv/bin/python -m tools.migrate_identity \
   --source-dir /CAMINHO/DO/KARI_DATA_DIR \
+  --static-dir /CAMINHO/DO/KARI_STATIC_DIR \
   --backup-dir /var/backups/kari/json-migration
 ```
 
@@ -89,6 +90,13 @@ sessão legados e possivelmente tokens OAuth.
 Confirme que `users_migrated`, `profiles_migrated` e `sessions_migrated`
 correspondem às respectivas contagens `*_found` e que `errors` está vazio antes
 de trocar o serviço para `KARI_PERSISTENCE_BACKEND=postgres`.
+
+Se os perfis legados referenciarem arquivos em `/static/profiles`, configure
+`KARI_STORAGE_BACKEND=object_storage` e as credenciais do bucket antes do
+comando. A migração exige `--static-dir`, transfere esses arquivos explicitamente
+e também exige que `media_migrated` corresponda a `media_found`. Sem storage
+remoto configurado, a migração falha de forma visível e não grava o perfil com
+uma URL local inutilizável.
 
 No staging, configure um banco PostgreSQL descartável em
 `KARI_TEST_POSTGRES_URL` e execute `python -m pytest -q`. O teste cria um schema

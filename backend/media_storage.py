@@ -7,7 +7,7 @@ from urllib.parse import quote
 
 
 _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
-_SUFFIXES = {".jpg", ".png", ".webp", ".gif", ".mp4", ".webm"}
+_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".mp4", ".webm"}
 
 
 class MediaStorageUnavailable(RuntimeError):

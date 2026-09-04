@@ -3,17 +3,27 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import mimetypes
 import os
 import shutil
 import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
+from backend.config import load_settings
+from backend.media_storage import ProfileMediaStorage, build_profile_media_storage
 from backend.persistence import PersistenceRepositories, build_repositories, token_digest
 
 
 LEGACY_FILES = ("profiles.json", "users.json", "tokens.json")
+PROFILE_MEDIA_FIELDS = {
+    "avatar_url": "avatar",
+    "background_url": "background",
+    "home_background_url": "home_background",
+}
+MAX_LEGACY_MEDIA_BYTES = 96 * 1024 * 1024
 
 
 @dataclass
@@ -24,6 +34,8 @@ class MigrationReport:
     profiles_migrated: int = 0
     sessions_found: int = 0
     sessions_migrated: int = 0
+    media_found: int = 0
+    media_migrated: int = 0
     errors: list[str] = field(default_factory=list)
     backup_dir: str = ""
 
@@ -67,11 +79,53 @@ def _backup_sources(source_dir: Path, backup_root: Path | None) -> Path | None:
     return destination
 
 
+def _migrate_profile_media(
+    profile: dict,
+    *,
+    media_storage: ProfileMediaStorage | None,
+    static_dir: Path | None,
+    report: MigrationReport,
+) -> None:
+    profile_id = str(profile["id"])
+    for field_name, kind in PROFILE_MEDIA_FIELDS.items():
+        raw_url = str(profile.get(field_name) or "").strip()
+        parsed = urlparse(raw_url)
+        if parsed.scheme or parsed.netloc or not parsed.path.startswith("/static/profiles/"):
+            continue
+        report.media_found += 1
+        if media_storage is None or static_dir is None:
+            raise ValueError("legacy-media-storage-required")
+
+        root = static_dir.resolve()
+        candidate = (root / unquote(parsed.path.removeprefix("/static/"))).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("legacy-media-path-invalid") from exc
+        if not candidate.is_file():
+            raise FileNotFoundError("legacy-media-file-missing")
+        if candidate.stat().st_size > MAX_LEGACY_MEDIA_BYTES:
+            raise ValueError("legacy-media-file-too-large")
+
+        suffix = candidate.suffix.lower()
+        content_type = mimetypes.guess_type(candidate.name)[0] or "application/octet-stream"
+        profile[field_name] = media_storage.replace(
+            profile_id,
+            kind,
+            suffix,
+            candidate.read_bytes(),
+            content_type,
+        )
+        report.media_migrated += 1
+
+
 def migrate_identity_data(
     source_dir: Path,
     repositories: PersistenceRepositories,
     *,
     backup_root: Path | None = None,
+    media_storage: ProfileMediaStorage | None = None,
+    static_dir: Path | None = None,
 ) -> MigrationReport:
     source_dir = source_dir.resolve()
     report = MigrationReport()
@@ -101,6 +155,12 @@ def migrate_identity_data(
         profile = dict(raw_profile)
         profile["id"] = str(profile.get("id") or profile_id)
         try:
+            _migrate_profile_media(
+                profile,
+                media_storage=media_storage,
+                static_dir=static_dir,
+                report=report,
+            )
             repositories.profiles.save(profile)
             report.profiles_migrated += 1
         except Exception as exc:
@@ -141,6 +201,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Migra identidade JSON do Kari para PostgreSQL.")
     parser.add_argument("--source-dir", type=Path, required=True)
     parser.add_argument("--backup-dir", type=Path)
+    parser.add_argument(
+        "--static-dir",
+        type=Path,
+        help="Diretorio static legado; obrigatorio se profiles.json referenciar /static/profiles.",
+    )
     args = parser.parse_args()
 
     database_url = os.environ.get("DATABASE_URL", "").strip()
@@ -159,10 +224,19 @@ def main() -> int:
         profiles_path=unused,
         sessions_path=unused,
     )
+    media_storage = None
+    if os.environ.get("KARI_STORAGE_BACKEND", "").strip().lower() == "object_storage":
+        settings = load_settings()
+        media_storage = build_profile_media_storage(
+            settings,
+            args.static_dir or Path("unused-static"),
+        )
     report = migrate_identity_data(
         args.source_dir,
         repositories,
         backup_root=args.backup_dir,
+        media_storage=media_storage,
+        static_dir=args.static_dir,
     )
     print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
     return 0 if report.ok else 1

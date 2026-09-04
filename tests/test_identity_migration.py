@@ -14,6 +14,27 @@ from backend.persistence.models import Base, OAuthAccountModel, SessionModel
 from tools.migrate_identity import migrate_identity_data
 
 
+class RecordingStorage:
+    writable = True
+
+    def __init__(self) -> None:
+        self.replaced: list[tuple[str, str, str, bytes, str]] = []
+
+    def delete(self, profile_id: str, kind: str) -> None:
+        del profile_id, kind
+
+    def replace(
+        self,
+        profile_id: str,
+        kind: str,
+        suffix: str,
+        content: bytes,
+        content_type: str,
+    ) -> str:
+        self.replaced.append((profile_id, kind, suffix, content, content_type))
+        return f"https://media.example.test/profiles/{profile_id}/{kind}{suffix}"
+
+
 class IdentityMigrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -112,6 +133,44 @@ class IdentityMigrationTests(unittest.TestCase):
         self.assertTrue(any(error.startswith("session[1]") for error in report.errors))
         for name, content in original.items():
             self.assertEqual((self.source / name).read_bytes(), content)
+
+    def test_legacy_profile_media_requires_and_uses_explicit_storage(self) -> None:
+        self._write_fixture()
+        profiles_path = self.source / "profiles.json"
+        profiles = json.loads(profiles_path.read_text(encoding="utf-8"))
+        profiles["profile-a"]["avatar_url"] = "/static/profiles/profile-a/avatar.jpeg"
+        profiles_path.write_text(json.dumps(profiles), encoding="utf-8")
+        original = profiles_path.read_bytes()
+
+        missing_storage = migrate_identity_data(self.source, self.repositories)
+        self.assertFalse(missing_storage.ok)
+        self.assertEqual(missing_storage.media_found, 1)
+        self.assertEqual(missing_storage.media_migrated, 0)
+        self.assertEqual(missing_storage.profiles_migrated, 0)
+
+        static_dir = self.root / "static"
+        media_path = static_dir / "profiles" / "profile-a" / "avatar.jpeg"
+        media_path.parent.mkdir(parents=True)
+        media_path.write_bytes(b"legacy-image")
+        storage = RecordingStorage()
+        migrated = migrate_identity_data(
+            self.source,
+            self.repositories,
+            media_storage=storage,
+            static_dir=static_dir,
+        )
+
+        self.assertTrue(migrated.ok, migrated.errors)
+        self.assertEqual(migrated.media_found, 1)
+        self.assertEqual(migrated.media_migrated, 1)
+        self.assertEqual(migrated.profiles_migrated, 1)
+        self.assertEqual(storage.replaced[0][:3], ("profile-a", "avatar", ".jpeg"))
+        self.assertEqual(profiles_path.read_bytes(), original)
+        stored = self.repositories.profiles.get("profile-a")
+        self.assertEqual(
+            stored["avatar_url"],
+            "https://media.example.test/profiles/profile-a/avatar.jpeg",
+        )
 
 
 if __name__ == "__main__":
