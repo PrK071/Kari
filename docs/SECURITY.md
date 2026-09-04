@@ -61,6 +61,8 @@ mas seus payloads não compartilham estado após a resposta.
   adaptador JSON preserva tokens legados somente no runtime local/desktop.
 - Logout revoga a sessão atual; uma ação separada deve revogar todas as sessões.
 - Tokens OAuth externos nunca entram no payload da API ou nos logs.
+- Callbacks serializam dados para contexto JavaScript sem permitir `</script>`,
+  usam CSP com nonce, não enviam referrer e nunca podem ser armazenados em cache.
 - O modelo atual continua usando Bearer em `localStorage`. A troca para cookie
   será atômica com proteção CSRF, `HttpOnly`, `Secure`, `SameSite` e CORS com
   credenciais; não deve existir uma etapa híbrida parcialmente protegida.

@@ -5445,25 +5445,56 @@ def _purge_oauth_states() -> None:
         _oauth_states.pop(key, None)
 
 
+def _script_json(value: object) -> str:
+    """JSON seguro para contexto de script HTML, inclusive contra </script>."""
+    return (
+        json.dumps(value, ensure_ascii=False)
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
+def _popup_headers(nonce: str) -> dict[str, str]:
+    return {
+        "Cache-Control": "no-store",
+        "Content-Security-Policy": (
+            "default-src 'none'; "
+            f"script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; "
+            "base-uri 'none'; frame-ancestors 'none'"
+        ),
+        "Referrer-Policy": "no-referrer",
+        "X-Content-Type-Options": "nosniff",
+    }
+
+
 def _oauth_html(message: dict) -> Response:
     """Pagina retornada no callback: avisa a janela que abriu (postMessage) e fecha.
     Fallback: link de volta pro app se o popup nao tiver opener."""
-    payload = json.dumps({"source": "kari-oauth", **message})
-    frontend = json.dumps(FRONTEND_BASE_URL)
+    nonce = secrets.token_urlsafe(18)
+    payload = _script_json({"source": "kari-oauth", **message})
+    frontend = _script_json(FRONTEND_BASE_URL)
+    frontend_href = html.escape(FRONTEND_BASE_URL, quote=True)
     body = f"""<!doctype html><html lang="pt-br"><head><meta charset="utf-8">
 <title>Kari - Vinculo de conta</title>
-<style>body{{background:#0b0b0e;color:#e5e5e5;font-family:system-ui,sans-serif;
+<style nonce="{nonce}">body{{background:#0b0b0e;color:#e5e5e5;font-family:system-ui,sans-serif;
 display:grid;place-items:center;height:100vh;margin:0}}a{{color:#6ee7b7}}</style></head>
 <body><div><p>{html.escape(str(message.get('detail') or 'Pode fechar esta janela.'))}</p>
-<p><a href={frontend}>Voltar ao Kari</a></p></div>
-<script>
+<p><a href="{frontend_href}">Voltar ao Kari</a></p></div>
+<script nonce="{nonce}">
 (function(){{
   var msg = {payload};
   try {{ if (window.opener) {{ window.opener.postMessage(msg, {frontend}); }} }} catch (e) {{}}
   setTimeout(function(){{ try {{ window.close(); }} catch (e) {{}} }}, 400);
 }})();
 </script></body></html>"""
-    return Response(content=body, media_type="text/html")
+    return Response(
+        content=body,
+        media_type="text/html",
+        headers=_popup_headers(nonce),
+    )
 
 
 def _fetch_anilist_viewer(access_token: str) -> dict:
@@ -6504,22 +6535,28 @@ def auth_google_start(request: Request) -> dict:
 
 def _auth_html(message: dict) -> Response:
     """Pagina do callback: envia token/erro pra janela que abriu e fecha."""
-    payload = json.dumps({"source": "kari-auth", **message})
-    frontend = json.dumps(FRONTEND_BASE_URL)
+    nonce = secrets.token_urlsafe(18)
+    payload = _script_json({"source": "kari-auth", **message})
+    frontend = _script_json(FRONTEND_BASE_URL)
+    frontend_href = html.escape(FRONTEND_BASE_URL, quote=True)
     body = f"""<!doctype html><html lang="pt-br"><head><meta charset="utf-8">
 <title>Kari - Login</title>
-<style>body{{background:#0b0b0e;color:#e5e5e5;font-family:system-ui,sans-serif;
+<style nonce="{nonce}">body{{background:#0b0b0e;color:#e5e5e5;font-family:system-ui,sans-serif;
 display:grid;place-items:center;height:100vh;margin:0}}a{{color:#6ee7b7}}</style></head>
 <body><div><p>{html.escape(str(message.get('detail') or 'Pode fechar esta janela.'))}</p>
-<p><a href={frontend}>Voltar ao Kari</a></p></div>
-<script>
+<p><a href="{frontend_href}">Voltar ao Kari</a></p></div>
+<script nonce="{nonce}">
 (function(){{
   var msg = {payload};
   try {{ if (window.opener) {{ window.opener.postMessage(msg, {frontend}); }} }} catch (e) {{}}
   setTimeout(function(){{ try {{ window.close(); }} catch (e) {{}} }}, 400);
 }})();
 </script></body></html>"""
-    return Response(content=body, media_type="text/html")
+    return Response(
+        content=body,
+        media_type="text/html",
+        headers=_popup_headers(nonce),
+    )
 
 
 def _finish_external_login(
