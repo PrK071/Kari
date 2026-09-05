@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,15 +21,34 @@ from backend.media_storage import (
 
 
 class _FakeS3Client:
-    def __init__(self) -> None:
+    def __init__(self, objects: dict[str, tuple[bytes, str]] | None = None) -> None:
         self.deletes: list[dict] = []
         self.puts: list[dict] = []
+        self.objects: dict[str, tuple[bytes, str]] = objects or {}
 
     def delete_objects(self, **kwargs) -> None:
         self.deletes.append(kwargs)
+        for obj in kwargs.get("Delete", {}).get("Objects", []):
+            self.objects.pop(obj["Key"], None)
 
     def put_object(self, **kwargs) -> None:
         self.puts.append(kwargs)
+        self.objects[kwargs["Key"]] = (
+            kwargs["Body"] if isinstance(kwargs["Body"], bytes) else bytes(kwargs["Body"]),
+            kwargs.get("ContentType", ""),
+        )
+
+    def get_object(self, **kwargs) -> dict:
+        key = kwargs["Key"]
+        if key not in self.objects:
+            from botocore.exceptions import ClientError
+
+            raise ClientError(
+                {"Error": {"Code": "NoSuchKey", "Message": "Not Found"}},
+                "GetObject",
+            )
+        content, content_type = self.objects[key]
+        return {"Body": io.BytesIO(content), "ContentType": content_type}
 
 
 class ProfileMediaStorageTests(unittest.TestCase):
@@ -60,12 +80,60 @@ class ProfileMediaStorageTests(unittest.TestCase):
 
         self.assertEqual(
             url,
-            "https://media.example.test/public/profiles/profile-1/background.webp",
+            "/api/profiles/profile-1/media/background",
         )
         self.assertEqual(len(client.deletes), 1)
         self.assertEqual(client.puts[0]["Bucket"], "kari-media")
         self.assertEqual(client.puts[0]["Key"], "profiles/profile-1/background.webp")
         self.assertEqual(client.puts[0]["ContentType"], "image/webp")
+
+    def test_s3_storage_reads_object_back_with_content_type(self) -> None:
+        client = _FakeS3Client(
+            {"profiles/profile-1/avatar.png": (b"image-bytes", "image/png")}
+        )
+        storage = S3ProfileMediaStorage(
+            client,
+            bucket="kari-media",
+            public_base_url="https://media.example.test/public",
+        )
+
+        payload = storage.read("profile-1", "avatar")
+
+        self.assertEqual(payload, (b"image-bytes", "image/png"))
+
+    def test_s3_storage_read_missing_object_returns_none(self) -> None:
+        storage = S3ProfileMediaStorage(
+            _FakeS3Client(),
+            bucket="kari-media",
+            public_base_url="https://media.example.test/public",
+        )
+
+        self.assertIsNone(storage.read("profile-1", "avatar"))
+
+    def test_s3_storage_failures_never_expose_secrets(self) -> None:
+        class ExplodingClient:
+            def get_object(self, **kwargs):
+                raise RuntimeError("access-key-12345 leaked upstream")
+
+        storage = S3ProfileMediaStorage(
+            ExplodingClient(),
+            bucket="kari-media",
+            public_base_url="https://media.example.test/public",
+        )
+
+        with self.assertRaises(MediaStorageUnavailable) as raised:
+            storage.read("profile-1", "avatar")
+        self.assertNotIn("access-key-12345", str(raised.exception))
+
+    def test_local_storage_reads_stored_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = LocalProfileMediaStorage(Path(directory))
+            storage.replace("profile-1", "avatar", ".png", b"local-bytes", "image/png")
+
+            payload = storage.read("profile-1", "avatar")
+
+            self.assertEqual(payload, (b"local-bytes", "image/png"))
+            self.assertIsNone(storage.read("profile-1", "background"))
 
     def test_web_filesystem_rejects_binary_upload(self) -> None:
         disabled = DisabledProfileMediaStorage()

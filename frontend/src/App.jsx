@@ -4,6 +4,8 @@ import { FixedSizeGrid as Grid } from "react-window"
 import { ArrowUpDown, BookOpen, BookText, Camera, ExternalLink, FileArchive, Grid2X2, Heart, History, Home, ImagePlus, LibraryBig, Link2, Loader2, PanelLeftClose, PanelLeftOpen, Puzzle, Search, Trash2, Unlink, Upload, UserRound, X } from "lucide-react"
 import MangaCard, { MangaCardSkeleton } from "./components/MangaCard.jsx"
 import { scopedStorageKey } from "./profileStorage.js"
+import { authenticatedHeaders } from "./profileMedia.js"
+import { useAuthedMedia } from "./useAuthedMedia.js"
 
 const API_BASE_URL = import.meta.env.VITE_DESKTOP_BUILD === "1"
   ? window.location.origin
@@ -26,11 +28,6 @@ const PROFILE_STORAGE_KEY = "kari:profile-id:v1"
 const AUTH_TOKEN_KEY = "kari:auth-token:v1"
 const READER_SESSION_STORAGE_KEY = "kari:reader-session:v1"
 
-function authenticatedHeaders(headers = {}) {
-  const token = window.localStorage.getItem(AUTH_TOKEN_KEY) || ""
-  return token ? { ...headers, Authorization: `Bearer ${token}` } : headers
-}
-
 const HERO_GENRE_STYLES = [
   "border-emerald-300/30 bg-emerald-300/10 text-emerald-100",
   "border-violet-300/30 bg-violet-300/10 text-violet-100",
@@ -49,10 +46,6 @@ function resolveReaderContentImage(url) {
     return `${API_BASE_URL}/api/image?url=${encodeURIComponent(url)}`
   }
   return resolveApiUrl(url)
-}
-
-function isVideoUrl(url) {
-  return /\.(mp4|webm|mov|m4v)(\?|$)/i.test(url || "")
 }
 
 const LANG_LABEL = {
@@ -135,6 +128,7 @@ function Header({ query, onQueryChange, onHome, onCatalog, onPluginSelect, onHis
   const [pluginsOpen, setPluginsOpen] = useState(false)
   const pluginsRef = useRef(null)
   const pluginActive = pluginView === "hq" || pluginView === "hq-local" || pluginView === "novels"
+  const headerAvatar = useAuthedMedia(profile?.avatar_url)
 
   useEffect(() => {
     const closeMenu = (event) => {
@@ -286,7 +280,7 @@ function Header({ query, onQueryChange, onHome, onCatalog, onPluginSelect, onHis
               className="flex h-9 items-center gap-2 rounded-md px-2 text-xs font-semibold text-zinc-400 transition hover:bg-soft hover:text-accent focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
             >
               {profile?.avatar_url
-                ? <img src={resolveApiUrl(profile.avatar_url)} alt="" className="h-6 w-6 rounded-full object-cover" />
+                ? <img src={headerAvatar.src} alt="" className="h-6 w-6 rounded-full object-cover" />
                 : <UserRound size={18} strokeWidth={1.8} aria-hidden="true" />}
               <span className="hidden lg:inline truncate max-w-24">{profile?.display_name || "Perfil"}</span>
             </button>
@@ -1670,8 +1664,11 @@ function ProfilePanel({ profile, historyCount, onClose, onSave, onProfileChange,
     }
   }
 
-  const avatarSrc = resolveApiUrl(profile.avatar_url)
-  const backgroundSrc = resolveApiUrl(profile.background_url || profile.home_background_url)
+  const avatarMedia = useAuthedMedia(profile.avatar_url)
+  const backgroundMedia = useAuthedMedia(profile.background_url || profile.home_background_url)
+  const homeBgMedia = useAuthedMedia(profile.home_background_url)
+  const avatarSrc = avatarMedia.src
+  const backgroundSrc = backgroundMedia.src
   const links = profile.links || {}
 
   return (
@@ -1689,7 +1686,7 @@ function ProfilePanel({ profile, historyCount, onClose, onSave, onProfileChange,
       >
         {/* Imagem/video de background dimensionada no card inteiro */}
         {backgroundSrc && (
-          isVideoUrl(backgroundSrc) ? (
+          backgroundMedia.isVideo ? (
             <video
               src={backgroundSrc}
               autoPlay
@@ -1848,9 +1845,9 @@ function ProfilePanel({ profile, historyCount, onClose, onSave, onProfileChange,
             <div className="mt-2 overflow-hidden rounded border border-line">
               <div className="relative h-24 w-full bg-soft">
                 {profile.home_background_url
-                  ? (isVideoUrl(resolveApiUrl(profile.home_background_url))
-                      ? <video src={resolveApiUrl(profile.home_background_url)} autoPlay muted loop playsInline className="h-full w-full object-cover" />
-                      : <img src={resolveApiUrl(profile.home_background_url)} alt="" className="h-full w-full object-cover" />)
+                  ? (homeBgMedia.isVideo
+                      ? <video src={homeBgMedia.src} autoPlay muted loop playsInline className="h-full w-full object-cover" />
+                      : <img src={homeBgMedia.src} alt="" className="h-full w-full object-cover" />)
                   : <div className="h-full w-full bg-gradient-to-br from-accent/15 to-violet-500/10" />}
                 <div className="absolute inset-0 flex items-end justify-end gap-2 p-2">
                   <button
@@ -3686,14 +3683,13 @@ export default function App() {
     void catalogQuery.refetch()
   }, [catalogQuery, refreshProfile, storageScope])
 
-  const homeBackground = profile?.home_background_url
-    ? resolveApiUrl(profile.home_background_url)
-    : ""
+  const homeMedia = useAuthedMedia(profile?.home_background_url)
+  const homeBackground = homeMedia.src
 
   return (
     <div className="relative min-h-screen bg-app text-zinc-100">
       {homeBackground && (
-        isVideoUrl(homeBackground) ? (
+        homeMedia.isVideo ? (
           <video
             src={homeBackground}
             autoPlay

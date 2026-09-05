@@ -5511,6 +5511,50 @@ def set_profile_home_background(
 
 
 # ---------------------------------------------------------------------------
+# Midia de perfil com bucket PRIVADO: servida pela aplicacao, somente ao dono.
+# Nenhuma URL publica do bucket e gerada; o token nunca vai na query string.
+# ---------------------------------------------------------------------------
+_PROFILE_MEDIA_KINDS = {"avatar", "background", "home_background"}
+_PROFILE_MEDIA_MIME = {
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/gif",
+    "video/mp4",
+    "video/webm",
+}
+
+
+@app.get("/api/profiles/{profile_id}/media/{kind}")
+def get_profile_media(
+    profile_id: str,
+    kind: str,
+    current_user: AuthenticatedUser = Depends(require_profile_owner),
+) -> Response:
+    """Serve avatar/background/video do perfil, somente para o proprio dono."""
+    del current_user  # require_profile_owner ja aplica 401 (sem token) e 403 (nao dono).
+    if kind not in _PROFILE_MEDIA_KINDS:
+        raise HTTPException(status_code=404, detail="Tipo de midia desconhecido.")
+    try:
+        payload = profile_media_storage.read(profile_id, kind)
+    except MediaStorageUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if payload is None:
+        raise HTTPException(status_code=404, detail="Midia de perfil nao encontrada.")
+    content, content_type = payload
+    if content_type not in _PROFILE_MEDIA_MIME:
+        raise HTTPException(status_code=404, detail="Tipo de midia nao permitido.")
+    return Response(
+        content=content,
+        media_type=content_type,
+        headers={
+            "Cache-Control": "private, max-age=300",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # Vinculo de contas externas via OAuth2 (AniList / MyAnimeList).
 # ---------------------------------------------------------------------------
 _oauth_states: dict[str, dict] = {}

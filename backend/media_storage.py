@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import mimetypes
 import re
 from pathlib import Path
 from typing import Protocol
@@ -27,6 +28,8 @@ class ProfileMediaStorage(Protocol):
     ) -> str: ...
 
     def delete(self, profile_id: str, kind: str) -> None: ...
+
+    def read(self, profile_id: str, kind: str) -> tuple[bytes, str] | None: ...
 
 
 def _validate_components(profile_id: str, kind: str, suffix: str = ".jpg") -> None:
@@ -76,12 +79,29 @@ class LocalProfileMediaStorage:
         relative = target.relative_to(self.static_dir).as_posix()
         return f"/static/{relative}"
 
+    def read(self, profile_id: str, kind: str) -> tuple[bytes, str] | None:
+        _validate_components(profile_id, kind)
+        directory = self.profile_dir / profile_id
+        for suffix in _SUFFIXES:
+            target = directory / f"{kind}{suffix}"
+            if not target.is_file():
+                continue
+            content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+            return target.read_bytes(), content_type
+        return None
+
 
 class DisabledProfileMediaStorage:
     writable = False
 
     def delete(self, profile_id: str, kind: str) -> None:
         _validate_components(profile_id, kind)
+
+    def read(self, profile_id: str, kind: str) -> tuple[bytes, str] | None:
+        del profile_id, kind
+        raise MediaStorageUnavailable(
+            "Uploads persistentes exigem KARI_STORAGE_BACKEND=object_storage no runtime web."
+        )
 
     def replace(
         self,
@@ -126,6 +146,29 @@ class S3ProfileMediaStorage:
         except Exception as exc:
             raise MediaStorageUnavailable("Object Storage indisponivel.") from exc
 
+    def read(self, profile_id: str, kind: str) -> tuple[bytes, str] | None:
+        _validate_components(profile_id, kind)
+        import botocore.exceptions
+
+        for suffix in _SUFFIXES:
+            key = self._key(profile_id, kind, suffix)
+            try:
+                response = self.client.get_object(Bucket=self.bucket, Key=key)
+            except botocore.exceptions.ClientError as exc:
+                code = (exc.response or {}).get("Error", {}).get("Code", "")
+                if code in {"NoSuchKey", "404", "NotFound"}:
+                    continue
+                raise MediaStorageUnavailable("Object Storage indisponivel.") from exc
+            except Exception as exc:
+                raise MediaStorageUnavailable("Object Storage indisponivel.") from exc
+            content_type = (response.get("ContentType") or "").strip()
+            try:
+                content = response["Body"].read()
+            except Exception as exc:
+                raise MediaStorageUnavailable("Object Storage indisponivel.") from exc
+            return content, content_type
+        return None
+
     def replace(
         self,
         profile_id: str,
@@ -142,11 +185,11 @@ class S3ProfileMediaStorage:
                 Key=key,
                 Body=content,
                 ContentType=content_type,
-                CacheControl="public, max-age=31536000, immutable",
+                CacheControl="private, max-age=31536000, immutable",
             )
         except Exception as exc:
             raise MediaStorageUnavailable("Object Storage indisponivel.") from exc
-        return f"{self.public_base_url}/{quote(key, safe='/')}"
+        return f"/api/profiles/{quote(profile_id, safe='')}/media/{quote(kind, safe='')}"
 
 
 def build_profile_media_storage(settings, static_dir: Path) -> ProfileMediaStorage:
