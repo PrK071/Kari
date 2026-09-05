@@ -74,9 +74,9 @@ head` (CREATE TABLE) e DML nas tabelas de identidade.
 Todos os itens abaixo verdes para sair de staging:
 
 ```text
-[ ] PostgreSQL real PASS
-[ ] Alembic real PASS
-[ ] migração JSON idempotente PASS
+[x] PostgreSQL real PASS
+[x] Alembic real PASS
+[x] migração JSON idempotente PASS
 [ ] Object Storage real PASS
 [ ] autenticação E2E PASS
 [ ] IDOR E2E PASS
