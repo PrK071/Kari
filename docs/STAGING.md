@@ -11,7 +11,9 @@ precisa de evidência registrada.
 2. Banco PostgreSQL dedicado de staging (`kari_staging`) + um segundo banco
    descartável para restore (`kari_staging_restore`).
 3. Bucket Object Storage S3-compatible de staging com credencial limitada a
-   esse bucket (list/create/delete) e origem pública HTTPS separada.
+   esse bucket (Backblaze B2: bucket PRIVATE `kari-staging`, Application Key
+   restrita somente a ele, capacidade Read and Write). A mídia de perfil é
+   servida pela API autenticada; não há origem pública.
 4. Projeto Vercel de staging (não o domínio definitivo) apontando para o
    repositório, root `frontend`, com `VITE_API_BASE_URL=https://<api-staging>`
    e `VITE_KARI_RUNTIME=web`.
@@ -77,7 +79,7 @@ Todos os itens abaixo verdes para sair de staging:
 [x] PostgreSQL real PASS
 [x] Alembic real PASS
 [x] migração JSON idempotente PASS
-[ ] Object Storage real PASS
+[x] Object Storage real PASS
 [ ] autenticação E2E PASS
 [ ] IDOR E2E PASS
 [ ] reader isolation PASS
@@ -93,6 +95,32 @@ Todos os itens abaixo verdes para sair de staging:
 [ ] scrapers essenciais PASS
 [ ] testes automatizados PASS
 ```
+
+## Evidências registradas — Object Storage (Backblaze B2)
+
+Provedor: Backblaze B2 (S3-compatible). Bucket `kari-staging` PRIVATE, região
+`us-east-005`, endpoint `https://s3.us-east-005.backblazeb2.com`, encryption
+B2-managed, versioning off. Application Key `kari-staging-app` restrita ao
+bucket (Read and Write); sem Master Key. `KARI_OBJECT_STORAGE_PUBLIC_BASE_URL`
+tornou-se opcional (bucket privado; mídia servida pela API autenticada).
+
+Probe real contra o B2 com a implementação do app (19/19 PASS):
+PutObject/GetObject byte-exact/Overwrite/DeleteObjects/inexistente→None;
+Content-Type png/jpeg/webp preservado; traversal (`../../`, `..\`, chave>128)
+rejeitado; Unicode em profile_id rejeitado pelo app; CreateBucket e
+ListAllMyBuckets → AccessDenied (menor privilégio); endpoint inválido →
+MediaStorageUnavailable com mensagem sanitizada.
+
+E2E HTTP real (backend production/web + Neon + B2, 29/29 PASS): upload/replace/
+delete avatar A e B; A→A e B→B 200; A→B e B→A 403; sem token 401; token inválido
+401; objeto ausente 404; MIME svg/html rejeitado (422); acima do limite 413;
+traversal normalizado → 403 (ownership) e rota crua → 404; bucket sem URL
+pública (friendly URL → 401); avatar_url usa `/api/profiles/.../media/...` sem
+token na URL; headers `private`/`nosniff`; logs sem secrets; bucket limpo após
+os testes. Frontend: `useAuthedMedia.js` fetch com Authorization → blob →
+createObjectURL, revoga no replace e no unmount.
+
+Commits: `41e759c` (public base URL opcional), ver commits subsequentes abaixo.
 
 ## Achados e commits
 
