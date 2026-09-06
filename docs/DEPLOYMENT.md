@@ -58,11 +58,11 @@ KARI_BACKGROUND_MAX_CONCURRENCY=4
 KARI_LOG_LEVEL=INFO
 KARI_STORAGE_BACKEND=object_storage
 KARI_OBJECT_STORAGE_BUCKET=NOME_DO_BUCKET
-KARI_OBJECT_STORAGE_ENDPOINT=https://NAMESPACE.compat.objectstorage.REGIAO.oraclecloud.com
+KARI_OBJECT_STORAGE_ENDPOINT=https://s3.REGIAO.backblazeb2.com
 KARI_OBJECT_STORAGE_REGION=REGIAO
 KARI_OBJECT_STORAGE_ACCESS_KEY_ID=CHAVE_FORA_DO_GIT
 KARI_OBJECT_STORAGE_SECRET_ACCESS_KEY=SEGREDO_FORA_DO_GIT
-KARI_OBJECT_STORAGE_PUBLIC_BASE_URL=https://ORIGEM_PUBLICA_DA_MIDIA
+# KARI_OBJECT_STORAGE_PUBLIC_BASE_URL= (opcional; omitir com bucket PRIVATE)
 ```
 
 Crie o schema explicitamente antes de iniciar a API. O startup não executa DDL:
@@ -149,10 +149,12 @@ limites independentes. Antes de escalar horizontalmente, implemente um
 testes de políticas contra eles.
 
 Para uploads de avatar/background, use um bucket dedicado compatível com S3 e
-configure `KARI_STORAGE_BACKEND=object_storage` mais as seis variáveis
-`KARI_OBJECT_STORAGE_*` do `.env.example`. `KARI_OBJECT_STORAGE_PUBLIC_BASE_URL`
-deve apontar para a origem pública HTTPS do bucket/CDN. Restrinja a credencial do
-serviço a listar, criar e excluir objetos somente nesse bucket. Se o backend
+configure `KARI_STORAGE_BACKEND=object_storage` mais as variáveis
+`KARI_OBJECT_STORAGE_*` do `.env.example`. O bucket pode ser PRIVATE: a mídia é
+servida pela API autenticada (`/api/profiles/.../media/...`) e o frontend usa
+fetch com token. `KARI_OBJECT_STORAGE_PUBLIC_BASE_URL` é opcional e só é
+necessária se houver origem pública HTTPS do bucket/CDN. Restrinja a credencial do
+serviço a ler, criar e excluir objetos somente nesse bucket. Se o backend
 continuar em `filesystem`, uploads web permanecem indisponíveis por segurança.
 
 Proxy `/etc/caddy/Caddyfile`:

@@ -198,18 +198,46 @@ class ProfileMediaStorageTests(unittest.TestCase):
             {
                 "KARI_STORAGE_BACKEND": "object_storage",
                 "KARI_OBJECT_STORAGE_BUCKET": "kari-media",
-                "KARI_OBJECT_STORAGE_ENDPOINT": "https://namespace.compat.objectstorage.region.oraclecloud.com",
-                "KARI_OBJECT_STORAGE_REGION": "region",
+                "KARI_OBJECT_STORAGE_ENDPOINT": "https://s3.us-east-005.backblazeb2.com",
+                "KARI_OBJECT_STORAGE_REGION": "us-east-005",
                 "KARI_OBJECT_STORAGE_ACCESS_KEY_ID": "access",
                 "KARI_OBJECT_STORAGE_SECRET_ACCESS_KEY": "secret",
-                "KARI_OBJECT_STORAGE_PUBLIC_BASE_URL": "https://objectstorage.region.oraclecloud.com/n/ns/b/kari/o",
             }
         )
         self.assertEqual(settings.object_storage_bucket, "kari-media")
-        self.assertTrue(settings.object_storage_public_base_url.endswith("/o"))
+        self.assertEqual(settings.object_storage_public_base_url, "")
         rendered = repr(settings)
         self.assertNotIn("test-secret", rendered)
         self.assertNotIn("access", rendered)
+
+    def test_object_storage_public_base_url_optional_but_validated(self) -> None:
+        settings = load_settings(
+            {
+                "KARI_STORAGE_BACKEND": "object_storage",
+                "KARI_OBJECT_STORAGE_BUCKET": "kari-media",
+                "KARI_OBJECT_STORAGE_ENDPOINT": "https://s3.us-east-005.backblazeb2.com",
+                "KARI_OBJECT_STORAGE_REGION": "us-east-005",
+                "KARI_OBJECT_STORAGE_ACCESS_KEY_ID": "access",
+                "KARI_OBJECT_STORAGE_SECRET_ACCESS_KEY": "secret",
+                "KARI_OBJECT_STORAGE_PUBLIC_BASE_URL": "https://media.example.test/public",
+            }
+        )
+        self.assertEqual(
+            settings.object_storage_public_base_url,
+            "https://media.example.test/public",
+        )
+        with self.assertRaises(ConfigurationError):
+            load_settings(
+                {
+                    "KARI_STORAGE_BACKEND": "object_storage",
+                    "KARI_OBJECT_STORAGE_BUCKET": "kari-media",
+                    "KARI_OBJECT_STORAGE_ENDPOINT": "https://s3.us-east-005.backblazeb2.com",
+                    "KARI_OBJECT_STORAGE_REGION": "us-east-005",
+                    "KARI_OBJECT_STORAGE_ACCESS_KEY_ID": "access",
+                    "KARI_OBJECT_STORAGE_SECRET_ACCESS_KEY": "secret",
+                    "KARI_OBJECT_STORAGE_PUBLIC_BASE_URL": "https://media.example.test/public?token=1",
+                }
+            )
 
 
 if __name__ == "__main__":

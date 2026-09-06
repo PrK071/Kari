@@ -177,7 +177,6 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
             "KARI_OBJECT_STORAGE_REGION": object_storage_region,
             "KARI_OBJECT_STORAGE_ACCESS_KEY_ID": object_storage_access_key_id,
             "KARI_OBJECT_STORAGE_SECRET_ACCESS_KEY": object_storage_secret_access_key,
-            "KARI_OBJECT_STORAGE_PUBLIC_BASE_URL": object_storage_public_base_raw,
         }
         missing = [name for name, value in required.items() if not value]
         if missing:
@@ -189,11 +188,12 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
             object_storage_endpoint_raw,
             require_https=production,
         )
-        object_storage_public_base_url = _public_asset_url(
-            "KARI_OBJECT_STORAGE_PUBLIC_BASE_URL",
-            object_storage_public_base_raw,
-            require_https=production,
-        )
+        if object_storage_public_base_raw:
+            object_storage_public_base_url = _public_asset_url(
+                "KARI_OBJECT_STORAGE_PUBLIC_BASE_URL",
+                object_storage_public_base_raw,
+                require_https=production,
+            )
 
     persistence_default = "postgres" if production else "json"
     persistence_backend = _choice(
