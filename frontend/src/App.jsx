@@ -5,7 +5,12 @@ import { ArrowUpDown, BookOpen, BookText, Camera, ExternalLink, FileArchive, Gri
 import MangaCard, { MangaCardSkeleton } from "./components/MangaCard.jsx"
 import { readBrowserStorage, removeBrowserStorage, writeBrowserStorage } from "./browserStorage.js"
 import { profileEntryTarget } from "./profileAccess.js"
-import { scopedStorageKey } from "./profileStorage.js"
+import {
+  GUEST_STATE_OWNER_KEY,
+  guestStateMigrationKey,
+  scopedStorageKey,
+  shouldMigrateGuestState,
+} from "./profileStorage.js"
 import { authenticatedHeaders } from "./profileMedia.js"
 import { useAuthedMedia } from "./useAuthedMedia.js"
 
@@ -3178,7 +3183,8 @@ export default function App() {
   }, [selectedManga])
   const profileBootstrapStarted = useRef(false)
 
-  const activateBrowserState = useCallback((scope, profileFavorites, allowLegacy = false) => {
+  const activateBrowserState = useCallback((scope, profileFavorites, options = {}) => {
+    const { allowLegacy = false, migrateGuest = false } = options
     const favoritesKey = scopedStorageKey(FAVORITES_STORAGE_KEY, scope)
     const historyKey = scopedStorageKey(HISTORY_STORAGE_KEY, scope)
     const scopedFavorites = readStoredMangaList(favoritesKey)
@@ -3189,10 +3195,43 @@ export default function App() {
     const legacyHistory = allowLegacy && readBrowserStorage(historyKey) === null
       ? readStoredMangaList(HISTORY_STORAGE_KEY)
       : []
+    const migrationKey = guestStateMigrationKey(scope)
+    const migrateGuestNow = migrateGuest && shouldMigrateGuestState(
+      scope,
+      readBrowserStorage(GUEST_STATE_OWNER_KEY),
+      readBrowserStorage(migrationKey),
+    )
+    const guestFavorites = migrateGuestNow
+      ? mergeMangaLists(
+          readStoredMangaList(scopedStorageKey(FAVORITES_STORAGE_KEY, "guest")),
+          readStoredMangaList(FAVORITES_STORAGE_KEY),
+        )
+      : []
+    const guestHistory = migrateGuestNow
+      ? mergeMangaLists(
+          readStoredMangaList(scopedStorageKey(HISTORY_STORAGE_KEY, "guest")),
+          readStoredMangaList(HISTORY_STORAGE_KEY),
+        )
+      : []
     const readerSession = readReaderSession(scope, allowLegacy)
+    const mergedFavorites = mergeMangaLists(
+      Array.isArray(profileFavorites) ? profileFavorites : [],
+      scopedFavorites,
+      legacyFavorites,
+      guestFavorites,
+    )
+    const mergedHistory = mergeMangaLists(scopedHistory, legacyHistory, guestHistory).slice(0, 100)
 
-    setFavorites(Array.isArray(profileFavorites) ? profileFavorites : (scopedFavorites.length ? scopedFavorites : legacyFavorites))
-    setHistory(scopedHistory.length ? scopedHistory : legacyHistory)
+    if (migrateGuestNow && (guestFavorites.length || guestHistory.length)) {
+      const favoritesSaved = writeBrowserStorage(favoritesKey, JSON.stringify(mergedFavorites))
+      const historySaved = writeBrowserStorage(historyKey, JSON.stringify(mergedHistory))
+      if (favoritesSaved && historySaved && writeBrowserStorage(GUEST_STATE_OWNER_KEY, String(scope))) {
+        writeBrowserStorage(migrationKey, "1")
+      }
+    }
+
+    setFavorites(mergedFavorites)
+    setHistory(mergedHistory)
     setSelectedManga(readerSession?.manga ?? null)
     setStorageScope(scope || "guest")
   }, [])
@@ -3223,7 +3262,7 @@ export default function App() {
           if (meResp.ok) {
             const me = await meResp.json()
             if (cancelled) return
-            activateBrowserState(me.profile.id, me.profile.favorites ?? [])
+            activateBrowserState(me.profile.id, me.profile.favorites ?? [], { migrateGuest: true })
             setProfile(me.profile)
             setProfileReady(true)
             return
@@ -3277,7 +3316,7 @@ export default function App() {
         if (sync.ok) data = await sync.json()
       }
       if (cancelled) return
-      activateBrowserState(data.id, mergedFavorites, true)
+      activateBrowserState(data.id, mergedFavorites, { allowLegacy: true })
       setProfile(data)
       setProfileReady(true)
     }
@@ -3557,7 +3596,7 @@ export default function App() {
     writeBrowserStorage(AUTH_TOKEN_KEY, data.token)
     setAuthToken(data.token)
     setProfile(data.profile)
-    activateBrowserState(data.profile.id, data.profile.favorites ?? [])
+    activateBrowserState(data.profile.id, data.profile.favorites ?? [], { migrateGuest: true })
     setAuthOpen(false)
     setProfilePanelOpen(true)
   }, [activateBrowserState])
@@ -3587,7 +3626,7 @@ export default function App() {
       if (resp.ok) {
         const me = await resp.json()
         setProfile(me.profile)
-        activateBrowserState(me.profile.id, me.profile.favorites ?? [])
+        activateBrowserState(me.profile.id, me.profile.favorites ?? [], { migrateGuest: true })
         setProfilePanelOpen(true)
       }
     } catch {
