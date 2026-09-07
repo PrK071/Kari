@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query"
 import { FixedSizeGrid as Grid } from "react-window"
 import { ArrowUpDown, BookOpen, BookText, Camera, ExternalLink, FileArchive, Grid2X2, Heart, History, Home, ImagePlus, LibraryBig, Link2, Loader2, PanelLeftClose, PanelLeftOpen, Puzzle, Search, Trash2, Unlink, Upload, UserRound, X } from "lucide-react"
 import MangaCard, { MangaCardSkeleton } from "./components/MangaCard.jsx"
+import { profileEntryTarget } from "./profileAccess.js"
 import { scopedStorageKey } from "./profileStorage.js"
 import { authenticatedHeaders } from "./profileMedia.js"
 import { useAuthedMedia } from "./useAuthedMedia.js"
@@ -3539,8 +3540,10 @@ export default function App() {
   }, [])
 
   const openProfile = useCallback(() => {
-    setProfilePanelOpen(true)
-  }, [])
+    const target = profileEntryTarget(profile)
+    setProfilePanelOpen(target === "profile")
+    setAuthOpen(target === "auth")
+  }, [profile?.id])
 
   const handleAuth = useCallback(async (mode, fields) => {
     const endpoint = mode === "register" ? "register" : "login"
@@ -3559,6 +3562,7 @@ export default function App() {
     setProfile(data.profile)
     activateBrowserState(data.profile.id, data.profile.favorites ?? [])
     setAuthOpen(false)
+    setProfilePanelOpen(true)
   }, [activateBrowserState])
 
   const handleLogout = useCallback(() => {
@@ -3587,6 +3591,7 @@ export default function App() {
         const me = await resp.json()
         setProfile(me.profile)
         activateBrowserState(me.profile.id, me.profile.favorites ?? [])
+        setProfilePanelOpen(true)
       }
     } catch {
       /* ignore */

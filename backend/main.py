@@ -143,7 +143,7 @@ KARI_DATA_DIR = Path(
 KARI_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 CATALOG_SNAPSHOT_PATH = KARI_DATA_DIR / "catalog.json"
-CATALOG_SNAPSHOT_VERSION = 12
+CATALOG_SNAPSHOT_VERSION = 13
 CHAPTER_AUDIT_FAILURE_TTL_SECONDS = 5 * 60
 # Timeout POR FONTE no audit de capitulos da home. Uma fonte que trava (browser
 # offline, provider lento, Cloudflare) vira falha registrada em vez de segurar o
@@ -415,7 +415,7 @@ SOURCE_LABELS = {
 SEARCH_SOURCES = ["fliptru", "nexus", "mangageek", "sakura", "mangakatana", "mangasbrasuka", "mangalivre", "mangadex"]
 PT_COMPLETE_SOURCES = ["fliptru", "nexus", "mangageek", "sakura", "mangasbrasuka", "mangalivre"]
 ACTIVE_CATALOG_SOURCES = ["MangaDex", "Fliptru", "Nexus Mangas", "MangaGeek", "MangaKatana", "MangasBrasuka", "MangaLivre"]
-SEARCH_CACHE_VERSION = 10
+SEARCH_CACHE_VERSION = 11
 SEARCH_COVER_RECOVERY_LIMIT = 4
 
 SOURCE_RELIABILITY = {
@@ -441,6 +441,12 @@ SOURCE_RELIABILITY = {
 # Obras cuja fonte preferida foi confirmada manualmente. Mantem lista externa e
 # leitura no mesmo provider, mesmo se um catalogo antigo ainda tiver MangaDex.
 SYNC_TITLE_SOURCE_OVERRIDES = {
+    "hunter x hunter": {
+        "source": "MangaLivre",
+        "provider": "mangalivre",
+        "source_url": "https://mangalivre.blog/manga/hunter-x-hunter/",
+        "chapter_languages": ["pt-br"],
+    },
     "homunculus": {
         "source": "MangaKatana",
         "provider": "mangakatana",
@@ -470,6 +476,18 @@ SPARSE_CHAPTER_THRESHOLD = 8
 MIN_SOURCE_RELEVANCE = 0.45
 
 CURATED_CATALOG = [
+    {
+        "title": "HUNTER x HUNTER",
+        "aliases": ["Hunter x Hunter", "Hunter Hunter", "HxH"],
+        "url": "https://mangalivre.blog/manga/hunter-x-hunter/",
+        "poster": (
+            "https://mangalivre.blog/wp-content/uploads/2025/04/"
+            "a1686843-1414-45e4-a4b7-425d58356042.jpg.512.jpg"
+        ),
+        "provider": "mangalivre",
+        "section": "Aventura",
+        "genres": ["Acao", "Aventura", "Fantasia"],
+    },
     {
         "title": "Tensei Shitara Slime Datta Ken",
         "aliases": [
@@ -2162,6 +2180,46 @@ def _search_rank_tier(query: str, item: dict) -> int:
     return 4
 
 
+def _catalog_search_matches(query: str, limit: int) -> list[dict]:
+    """Mantem pesquisaveis as mesmas obras que a home exibe.
+
+    Uma fonte pode devolver a obra pelo titulo original/alternativo e fazer a
+    busca remota parecer bem-sucedida. Nesse caso o fallback antigo nao
+    consultava o snapshot e o card conhecido pelo usuario desaparecia.
+    """
+    data = catalog_cache.data if catalog_cache else (_read_catalog_snapshot() or {})
+    pools = [data.get("items") or [], _fast_curated_catalog_items()]
+    pools.extend(section.get("items") or [] for section in (data.get("sections") or []))
+
+    ranked: list[tuple[int, float, dict]] = []
+    seen: set[str] = set()
+    for pool in pools:
+        for raw in pool:
+            if not isinstance(raw, dict):
+                continue
+            item = dict(raw)
+            identity = str(
+                item.get("source_url") or item.get("id") or item.get("title") or ""
+            ).strip()
+            key = f"{str(item.get('provider') or '').lower()}:{identity}"
+            if not identity or key in seen or not _title_contains_query_tokens(query, item):
+                continue
+            score = _search_match_score(query, item)
+            if score <= 0:
+                continue
+            seen.add(key)
+            ranked.append((_search_rank_tier(query, item), -score, item))
+
+    ranked.sort(
+        key=lambda match: (
+            match[0],
+            match[1],
+            str(match[2].get("title") or "").lower(),
+        )
+    )
+    return [item for _, _, item in ranked[:limit]]
+
+
 def _build_sections_from_items(items: list[dict], per_section: int = 18) -> list[dict]:
     """Fallback: group items by their 'section' field when catalog sections are empty."""
     grouped: dict[str, list[dict]] = {}
@@ -2528,6 +2586,38 @@ def _dedupe_cross_source_sections(sections: list[dict]) -> list[dict]:
     return cleaned
 
 
+def _merge_curated_catalog(
+    items: list[dict],
+    sections: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """Mantem obras curadas na home depois que o snapshot remoto e atualizado."""
+    curated = _fast_curated_catalog_items()
+    if not curated:
+        return items, sections
+
+    merged_sections = [
+        {**section, "items": list(section.get("items") or [])}
+        for section in sections
+    ]
+    for item in curated:
+        section_title = str(item.get("section") or "Catalogo").strip() or "Catalogo"
+        target = next(
+            (
+                section
+                for section in merged_sections
+                if normalize_match_text(str(section.get("title") or ""))
+                == normalize_match_text(section_title)
+            ),
+            None,
+        )
+        if target is None:
+            target = {"title": section_title, "items": []}
+            merged_sections.append(target)
+        target["items"] = _dedupe([item, *(target.get("items") or [])])
+
+    return _dedupe([*curated, *items]), merged_sections
+
+
 def _partner_catalog_sections(limit: int = PARTNER_CATALOG_LIMIT) -> tuple[list[dict], list[dict]]:
     providers = tuple(
         provider
@@ -2630,6 +2720,7 @@ def _refresh_catalog_cache(limit: int = DEFAULT_LIMIT) -> None:
         while insert_at < len(sections) and str(sections[insert_at].get("title") or "").startswith("Rec"):
             insert_at += 1
         sections[insert_at:insert_at] = partner_sections
+        items, sections = _merge_curated_catalog(items, sections)
         sections = _dedupe_cross_source_sections(sections)
         if not sections and items:
             sections = _build_sections_from_items(items)
@@ -5225,6 +5316,11 @@ def _search_mangas(query: str, limit: int) -> dict:
         source_limit,
         timeout=SOURCE_SEARCH_TIMEOUT_SECONDS,
     )
+
+    # A barra pesquisa tambem o catalogo que o usuario acabou de ver. Fontes
+    # remotas frequentemente devolvem a mesma obra apenas pelo titulo original;
+    # manter o card do snapshot evita que ela pareca ter desaparecido da busca.
+    items = [*_catalog_search_matches(query, source_limit), *items]
 
     # Fontes externas geralmente exigem nome exato. Se primeira passada nao
     # achou match forte, tenta uma vez titulo proximo/prefixo sem abrir flood.
