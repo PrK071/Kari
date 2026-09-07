@@ -211,6 +211,18 @@ def _safe_error(exc: Exception) -> str:
     return type(exc).__name__
 
 
+def _elapsed_ms(started_at: float) -> float:
+    return round((time.perf_counter() - started_at) * 1000, 2)
+
+
+def _log_search_metrics(metrics: dict) -> None:
+    """Log estruturado sem o termo pesquisado ou mensagens vindas de terceiros."""
+    logger.info(
+        "search_metrics %s",
+        json.dumps(metrics, ensure_ascii=True, separators=(",", ":")),
+    )
+
+
 def _enforce_rate_limit(
     request: Request,
     scope: str,
@@ -3003,6 +3015,9 @@ def _search_sources_with_timeout(
     limit: int,
     *,
     timeout: float = SOURCE_SEARCH_TIMEOUT_SECONDS,
+    telemetry: list[dict] | None = None,
+    request_started_at: float | None = None,
+    phase: str = "primary",
 ) -> tuple[list[dict], list[str]]:
     if not sources:
         return [], []
@@ -3010,22 +3025,81 @@ def _search_sources_with_timeout(
     items: list[dict] = []
     errors: list[str] = []
     futures = {}
-    for source in sources:
+    submitted_at: dict[str, float] = {}
+    started_at: dict[str, float] = {}
+
+    def run_timed(source: str) -> tuple[list[dict], str | None, float, float]:
+        started = time.perf_counter()
+        started_at[source] = started
         try:
-            futures[scraper_executor.submit(_search_source, source, query, limit)] = source
+            source_items = _search_source(source, query, limit)
+            return source_items, None, started, time.perf_counter()
+        except Exception as exc:  # nunca inclui resposta/URL externa na telemetria
+            return [], _safe_error(exc), started, time.perf_counter()
+
+    for source in sources:
+        submitted = time.perf_counter()
+        try:
+            future = scraper_executor.submit(run_timed, source)
+            futures[future] = source
+            submitted_at[source] = submitted
         except WorkCapacityExceeded:
             errors.append(f"{_source_label(source)}: capacity")
+            if telemetry is not None:
+                telemetry.append({
+                    "source": source,
+                    "phase": phase,
+                    "provider_start_ms": round(
+                        (submitted - (request_started_at or submitted)) * 1000,
+                        2,
+                    ),
+                    "provider_duration_ms": 0.0,
+                    "result_count": 0,
+                    "timeout": False,
+                    "error": "capacity",
+                    "cache": "not_applicable",
+                })
     done, pending = wait(futures, timeout=timeout)
     for future in done:
         source = futures[future]
-        try:
-            items.extend(future.result())
-        except Exception as exc:
-            errors.append(f"{_source_label(source)}: {_safe_error(exc)}")
+        source_items, error, started, finished = future.result()
+        items.extend(source_items)
+        if error:
+            errors.append(f"{_source_label(source)}: {error}")
+        if telemetry is not None:
+            telemetry.append({
+                "source": source,
+                "phase": phase,
+                "provider_start_ms": round(
+                    (started - (request_started_at or started)) * 1000,
+                    2,
+                ),
+                "provider_duration_ms": round((finished - started) * 1000, 2),
+                "result_count": len(source_items),
+                "timeout": False,
+                "error": error,
+                "cache": "not_applicable",
+            })
     for future in pending:
         source = futures[future]
         future.cancel()
         errors.append(f"{_source_label(source)}: timeout")
+        if telemetry is not None:
+            finished = time.perf_counter()
+            started = started_at.get(source, submitted_at[source])
+            telemetry.append({
+                "source": source,
+                "phase": phase,
+                "provider_start_ms": round(
+                    (started - (request_started_at or started)) * 1000,
+                    2,
+                ),
+                "provider_duration_ms": round((finished - started) * 1000, 2),
+                "result_count": 0,
+                "timeout": True,
+                "error": None,
+                "cache": "not_applicable",
+            })
     return items, errors
 
 
@@ -5292,9 +5366,12 @@ def _fill_visible_home_chapter_counts(data: dict, matches_genre, cap: int = 48) 
 
 
 def _search_mangas(query: str, limit: int) -> dict:
+    request_started_at = time.perf_counter()
     normalized_query = normalize_match_text(query)
+    request_id = secrets.token_hex(4)
+    query_hash = hashlib.sha256(normalized_query.encode("utf-8")).hexdigest()[:12]
     if len(normalized_query) < 2:
-        return {
+        data = {
             "items": [],
             "sections": [{"title": "Resultados", "items": []}],
             "total": 0,
@@ -5304,28 +5381,71 @@ def _search_mangas(query: str, limit: int) -> dict:
             "errors": [],
             "cached": False,
         }
+        _log_search_metrics({
+            "request_id": request_id,
+            "query_hash": query_hash,
+            "query_length": len(normalized_query),
+            "request_total_ms": _elapsed_ms(request_started_at),
+            "cache": "miss",
+            "catalog_backend": "memory_or_json",
+            "catalog_access_ms": 0.0,
+            "postgres_access_ms": None,
+            "time_to_first_result_ms": None,
+            "external_wait_ms": 0.0,
+            "merge_dedupe_ms": 0.0,
+            "cover_recovery_ms": 0.0,
+            "result_count": 0,
+            "providers": [],
+        })
+        return data
 
     cache_key = f"v{SEARCH_CACHE_VERSION}:{normalized_query}:{limit}"
     cached = search_cache.get(cache_key)
     if _cache_is_fresh(cached, SEARCH_CACHE_TTL_SECONDS):
-        return {**cached.data, "cached": True}
+        data = {**cached.data, "cached": True}
+        _log_search_metrics({
+            "request_id": request_id,
+            "query_hash": query_hash,
+            "query_length": len(normalized_query),
+            "request_total_ms": _elapsed_ms(request_started_at),
+            "cache": "hit",
+            "catalog_backend": "memory_or_json",
+            "catalog_access_ms": 0.0,
+            "postgres_access_ms": None,
+            "time_to_first_result_ms": 0.0 if data.get("items") else None,
+            "external_wait_ms": 0.0,
+            "merge_dedupe_ms": 0.0,
+            "cover_recovery_ms": 0.0,
+            "result_count": len(data.get("items") or []),
+            "providers": [],
+        })
+        return data
 
     sources = _search_sources()
     source_limit = _search_source_limit(limit)
+    provider_metrics: list[dict] = []
+    catalog_started_at = time.perf_counter()
+    catalog_items = _catalog_search_matches(query, source_limit)
+    catalog_access_ms = _elapsed_ms(catalog_started_at)
+    first_result_ms = _elapsed_ms(request_started_at) if catalog_items else None
     # Sakura sai do batch rapido (browser nao cabe em 4s) e vira passe dedicado.
     sakura_live = "sakura" in sources
     fast_sources = [source for source in sources if source != "sakura"]
+    external_started_at = time.perf_counter()
     items, errors = _search_sources_with_timeout(
         fast_sources,
         query,
         source_limit,
         timeout=SOURCE_SEARCH_TIMEOUT_SECONDS,
+        telemetry=provider_metrics,
+        request_started_at=request_started_at,
+        phase="primary",
     )
 
     # A barra pesquisa tambem o catalogo que o usuario acabou de ver. Fontes
     # remotas frequentemente devolvem a mesma obra apenas pelo titulo original;
     # manter o card do snapshot evita que ela pareca ter desaparecido da busca.
-    items = [*_catalog_search_matches(query, source_limit), *items]
+    items = [*catalog_items, *items]
 
     # Fontes externas geralmente exigem nome exato. Se primeira passada nao
     # achou match forte, tenta uma vez titulo proximo/prefixo sem abrir flood.
@@ -5338,6 +5458,9 @@ def _search_mangas(query: str, limit: int) -> dict:
                 fallback_term,
                 source_limit,
                 timeout=min(SOURCE_SEARCH_TIMEOUT_SECONDS, 3.0),
+                telemetry=provider_metrics,
+                request_started_at=request_started_at,
+                phase="fallback",
             )
             items.extend(fallback_items)
             errors.extend(fallback_errors)
@@ -5355,10 +5478,24 @@ def _search_mangas(query: str, limit: int) -> dict:
                 query,
                 source_limit,
                 timeout=SAKURA_LIVE_SEARCH_TIMEOUT_SECONDS,
+                telemetry=provider_metrics,
+                request_started_at=request_started_at,
+                phase="sakura",
             )
             items.extend(sakura_items)
             errors.extend(sakura_errors)
 
+    external_wait_ms = _elapsed_ms(external_started_at)
+    if first_result_ms is None:
+        completed_with_results = [
+            metric["provider_start_ms"] + metric["provider_duration_ms"]
+            for metric in provider_metrics
+            if metric["result_count"] > 0
+        ]
+        if completed_with_results:
+            first_result_ms = round(min(completed_with_results), 2)
+
+    merge_started_at = time.perf_counter()
     items = _dedupe_search_results(items)
     items = _apply_curated_source_overrides(items, query)
     items = _dedupe_search_results(items)
@@ -5384,8 +5521,11 @@ def _search_mangas(query: str, limit: int) -> dict:
     )
     for item in items:
         item.pop("_search_tier", None)
+    merge_dedupe_ms = _elapsed_ms(merge_started_at)
     _share_search_covers_by_title(items)
+    cover_started_at = time.perf_counter()
     _recover_missing_search_covers(items[:limit])
+    cover_recovery_ms = _elapsed_ms(cover_started_at)
     data = {
         "items": items[:limit],
         "sections": [{"title": "Resultados", "items": items[:limit]}],
@@ -5397,6 +5537,25 @@ def _search_mangas(query: str, limit: int) -> dict:
         "cached": False,
     }
     search_cache[cache_key] = CacheEntry(time.time(), data)
+    _log_search_metrics({
+        "request_id": request_id,
+        "query_hash": query_hash,
+        "query_length": len(normalized_query),
+        "request_total_ms": _elapsed_ms(request_started_at),
+        "cache": "miss",
+        "catalog_backend": "memory_or_json",
+        "catalog_access_ms": catalog_access_ms,
+        "postgres_access_ms": None,
+        "time_to_first_result_ms": first_result_ms,
+        "external_wait_ms": external_wait_ms,
+        "merge_dedupe_ms": merge_dedupe_ms,
+        "cover_recovery_ms": cover_recovery_ms,
+        "result_count": len(data["items"]),
+        "providers": sorted(
+            provider_metrics,
+            key=lambda metric: (metric["provider_start_ms"], metric["source"]),
+        ),
+    })
     return data
 
 

@@ -133,7 +133,7 @@ function mergeMangaLists(...lists) {
   return result
 }
 
-function Header({ query, onQueryChange, onHome, onCatalog, onPluginSelect, onHistory, onFavorites, onProfile, profile, libraryView, pluginView, activeGenre, onClearGenre, total, isSearching, collapsed, hidden, onReveal, onRequestHide }) {
+function Header({ query, onQueryChange, onHome, onCatalog, onPluginSelect, onHistory, onFavorites, onProfile, profile, libraryView, pluginView, activeGenre, onClearGenre, total, isSearching, catalogBootstrapping, collapsed, hidden, onReveal, onRequestHide }) {
   const [pluginsOpen, setPluginsOpen] = useState(false)
   const pluginsRef = useRef(null)
   const pluginActive = pluginView === "hq" || pluginView === "hq-local" || pluginView === "novels"
@@ -163,7 +163,11 @@ function Header({ query, onQueryChange, onHome, onCatalog, onPluginSelect, onHis
           ? "Biblioteca de Web Novels"
       : activeGenre
     ? `${total} obras em ${activeGenre}`
-    : isSearching ? `${total} resultados` : `${total} obras no catalogo`
+    : isSearching
+      ? `${total} resultados`
+      : catalogBootstrapping
+        ? "Atualizando catalogo..."
+        : `${total} obras no catalogo`
   return (
     <header
       onMouseEnter={onReveal}
@@ -3505,9 +3509,20 @@ export default function App() {
       : refreshedHistory
   const visibleMangas = libraryView ? libraryItems : pagedCatalog ? catalogPages : mangas
   const total = libraryView ? libraryItems.length : (payload?.total ?? mangas.length)
+  // Em cold start o Render ainda nao tem catalog.json e responde o seed curado
+  // parcial (hoje, somente HxH passa como "pronto"). Nao apresente esse estado
+  // transitorio como se fosse o catalogo inteiro enquanto o refresh esta ativo.
+  const catalogBootstrapping = Boolean(
+    !debouncedQuery
+    && !genreFilter
+    && !libraryView
+    && !pluginView
+    && payload?.refreshing
+    && mangas.length <= 1,
+  )
   // Skeleton SO no primeiro carregamento (sem dado em cache). Voltar do modal
   // serve o cache -> isPending=false -> aparece instantaneo.
-  const loading = catalogQuery.isPending && !payload
+  const loading = (catalogQuery.isPending && !payload) || catalogBootstrapping
   const error = catalogQuery.isError ? "Nao consegui carregar o catalogo." : ""
 
   const heroSection = (sections ?? []).find(
@@ -3878,6 +3893,7 @@ export default function App() {
         onClearGenre={handleCatalog}
         total={total}
         isSearching={isSearching}
+        catalogBootstrapping={catalogBootstrapping}
         collapsed={headerCollapsed}
         hidden={headerHidden}
         onReveal={revealHeader}
