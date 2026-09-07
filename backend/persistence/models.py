@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from sqlalchemy import (
+    Boolean,
     Float,
     ForeignKey,
     Index,
@@ -10,11 +11,15 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
 class Base(DeclarativeBase):
     pass
+
+
+JSON_DOCUMENT = JSON().with_variant(JSONB(), "postgresql")
 
 
 class ProfileModel(Base):
@@ -176,5 +181,49 @@ class OAuthAccountModel(Base):
     profile: Mapped[ProfileModel] = relationship(back_populates="oauth_accounts")
 
 
+class CatalogItemModel(Base):
+    __tablename__ = "catalog_items"
+    __table_args__ = (
+        UniqueConstraint("provider", "source_key", name="uq_catalog_provider_source"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    canonical_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    canonical_title: Mapped[str] = mapped_column(String(512), nullable=False)
+    normalized_title: Mapped[str] = mapped_column(String(512), nullable=False)
+    aliases: Mapped[list] = mapped_column(JSON_DOCUMENT, nullable=False)
+    normalized_aliases: Mapped[list] = mapped_column(JSON_DOCUMENT, nullable=False)
+    search_text: Mapped[str] = mapped_column(Text, nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    source: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_identifier: Mapped[str] = mapped_column(Text, nullable=False)
+    source_url: Mapped[str] = mapped_column(Text, nullable=False)
+    cover_url: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    genres: Mapped[list] = mapped_column(JSON_DOCUMENT, nullable=False)
+    chapter_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    chapter_metadata: Mapped[dict] = mapped_column(JSON_DOCUMENT, nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON_DOCUMENT, nullable=False)
+    is_home_ready: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    first_seen_at: Mapped[float] = mapped_column(Float, nullable=False)
+    last_seen_at: Mapped[float] = mapped_column(Float, nullable=False)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+
 Index("ix_sessions_user_expires", SessionModel.user_id, SessionModel.expires_at)
 Index("ix_library_external", LibraryEntryModel.external_provider, LibraryEntryModel.external_id)
+Index("ix_catalog_normalized_title", CatalogItemModel.normalized_title)
+Index("ix_catalog_canonical_key", CatalogItemModel.canonical_key)
+Index("ix_catalog_home_ready_seen", CatalogItemModel.is_home_ready, CatalogItemModel.last_seen_at)
+Index(
+    "ix_catalog_search_text_trgm",
+    CatalogItemModel.search_text,
+    postgresql_using="gin",
+    postgresql_ops={"search_text": "gin_trgm_ops"},
+)
+Index(
+    "ix_catalog_normalized_aliases_gin",
+    CatalogItemModel.normalized_aliases,
+    postgresql_using="gin",
+)

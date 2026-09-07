@@ -37,6 +37,7 @@ from plugins.light_novel_local import LightNovelLocalPlugin
 from plugins.novel_mania import NovelManiaPlugin
 from plugins.pleiades_translations import PleiadesTranslationsPlugin
 from plugins.tensura_fan import TensuraFanPlugin
+from backend.title_normalization import normalize_match_text
 try:
     from curl_cffi import requests as curl_requests
 except Exception:
@@ -1078,13 +1079,6 @@ class TextExtractor(HTMLParser):
 
 def normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", unescape(value)).strip()
-
-
-def normalize_match_text(value: str) -> str:
-    value = unicodedata.normalize("NFKD", normalize_text(value))
-    value = "".join(char for char in value if not unicodedata.combining(char))
-    value = re.sub(r"[^a-zA-Z0-9]+", " ", value).lower()
-    return re.sub(r"\s+", " ", value).strip()
 
 
 def fuzzy_match_score(query: str, *values: str | None) -> float:

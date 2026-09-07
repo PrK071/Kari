@@ -7,7 +7,7 @@ from typing import Callable
 from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from backend.persistence.base import ProfileRepository, SessionRepository, UserRepository
+from backend.persistence.base import CatalogRepository, ProfileRepository, SessionRepository, UserRepository
 from backend.persistence.json import (
     JsonProfileRepository,
     JsonSessionRepository,
@@ -15,6 +15,7 @@ from backend.persistence.json import (
 )
 from backend.persistence.postgres import (
     OAuthTokenCipher,
+    PostgresCatalogRepository,
     PostgresProfileRepository,
     PostgresSessionRepository,
     PostgresUserRepository,
@@ -26,6 +27,7 @@ class PersistenceRepositories:
     users: UserRepository
     profiles: ProfileRepository
     sessions: SessionRepository
+    catalog: CatalogRepository | None = None
     engine: Engine | None = None
 
     def ready(self) -> bool:
@@ -64,5 +66,6 @@ def build_repositories(
         users=PostgresUserRepository(sessions),
         profiles=PostgresProfileRepository(sessions, cipher),
         sessions=PostgresSessionRepository(sessions),
+        catalog=PostgresCatalogRepository(sessions),
         engine=engine,
     )
