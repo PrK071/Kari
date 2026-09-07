@@ -7582,6 +7582,7 @@ def list_mangas(
 def search_mangas(
     request: Request,
     background_tasks: BackgroundTasks,
+    response: Response,
     q: str = Query(..., description="Termo de busca por titulo em fontes reais."),
     genre: str = Query(default="", description="Filtro local por genero."),
     limit: int = Query(default=DEFAULT_LIMIT, ge=1, le=200),
@@ -7589,7 +7590,10 @@ def search_mangas(
 ) -> SearchResponse:
     """Busca tipada: retorna MangaSearchItem (sinopse, generos, autores, etc.)."""
     _enforce_rate_limit(request, "search", SEARCH_RATE_LIMIT, resource=q.strip().lower())
-    return SearchResponse(**_build_search_payload(q, genre, limit, offset, background_tasks))
+    started_at = time.perf_counter()
+    payload = _build_search_payload(q, genre, limit, offset, background_tasks)
+    response.headers["Server-Timing"] = f"search;dur={_elapsed_ms(started_at):.2f}"
+    return SearchResponse(**payload)
 
 
 @app.get("/api/home", response_model=HomeResponse)
