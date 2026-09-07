@@ -33,6 +33,7 @@ class SchemaMigrationTests(unittest.TestCase):
                         "sessions",
                         "profiles",
                         "profile_favorites",
+                        "profile_history",
                         "profile_library",
                         "oauth_accounts",
                     }.issubset(tables)

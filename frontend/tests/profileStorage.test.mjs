@@ -3,6 +3,7 @@ import test from "node:test"
 
 import {
   guestStateMigrationKey,
+  legacyProfileScopeForMigration,
   scopedStorageKey,
   shouldMigrateGuestState,
 } from "../src/profileStorage.js"
@@ -14,6 +15,12 @@ test("browser state keys are isolated by profile", () => {
     scopedStorageKey("kari:reader-session:v1", "profile-a"),
     scopedStorageKey("kari:reader-session:v1", "profile-b"),
   )
+})
+
+test("legacy local profile is a recovery source only for a different authenticated profile", () => {
+  assert.equal(legacyProfileScopeForMigration("discord-1", "old-local-profile", true), "old-local-profile")
+  assert.equal(legacyProfileScopeForMigration("discord-1", "discord-1", true), "")
+  assert.equal(legacyProfileScopeForMigration("discord-1", "old-local-profile", false), "")
 })
 
 test("guest state has an explicit scope and unsafe separators are encoded", () => {

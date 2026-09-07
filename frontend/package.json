@@ -7,10 +7,11 @@
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
     "preview": "vite preview --host 127.0.0.1",
-    "test": "node --test tests/profileStorage.test.mjs tests/profileMedia.test.mjs tests/profileAccess.test.mjs tests/browserStorage.test.mjs"
+    "test": "node --test tests/profileStorage.test.mjs tests/profileMedia.test.mjs tests/profileAccess.test.mjs tests/browserStorage.test.mjs tests/browserLibrary.test.mjs"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.101.0",
+    "jszip": "^3.10.1",
     "lucide-react": "^1.24.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",

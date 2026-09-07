@@ -33,6 +33,11 @@ class ProfileModel(Base):
         cascade="all, delete-orphan",
         order_by="FavoriteModel.position",
     )
+    history: Mapped[list[HistoryEntryModel]] = relationship(
+        back_populates="profile",
+        cascade="all, delete-orphan",
+        order_by="HistoryEntryModel.position",
+    )
     library: Mapped[list[LibraryEntryModel]] = relationship(
         back_populates="profile",
         cascade="all, delete-orphan",
@@ -106,6 +111,24 @@ class FavoriteModel(Base):
     data: Mapped[dict] = mapped_column(JSON, nullable=False)
 
     profile: Mapped[ProfileModel] = relationship(back_populates="favorites")
+
+
+class HistoryEntryModel(Base):
+    __tablename__ = "profile_history"
+    __table_args__ = (
+        UniqueConstraint("profile_id", "item_key", name="uq_history_profile_item"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    profile_id: Mapped[str] = mapped_column(
+        ForeignKey("profiles.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    item_key: Mapped[str] = mapped_column(String(2048), nullable=False)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    data: Mapped[dict] = mapped_column(JSON, nullable=False)
+
+    profile: Mapped[ProfileModel] = relationship(back_populates="history")
 
 
 class LibraryEntryModel(Base):

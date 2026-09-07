@@ -64,6 +64,7 @@ class ProfileAuthorizationTests(unittest.TestCase):
             ("GET", f"/api/profiles/{profile_id}", None),
             ("PUT", f"/api/profiles/{profile_id}", {"display_name": "stolen"}),
             ("PUT", f"/api/profiles/{profile_id}/favorites", {"favorites": []}),
+            ("PUT", f"/api/profiles/{profile_id}/history", {"history": []}),
             (
                 "PUT",
                 f"/api/profiles/{profile_id}/library",
@@ -102,6 +103,7 @@ class ProfileAuthorizationTests(unittest.TestCase):
         profile_id = self.alice["profile"]["id"]
         headers = self._bearer(self.alice["token"])
         favorite = {"id": "manga-1", "title": "Owned favorite"}
+        history_item = {"id": "manga-2", "title": "Owned history"}
 
         updated = self.client.put(
             f"/api/profiles/{profile_id}/favorites",
@@ -110,11 +112,19 @@ class ProfileAuthorizationTests(unittest.TestCase):
         )
 
         self.assertEqual(updated.status_code, 200, updated.text)
+        history_updated = self.client.put(
+            f"/api/profiles/{profile_id}/history",
+            headers=headers,
+            json={"history": [history_item]},
+        )
+        self.assertEqual(history_updated.status_code, 200, history_updated.text)
         loaded = self.client.get(f"/api/profiles/{profile_id}", headers=headers)
         self.assertEqual(loaded.status_code, 200)
         self.assertEqual(len(loaded.json()["favorites"]), 1)
         self.assertEqual(loaded.json()["favorites"][0]["id"], favorite["id"])
         self.assertEqual(loaded.json()["favorites"][0]["title"], favorite["title"])
+        self.assertEqual(len(loaded.json()["history"]), 1)
+        self.assertEqual(loaded.json()["history"][0]["id"], history_item["id"])
 
     def test_missing_and_invalid_tokens_are_rejected(self) -> None:
         path = f"/api/profiles/{self.alice['profile']['id']}"

@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session, selectinload, sessionmaker
 
 from backend.persistence.models import (
     FavoriteModel,
+    HistoryEntryModel,
     LibraryEntryModel,
     OAuthAccountModel,
     ProfileModel,
@@ -127,6 +128,7 @@ class PostgresProfileRepository:
     def _query():
         return select(ProfileModel).options(
             selectinload(ProfileModel.favorites),
+            selectinload(ProfileModel.history),
             selectinload(ProfileModel.library),
             selectinload(ProfileModel.oauth_accounts),
         )
@@ -139,6 +141,7 @@ class PostgresProfileRepository:
             "background_url": model.background_url,
             "home_background_url": model.home_background_url,
             "favorites": [dict(item.data) for item in model.favorites],
+            "history": [dict(item.data) for item in model.history],
             "library": [dict(item.data) for item in model.library],
             "created_at": model.created_at,
             "updated_at": model.updated_at,
@@ -200,6 +203,21 @@ class PostgresProfileRepository:
                     favorite_keys.add(item_key)
                     database.add(
                         FavoriteModel(
+                            profile_id=profile_id,
+                            item_key=item_key,
+                            position=position,
+                            data=dict(item),
+                        )
+                    )
+
+            database.execute(delete(HistoryEntryModel).where(HistoryEntryModel.profile_id == profile_id))
+            history_keys: set[str] = set()
+            for position, item in enumerate(profile.get("history") or []):
+                item_key = _item_key(item) if isinstance(item, dict) else ""
+                if item_key and item_key not in history_keys:
+                    history_keys.add(item_key)
+                    database.add(
+                        HistoryEntryModel(
                             profile_id=profile_id,
                             item_key=item_key,
                             position=position,

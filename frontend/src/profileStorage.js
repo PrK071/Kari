@@ -16,3 +16,9 @@ export function shouldMigrateGuestState(profileId, ownerProfileId, completed) {
   if (!profile || completed === "1") return false
   return !owner || owner === profile
 }
+
+export function legacyProfileScopeForMigration(profileId, storedProfileId, enabled) {
+  const profile = String(profileId || "").trim()
+  const stored = String(storedProfileId || "").trim()
+  return enabled && stored && stored !== profile ? stored : ""
+}

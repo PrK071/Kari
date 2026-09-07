@@ -1093,6 +1093,10 @@ class ProfileFavoritesRequest(BaseModel):
     favorites: list[dict] = Field(default_factory=list, max_length=500)
 
 
+class ProfileHistoryRequest(BaseModel):
+    history: list[dict] = Field(default_factory=list, max_length=100)
+
+
 class ProfileLibraryEntryRequest(BaseModel):
     item: dict
     status: str = Field(default="COMPLETED", max_length=24)
@@ -1493,6 +1497,7 @@ def _profile_payload(profile: dict) -> dict:
         "home_background_url": str(profile.get("home_background_url") or ""),
         "links": _profile_links_payload(profile),
         "favorites": [_profile_item_with_cached_chapters(item) for item in (profile.get("favorites") or [])],
+        "history": [_profile_item_with_cached_chapters(item) for item in (profile.get("history") or [])],
         "library": [_profile_item_with_cached_chapters(item) for item in (profile.get("library") or [])],
         "created_at": float(profile.get("created_at") or 0),
         "updated_at": float(profile.get("updated_at") or 0),
@@ -5422,6 +5427,7 @@ def create_profile(request: ProfileCreateRequest) -> dict:
         "id": uuid4().hex,
         "display_name": display_name,
         "favorites": [],
+        "history": [],
         "library": [],
         "created_at": now,
         "updated_at": now,
@@ -5482,6 +5488,33 @@ def update_profile_favorites(
     with _profiles_lock:
         profile = _profile_or_404(profile_id)
         profile["favorites"] = favorites
+        profile["updated_at"] = time.time()
+        profile_repository.save(profile)
+    return _profile_payload(profile)
+
+
+@app.put("/api/profiles/{profile_id}/history")
+def update_profile_history(
+    profile_id: str,
+    request: ProfileHistoryRequest,
+    current_user: AuthenticatedUser = Depends(require_profile_owner),
+) -> dict:
+    del current_user
+    history: list[dict] = []
+    seen: set[str] = set()
+    for raw_item in request.history:
+        item = _profile_favorite(raw_item)
+        if not item:
+            continue
+        key = str(item.get("source_url") or item.get("id") or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        history.append(item)
+
+    with _profiles_lock:
+        profile = _profile_or_404(profile_id)
+        profile["history"] = history[:100]
         profile["updated_at"] = time.time()
         profile_repository.save(profile)
     return _profile_payload(profile)
@@ -6641,6 +6674,8 @@ def auth_register(request: RegisterRequest, http_request: Request) -> dict:
             "id": uuid4().hex,
             "display_name": username,
             "favorites": [],
+            "history": [],
+            "library": [],
             "created_at": now,
             "updated_at": now,
         }
@@ -6808,6 +6843,8 @@ def _finish_external_login(
                 "display_name": display,
                 "avatar_url": avatar_url,
                 "favorites": [],
+                "history": [],
+                "library": [],
                 "created_at": now,
                 "updated_at": now,
             }

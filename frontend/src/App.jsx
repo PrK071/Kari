@@ -3,11 +3,13 @@ import { useQuery } from "@tanstack/react-query"
 import { FixedSizeGrid as Grid } from "react-window"
 import { ArrowUpDown, BookOpen, BookText, Camera, ExternalLink, FileArchive, Grid2X2, Heart, History, Home, ImagePlus, LibraryBig, Link2, Loader2, PanelLeftClose, PanelLeftOpen, Puzzle, Search, Trash2, Unlink, Upload, UserRound, X } from "lucide-react"
 import MangaCard, { MangaCardSkeleton } from "./components/MangaCard.jsx"
+import BrowserLibraryPage from "./BrowserLibraryPage.jsx"
 import { readBrowserStorage, removeBrowserStorage, writeBrowserStorage } from "./browserStorage.js"
 import { profileEntryTarget } from "./profileAccess.js"
 import {
   GUEST_STATE_OWNER_KEY,
   guestStateMigrationKey,
+  legacyProfileScopeForMigration,
   scopedStorageKey,
   shouldMigrateGuestState,
 } from "./profileStorage.js"
@@ -1005,20 +1007,20 @@ function HQNowPluginPage({ onOpen, localLibrariesEnabled }) {
       >
         <FileArchive size={15} aria-hidden="true" /> HQ Now
       </button>
-      {localLibrariesEnabled && (
-        <button
-          type="button"
-          role="tab"
-          aria-selected={tab === "local"}
-          onClick={() => setTab("local")}
-          className={`flex h-9 items-center gap-2 rounded px-3 text-xs font-bold transition ${tab === "local" ? "bg-accent text-black" : "border border-line bg-panel text-zinc-300 hover:border-accent"}`}
-        >
-          <Upload size={15} aria-hidden="true" /> Minha biblioteca
-        </button>
-      )}
+      <button
+        type="button"
+        role="tab"
+        aria-selected={tab === "local"}
+        onClick={() => setTab("local")}
+        className={`flex h-9 items-center gap-2 rounded px-3 text-xs font-bold transition ${tab === "local" ? "bg-accent text-black" : "border border-line bg-panel text-zinc-300 hover:border-accent"}`}
+      >
+        <Upload size={15} aria-hidden="true" /> Meu aparelho
+      </button>
     </div>
     {tab === "local" ? (
-      <PluginLibraryPage kind="hq" onOpen={onOpen} />
+      localLibrariesEnabled
+        ? <PluginLibraryPage kind="hq" onOpen={onOpen} />
+        : <BrowserLibraryPage kind="hq" />
     ) : (
     <main className="mx-auto min-h-[calc(100vh-72px)] w-full max-w-[1600px] px-4 py-6">
       <section aria-labelledby="hq-now-title">
@@ -1259,22 +1261,22 @@ function WebNovelsPluginPage({ onOpen, onChanged, localLibrariesEnabled }) {
         >
           <BookOpen size={15} aria-hidden="true" /> Pleiades
         </button>
-        {localLibrariesEnabled && (
-          <button
-            type="button"
-            role="tab"
-            aria-selected={tab === "local"}
-            onClick={() => setTab("local")}
-            className={`flex h-9 items-center gap-2 rounded px-3 text-xs font-bold transition ${tab === "local" ? "bg-accent text-black" : "border border-line bg-panel text-zinc-300 hover:border-accent"}`}
-          >
-            <Upload size={15} aria-hidden="true" /> Minha biblioteca
-          </button>
-        )}
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "local"}
+          onClick={() => setTab("local")}
+          className={`flex h-9 items-center gap-2 rounded px-3 text-xs font-bold transition ${tab === "local" ? "bg-accent text-black" : "border border-line bg-panel text-zinc-300 hover:border-accent"}`}
+        >
+          <Upload size={15} aria-hidden="true" /> Meu aparelho
+        </button>
       </div>
       {tab !== "local" ? (
         <RemoteNovelsPluginPage source={tab} onOpen={onOpen} />
       ) : (
-        <PluginLibraryPage kind="novels" onOpen={onOpen} onChanged={onChanged} />
+        localLibrariesEnabled
+          ? <PluginLibraryPage kind="novels" onOpen={onOpen} onChanged={onChanged} />
+          : <BrowserLibraryPage kind="novels" />
       )}
     </>
   )
@@ -1471,7 +1473,7 @@ function fileToDataUrl(file) {
   })
 }
 
-function ProfilePanel({ profile, historyCount, onClose, onSave, onProfileChange, onShowHistory, onShowFavorites, onShowLibrary, authed, onOpenAuth, onLogout }) {
+function ProfilePanel({ profile, favoritesCount, historyCount, onClose, onSave, onProfileChange, onShowHistory, onShowFavorites, onShowLibrary, onRecoverBrowserData, authed, onOpenAuth, onLogout }) {
   const [name, setName] = useState(profile?.display_name || "Leitor")
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState("")
@@ -1601,6 +1603,11 @@ function ProfilePanel({ profile, historyCount, onClose, onSave, onProfileChange,
 
   const linkAccount = async (provider) => {
     if (!profile?.id) return
+    const popup = window.open("", "kari-oauth", "width=560,height=760")
+    if (!popup) {
+      setError("Habilite popups para vincular a conta.")
+      return
+    }
     setLinking(provider)
     setError("")
     setNotice("")
@@ -1612,16 +1619,14 @@ function ProfilePanel({ profile, historyCount, onClose, onSave, onProfileChange,
       const data = await response.json().catch(() => null)
       if (!response.ok) {
         setError((data && data.detail) || "Nao consegui iniciar o vinculo.")
+        popup.close()
         setLinking("")
         return
       }
-      const popup = window.open(data.authorize_url, "kari-oauth", "width=560,height=760")
-      if (!popup) {
-        setError("Habilite popups para vincular a conta.")
-        setLinking("")
-      }
+      popup.location.replace(data.authorize_url)
     } catch {
       setError("Nao consegui iniciar o vinculo.")
+      popup.close()
       setLinking("")
     }
   }
@@ -1801,7 +1806,7 @@ function ProfilePanel({ profile, historyCount, onClose, onSave, onProfileChange,
               className="rounded border border-line/70 bg-soft/40 px-3 py-2 text-left backdrop-blur transition hover:border-accent/60 hover:bg-accent/10 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
             >
               <p className="text-[10px] uppercase text-muted">Favoritos</p>
-              <p className="mt-1 text-lg font-black text-zinc-100">{profile.favorites?.length || 0}</p>
+              <p className="mt-1 text-lg font-black text-zinc-100">{favoritesCount}</p>
             </button>
             <button
               type="button"
@@ -1820,6 +1825,25 @@ function ProfilePanel({ profile, historyCount, onClose, onSave, onProfileChange,
               <p className="mt-1 text-lg font-black text-zinc-100">{profile.library?.length || 0}</p>
             </button>
           </div>
+
+          {authed && (
+            <button
+              type="button"
+              onClick={() => {
+                const recovered = onRecoverBrowserData?.()
+                if (!recovered) return
+                setError("")
+                setNotice(
+                  recovered.total > 0
+                    ? `Recuperados deste aparelho: ${recovered.favorites} favoritos e ${recovered.history} itens do historico.`
+                    : "Nao encontrei dados antigos neste aparelho.",
+                )
+              }}
+              className="mt-3 flex h-9 w-full items-center justify-center gap-2 rounded border border-accent/40 bg-accent/10 text-xs font-bold text-accent transition hover:bg-accent/20"
+            >
+              <History size={14} aria-hidden="true" /> Recuperar dados deste aparelho
+            </button>
+          )}
 
           {/* Conta (cadastro/login) */}
           <div className="mt-5">
@@ -3183,8 +3207,13 @@ export default function App() {
   }, [selectedManga])
   const profileBootstrapStarted = useRef(false)
 
-  const activateBrowserState = useCallback((scope, profileFavorites, options = {}) => {
-    const { allowLegacy = false, migrateGuest = false } = options
+  const activateBrowserState = useCallback((scope, profileFavorites, profileHistory = [], options = {}) => {
+    const {
+      allowLegacy = false,
+      forceBrowserRecovery = false,
+      legacyProfileId = "",
+      migrateGuest = false,
+    } = options
     const favoritesKey = scopedStorageKey(FAVORITES_STORAGE_KEY, scope)
     const historyKey = scopedStorageKey(HISTORY_STORAGE_KEY, scope)
     const scopedFavorites = readStoredMangaList(favoritesKey)
@@ -3196,21 +3225,32 @@ export default function App() {
       ? readStoredMangaList(HISTORY_STORAGE_KEY)
       : []
     const migrationKey = guestStateMigrationKey(scope)
-    const migrateGuestNow = migrateGuest && shouldMigrateGuestState(
-      scope,
-      readBrowserStorage(GUEST_STATE_OWNER_KEY),
-      readBrowserStorage(migrationKey),
+    const migrateGuestNow = (migrateGuest || forceBrowserRecovery) && (
+      forceBrowserRecovery || shouldMigrateGuestState(
+        scope,
+        readBrowserStorage(GUEST_STATE_OWNER_KEY),
+        readBrowserStorage(migrationKey),
+      )
     )
+    const legacyScope = legacyProfileScopeForMigration(scope, legacyProfileId, migrateGuestNow)
+    const legacyProfileFavorites = legacyScope
+      ? readStoredMangaList(scopedStorageKey(FAVORITES_STORAGE_KEY, legacyScope))
+      : []
+    const legacyProfileHistory = legacyScope
+      ? readStoredMangaList(scopedStorageKey(HISTORY_STORAGE_KEY, legacyScope))
+      : []
     const guestFavorites = migrateGuestNow
       ? mergeMangaLists(
           readStoredMangaList(scopedStorageKey(FAVORITES_STORAGE_KEY, "guest")),
           readStoredMangaList(FAVORITES_STORAGE_KEY),
+          legacyProfileFavorites,
         )
       : []
     const guestHistory = migrateGuestNow
       ? mergeMangaLists(
           readStoredMangaList(scopedStorageKey(HISTORY_STORAGE_KEY, "guest")),
           readStoredMangaList(HISTORY_STORAGE_KEY),
+          legacyProfileHistory,
         )
       : []
     const readerSession = readReaderSession(scope, allowLegacy)
@@ -3220,7 +3260,12 @@ export default function App() {
       legacyFavorites,
       guestFavorites,
     )
-    const mergedHistory = mergeMangaLists(scopedHistory, legacyHistory, guestHistory).slice(0, 100)
+    const mergedHistory = mergeMangaLists(
+      Array.isArray(profileHistory) ? profileHistory : [],
+      scopedHistory,
+      legacyHistory,
+      guestHistory,
+    ).slice(0, 100)
 
     if (migrateGuestNow && (guestFavorites.length || guestHistory.length)) {
       const favoritesSaved = writeBrowserStorage(favoritesKey, JSON.stringify(mergedFavorites))
@@ -3234,6 +3279,7 @@ export default function App() {
     setHistory(mergedHistory)
     setSelectedManga(readerSession?.manga ?? null)
     setStorageScope(scope || "guest")
+    return { favorites: mergedFavorites, history: mergedHistory }
   }, [])
 
   useEffect(() => {
@@ -3254,6 +3300,7 @@ export default function App() {
     const bootstrap = async () => {
       // 1) Conta logada: usa o perfil da conta (token Bearer).
       const token = readBrowserStorage(AUTH_TOKEN_KEY) || ""
+      const legacyProfileId = readBrowserStorage(PROFILE_STORAGE_KEY) || ""
       if (token) {
         try {
           const meResp = await fetch(`${API_BASE_URL}/api/auth/me`, {
@@ -3262,8 +3309,13 @@ export default function App() {
           if (meResp.ok) {
             const me = await meResp.json()
             if (cancelled) return
-            activateBrowserState(me.profile.id, me.profile.favorites ?? [], { migrateGuest: true })
-            setProfile(me.profile)
+            const restored = activateBrowserState(
+              me.profile.id,
+              me.profile.favorites ?? [],
+              me.profile.history ?? [],
+              { migrateGuest: true, legacyProfileId },
+            )
+            setProfile({ ...me.profile, favorites: restored.favorites, history: restored.history })
             setProfileReady(true)
             return
           }
@@ -3279,7 +3331,7 @@ export default function App() {
       // backend existem apenas para compatibilidade com o runtime desktop.
       if (!LOCAL_CAPABILITIES_ENABLED) {
         if (!cancelled) {
-          activateBrowserState("guest")
+          activateBrowserState("guest", [], [])
           setProfileReady(true)
         }
         return
@@ -3316,7 +3368,7 @@ export default function App() {
         if (sync.ok) data = await sync.json()
       }
       if (cancelled) return
-      activateBrowserState(data.id, mergedFavorites, { allowLegacy: true })
+      activateBrowserState(data.id, mergedFavorites, data.history ?? [], { allowLegacy: true })
       setProfile(data)
       setProfileReady(true)
     }
@@ -3345,6 +3397,25 @@ export default function App() {
       .catch(() => {})
     return () => controller.abort()
   }, [favorites, profile?.id, profileReady])
+
+  useEffect(() => {
+    if (!profileReady || !profile?.id) return undefined
+    const controller = new AbortController()
+    void fetch(`${API_BASE_URL}/api/profiles/${encodeURIComponent(profile.id)}/history`, {
+      method: "PUT",
+      signal: controller.signal,
+      headers: authenticatedHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ history }),
+    })
+      .then((response) => response.ok ? response.json() : null)
+      .then((data) => {
+        if (data && !controller.signal.aborted) {
+          setProfile((current) => current?.id === data.id ? data : current)
+        }
+      })
+      .catch(() => {})
+    return () => controller.abort()
+  }, [history, profile?.id, profileReady])
 
   // Debounce do termo digitado (180ms) -> uma query por pausa, nao por tecla.
   // A queryKey usa o valor "debounced"; o input continua refletindo `query`.
@@ -3523,8 +3594,13 @@ export default function App() {
         .then((response) => response.ok ? response.json() : null)
         .then((data) => {
           if (!data) return
-          setProfile(data)
-          if (Array.isArray(data.favorites)) setFavorites(data.favorites)
+          setFavorites((current) => mergeMangaLists(data.favorites, current))
+          setHistory((current) => mergeMangaLists(data.history, current).slice(0, 100))
+          setProfile((current) => ({
+            ...data,
+            favorites: mergeMangaLists(data.favorites, current?.favorites),
+            history: mergeMangaLists(data.history, current?.history).slice(0, 100),
+          }))
         })
         .catch(() => {})
     }
@@ -3595,8 +3671,13 @@ export default function App() {
     if (!resp.ok) throw new Error(data.detail || "Falha na autenticacao.")
     writeBrowserStorage(AUTH_TOKEN_KEY, data.token)
     setAuthToken(data.token)
-    setProfile(data.profile)
-    activateBrowserState(data.profile.id, data.profile.favorites ?? [], { migrateGuest: true })
+    const restored = activateBrowserState(
+      data.profile.id,
+      data.profile.favorites ?? [],
+      data.profile.history ?? [],
+      { migrateGuest: true, legacyProfileId: readBrowserStorage(PROFILE_STORAGE_KEY) || "" },
+    )
+    setProfile({ ...data.profile, favorites: restored.favorites, history: restored.history })
     setAuthOpen(false)
     setProfilePanelOpen(true)
   }, [activateBrowserState])
@@ -3625,8 +3706,13 @@ export default function App() {
       })
       if (resp.ok) {
         const me = await resp.json()
-        setProfile(me.profile)
-        activateBrowserState(me.profile.id, me.profile.favorites ?? [], { migrateGuest: true })
+        const restored = activateBrowserState(
+          me.profile.id,
+          me.profile.favorites ?? [],
+          me.profile.history ?? [],
+          { migrateGuest: true, legacyProfileId: readBrowserStorage(PROFILE_STORAGE_KEY) || "" },
+        )
+        setProfile({ ...me.profile, favorites: restored.favorites, history: restored.history })
         setProfilePanelOpen(true)
       }
     } catch {
@@ -3660,7 +3746,31 @@ export default function App() {
     if (!nextProfile) return
     setProfile(nextProfile)
     if (Array.isArray(nextProfile.favorites)) setFavorites(nextProfile.favorites)
+    if (Array.isArray(nextProfile.history)) setHistory(nextProfile.history)
   }, [])
+
+  const recoverBrowserData = useCallback(() => {
+    if (!profile?.id) return null
+    const restored = activateBrowserState(
+      profile.id,
+      mergeMangaLists(profile.favorites, favorites),
+      mergeMangaLists(profile.history, history),
+      {
+        forceBrowserRecovery: true,
+        legacyProfileId: readBrowserStorage(PROFILE_STORAGE_KEY) || "",
+      },
+    )
+    setProfile((current) => current ? {
+      ...current,
+      favorites: restored.favorites,
+      history: restored.history,
+    } : current)
+    return {
+      favorites: restored.favorites.length,
+      history: restored.history.length,
+      total: restored.favorites.length + restored.history.length,
+    }
+  }, [activateBrowserState, favorites, history, profile])
 
   const refreshProfile = useCallback(async () => {
     if (!profile?.id) return
@@ -3846,6 +3956,7 @@ export default function App() {
       {profilePanelOpen && (
         <ProfilePanel
           profile={profile}
+          favoritesCount={favorites.length}
           historyCount={history.length}
           onClose={() => setProfilePanelOpen(false)}
           onSave={saveProfile}
@@ -3853,6 +3964,7 @@ export default function App() {
           onShowHistory={() => { setProfilePanelOpen(false); showLibrary("history") }}
           onShowFavorites={() => { setProfilePanelOpen(false); showLibrary("favorites") }}
           onShowLibrary={() => { setProfilePanelOpen(false); showLibrary("library") }}
+          onRecoverBrowserData={recoverBrowserData}
           authed={authed}
           onOpenAuth={() => { setProfilePanelOpen(false); setAuthOpen(true) }}
           onLogout={handleLogout}

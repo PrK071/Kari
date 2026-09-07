@@ -80,6 +80,7 @@ class PostgresRepositoryTests(unittest.TestCase):
             "id": "profile-a",
             "display_name": "Alice",
             "favorites": [{"id": "favorite-a", "title": "Favorite"}],
+            "history": [{"id": "history-a", "title": "History"}],
             "library": [
                 {
                     "id": "library-a",
@@ -111,6 +112,7 @@ class PostgresRepositoryTests(unittest.TestCase):
         loaded = self.repositories.profiles.get("profile-a")
 
         self.assertEqual(loaded["favorites"][0]["id"], "favorite-a")
+        self.assertEqual(loaded["history"][0]["id"], "history-a")
         self.assertEqual(loaded["library"][0]["status"], "CURRENT")
         self.assertEqual(
             loaded["_tokens"]["anilist"]["access_token"],
