@@ -35,7 +35,8 @@ class FliptruPlugin:
     provider = "fliptru"
     source_label = "Fliptru"
 
-    def __init__(self) -> None:
+    def __init__(self, request_timeout: float | tuple[float, float] | None = None) -> None:
+        self.request_timeout = request_timeout or (5, 22)
         self.session = requests.Session()
         adapter = HTTPAdapter(max_retries=2, pool_connections=10, pool_maxsize=10)
         self.session.mount("https://", adapter)
@@ -76,7 +77,7 @@ class FliptruPlugin:
         return f"{BASE_URL}/comic/{slug}/{chapter}"
 
     def _get(self, url: str, *, params: dict | None = None) -> requests.Response:
-        response = self.session.get(url, params=params, timeout=(5, 22))
+        response = self.session.get(url, params=params, timeout=self.request_timeout)
         response.raise_for_status()
         return response
 

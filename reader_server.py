@@ -1241,7 +1241,7 @@ class MangaReader:
         self.cache = TemporaryChapterCache()
         self.hq_plugin = HQLocalPlugin()
         self.hq_now_plugin = HQNowPlugin()
-        self.fliptru_plugin = FliptruPlugin()
+        self.fliptru_plugin = FliptruPlugin(getattr(args, "request_timeout", None))
         self.central_novel_plugin = CentralNovelPlugin()
         self.light_novel_plugin = LightNovelLocalPlugin()
         self.novel_mania_plugin = NovelManiaPlugin()
