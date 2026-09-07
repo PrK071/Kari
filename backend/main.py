@@ -217,7 +217,7 @@ def _elapsed_ms(started_at: float) -> float:
 
 def _log_search_metrics(metrics: dict) -> None:
     """Log estruturado sem o termo pesquisado ou mensagens vindas de terceiros."""
-    logger.info(
+    logging.getLogger("uvicorn.error").info(
         "search_metrics %s",
         json.dumps(metrics, ensure_ascii=True, separators=(",", ":")),
     )
