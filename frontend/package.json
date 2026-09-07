@@ -7,7 +7,7 @@
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
     "preview": "vite preview --host 127.0.0.1",
-    "test": "node --test tests/profileStorage.test.mjs tests/profileMedia.test.mjs tests/profileAccess.test.mjs"
+    "test": "node --test tests/profileStorage.test.mjs tests/profileMedia.test.mjs tests/profileAccess.test.mjs tests/browserStorage.test.mjs"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.101.0",

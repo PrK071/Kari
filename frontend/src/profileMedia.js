@@ -1,7 +1,9 @@
+import { readBrowserStorage } from "./browserStorage.js"
+
 export const AUTH_TOKEN_KEY = "kari:auth-token:v1"
 
 export function authenticatedHeaders(headers = {}) {
-  const token = window.localStorage.getItem(AUTH_TOKEN_KEY) || ""
+  const token = readBrowserStorage(AUTH_TOKEN_KEY) || ""
   return token ? { ...headers, Authorization: `Bearer ${token}` } : headers
 }
 

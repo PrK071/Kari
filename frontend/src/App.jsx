@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query"
 import { FixedSizeGrid as Grid } from "react-window"
 import { ArrowUpDown, BookOpen, BookText, Camera, ExternalLink, FileArchive, Grid2X2, Heart, History, Home, ImagePlus, LibraryBig, Link2, Loader2, PanelLeftClose, PanelLeftOpen, Puzzle, Search, Trash2, Unlink, Upload, UserRound, X } from "lucide-react"
 import MangaCard, { MangaCardSkeleton } from "./components/MangaCard.jsx"
+import { readBrowserStorage, removeBrowserStorage, writeBrowserStorage } from "./browserStorage.js"
 import { profileEntryTarget } from "./profileAccess.js"
 import { scopedStorageKey } from "./profileStorage.js"
 import { authenticatedHeaders } from "./profileMedia.js"
@@ -104,7 +105,7 @@ function mangaTitleAliasKey(manga) {
 
 function readStoredMangaList(key) {
   try {
-    const value = JSON.parse(window.localStorage.getItem(key) || "[]")
+    const value = JSON.parse(readBrowserStorage(key) || "[]")
     return Array.isArray(value) ? value.filter((item) => mangaStorageKey(item)) : []
   } catch {
     return []
@@ -921,8 +922,8 @@ const LOCAL_LIBRARY_CONFIG = {
 function readReaderSession(profileId, allowLegacy = false) {
   try {
     const key = scopedStorageKey(READER_SESSION_STORAGE_KEY, profileId)
-    const rawValue = window.localStorage.getItem(key)
-      ?? (allowLegacy ? window.localStorage.getItem(READER_SESSION_STORAGE_KEY) : null)
+    const rawValue = readBrowserStorage(key)
+      ?? (allowLegacy ? readBrowserStorage(READER_SESSION_STORAGE_KEY) : null)
     const value = JSON.parse(rawValue || "null")
     if (!value?.manga || !mangaStorageKey(value.manga) || !value.chapter_url) return null
     return value
@@ -932,7 +933,7 @@ function readReaderSession(profileId, allowLegacy = false) {
 }
 
 function clearReaderSession(profileId) {
-  window.localStorage.removeItem(scopedStorageKey(READER_SESSION_STORAGE_KEY, profileId))
+  removeBrowserStorage(scopedStorageKey(READER_SESSION_STORAGE_KEY, profileId))
 }
 
 function chapterTextBlocks(content) {
@@ -1477,6 +1478,9 @@ function ProfilePanel({ profile, historyCount, onClose, onSave, onProfileChange,
   const avatarInputRef = useRef(null)
   const backgroundInputRef = useRef(null)
   const homeBgInputRef = useRef(null)
+  const avatarMedia = useAuthedMedia(profile?.avatar_url)
+  const backgroundMedia = useAuthedMedia(profile?.background_url || profile?.home_background_url)
+  const homeBgMedia = useAuthedMedia(profile?.home_background_url)
 
   useEffect(() => {
     setName(profile?.display_name || "Leitor")
@@ -1665,9 +1669,6 @@ function ProfilePanel({ profile, historyCount, onClose, onSave, onProfileChange,
     }
   }
 
-  const avatarMedia = useAuthedMedia(profile.avatar_url)
-  const backgroundMedia = useAuthedMedia(profile.background_url || profile.home_background_url)
-  const homeBgMedia = useAuthedMedia(profile.home_background_url)
   const avatarSrc = avatarMedia.src
   const backgroundSrc = backgroundMedia.src
   const links = profile.links || {}
@@ -2216,16 +2217,12 @@ function MangaDetailPanel({ manga, storageScope, onClose, onGenreSelect, isFavor
       window.open(chapter.external_url, "_blank", "noopener,noreferrer")
       return
     }
-    try {
-      window.localStorage.setItem(scopedStorageKey(READER_SESSION_STORAGE_KEY, storageScope), JSON.stringify({
-        manga,
-        manga_key: mangaStorageKey(manga),
-        chapter_url: chapter.url,
-        chapter_lang: chapterLang,
-      }))
-    } catch {
-      // Leitor continua funcionando caso armazenamento local esteja indisponivel.
-    }
+    writeBrowserStorage(scopedStorageKey(READER_SESSION_STORAGE_KEY, storageScope), JSON.stringify({
+      manga,
+      manga_key: mangaStorageKey(manga),
+      chapter_url: chapter.url,
+      chapter_lang: chapterLang,
+    }))
     setLoadingChapter(true)
     setLoaderTick((t) => t + 1)
     setFirstChapterPageLoaded(false)
@@ -3104,7 +3101,7 @@ export default function App() {
   const [pluginView, setPluginView] = useState("")
   const [headerCollapsed, setHeaderCollapsed] = useState(false)
   const [headerHidden, setHeaderHidden] = useState(false)
-  const [authToken, setAuthToken] = useState(() => window.localStorage.getItem(AUTH_TOKEN_KEY) || "")
+  const [authToken, setAuthToken] = useState(() => readBrowserStorage(AUTH_TOKEN_KEY) || "")
   const [authOpen, setAuthOpen] = useState(false)
   const [storageScope, setStorageScope] = useState("")
   const authed = Boolean(authToken)
@@ -3186,10 +3183,10 @@ export default function App() {
     const historyKey = scopedStorageKey(HISTORY_STORAGE_KEY, scope)
     const scopedFavorites = readStoredMangaList(favoritesKey)
     const scopedHistory = readStoredMangaList(historyKey)
-    const legacyFavorites = allowLegacy && window.localStorage.getItem(favoritesKey) === null
+    const legacyFavorites = allowLegacy && readBrowserStorage(favoritesKey) === null
       ? readStoredMangaList(FAVORITES_STORAGE_KEY)
       : []
-    const legacyHistory = allowLegacy && window.localStorage.getItem(historyKey) === null
+    const legacyHistory = allowLegacy && readBrowserStorage(historyKey) === null
       ? readStoredMangaList(HISTORY_STORAGE_KEY)
       : []
     const readerSession = readReaderSession(scope, allowLegacy)
@@ -3202,12 +3199,12 @@ export default function App() {
 
   useEffect(() => {
     if (!storageScope) return
-    window.localStorage.setItem(scopedStorageKey(FAVORITES_STORAGE_KEY, storageScope), JSON.stringify(favorites))
+    writeBrowserStorage(scopedStorageKey(FAVORITES_STORAGE_KEY, storageScope), JSON.stringify(favorites))
   }, [favorites, storageScope])
 
   useEffect(() => {
     if (!storageScope) return
-    window.localStorage.setItem(scopedStorageKey(HISTORY_STORAGE_KEY, storageScope), JSON.stringify(history))
+    writeBrowserStorage(scopedStorageKey(HISTORY_STORAGE_KEY, storageScope), JSON.stringify(history))
   }, [history, storageScope])
 
   useEffect(() => {
@@ -3217,7 +3214,7 @@ export default function App() {
 
     const bootstrap = async () => {
       // 1) Conta logada: usa o perfil da conta (token Bearer).
-      const token = window.localStorage.getItem(AUTH_TOKEN_KEY) || ""
+      const token = readBrowserStorage(AUTH_TOKEN_KEY) || ""
       if (token) {
         try {
           const meResp = await fetch(`${API_BASE_URL}/api/auth/me`, {
@@ -3231,10 +3228,10 @@ export default function App() {
             setProfileReady(true)
             return
           }
-          window.localStorage.removeItem(AUTH_TOKEN_KEY)
+          removeBrowserStorage(AUTH_TOKEN_KEY)
           if (!cancelled) setAuthToken("")
         } catch {
-          window.localStorage.removeItem(AUTH_TOKEN_KEY)
+          removeBrowserStorage(AUTH_TOKEN_KEY)
           if (!cancelled) setAuthToken("")
         }
       }
@@ -3250,7 +3247,7 @@ export default function App() {
       }
 
       // 3) Desktop: perfil anonimo local legado.
-      const storedId = window.localStorage.getItem(PROFILE_STORAGE_KEY)
+      const storedId = readBrowserStorage(PROFILE_STORAGE_KEY)
       let response = storedId
         ? await fetch(`${API_BASE_URL}/api/profiles/${encodeURIComponent(storedId)}`)
         : null
@@ -3263,11 +3260,11 @@ export default function App() {
       }
       if (!response.ok) throw new Error("profile")
       let data = await response.json()
-      window.localStorage.setItem(PROFILE_STORAGE_KEY, data.id)
+      writeBrowserStorage(PROFILE_STORAGE_KEY, data.id)
 
       const favoritesKey = scopedStorageKey(FAVORITES_STORAGE_KEY, data.id)
       const localFavorites = readStoredMangaList(favoritesKey)
-      const legacyFavorites = window.localStorage.getItem(favoritesKey) === null
+      const legacyFavorites = readBrowserStorage(favoritesKey) === null
         ? readStoredMangaList(FAVORITES_STORAGE_KEY)
         : []
       const mergedFavorites = mergeMangaLists(data.favorites, localFavorites, legacyFavorites)
@@ -3557,7 +3554,7 @@ export default function App() {
     })
     const data = await resp.json().catch(() => ({}))
     if (!resp.ok) throw new Error(data.detail || "Falha na autenticacao.")
-    window.localStorage.setItem(AUTH_TOKEN_KEY, data.token)
+    writeBrowserStorage(AUTH_TOKEN_KEY, data.token)
     setAuthToken(data.token)
     setProfile(data.profile)
     activateBrowserState(data.profile.id, data.profile.favorites ?? [])
@@ -3566,22 +3563,22 @@ export default function App() {
   }, [activateBrowserState])
 
   const handleLogout = useCallback(() => {
-    const token = window.localStorage.getItem(AUTH_TOKEN_KEY)
+    const token = readBrowserStorage(AUTH_TOKEN_KEY)
     if (token) {
       void fetch(`${API_BASE_URL}/api/auth/logout`, {
         method: "POST",
         headers: { Authorization: `Bearer ${token}` },
       }).catch(() => {})
     }
-    window.localStorage.removeItem(AUTH_TOKEN_KEY)
-    window.localStorage.removeItem(PROFILE_STORAGE_KEY)
+    removeBrowserStorage(AUTH_TOKEN_KEY)
+    removeBrowserStorage(PROFILE_STORAGE_KEY)
     setAuthToken("")
     window.location.reload()
   }, [])
 
   // Recebe o token de login externo (Discord) via popup postMessage.
   const handleAuthToken = useCallback(async (token) => {
-    window.localStorage.setItem(AUTH_TOKEN_KEY, token)
+    writeBrowserStorage(AUTH_TOKEN_KEY, token)
     setAuthToken(token)
     try {
       const resp = await fetch(`${API_BASE_URL}/api/auth/me`, {
