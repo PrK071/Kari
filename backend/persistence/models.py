@@ -216,12 +216,9 @@ Index("ix_library_external", LibraryEntryModel.external_provider, LibraryEntryMo
 Index("ix_catalog_normalized_title", CatalogItemModel.normalized_title)
 Index("ix_catalog_canonical_key", CatalogItemModel.canonical_key)
 Index("ix_catalog_home_ready_seen", CatalogItemModel.is_home_ready, CatalogItemModel.last_seen_at)
-Index(
-    "ix_catalog_search_text_trgm",
-    CatalogItemModel.search_text,
-    postgresql_using="gin",
-    postgresql_ops={"search_text": "gin_trgm_ops"},
-)
+# O indice com operator class de pg_trgm pertence a migration Alembic. Declara-lo
+# no metadata quebra create_all() quando o search_path nao inclui o schema da
+# extensao (por exemplo, testes PostgreSQL em schema isolado).
 Index(
     "ix_catalog_normalized_aliases_gin",
     CatalogItemModel.normalized_aliases,
