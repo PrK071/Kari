@@ -5739,10 +5739,11 @@ def _rank_persistent_search_items(query: str, items: list[dict], limit: int) -> 
     return ranked[:limit]
 
 
-def _invalidate_search_cache(normalized_query: str) -> None:
+def _invalidate_empty_search_cache(normalized_query: str) -> None:
     marker = f":{normalized_query}:"
     for key in list(search_cache):
-        if marker in key:
+        cached = search_cache.get(key)
+        if marker in key and cached is not None and not cached.data.get("items"):
             search_cache.pop(key, None)
 
 
@@ -5762,7 +5763,7 @@ def _refresh_search_background(query: str, limit: int, query_hash: str) -> None:
     )
     persisted_count = _persist_catalog_items(items)
     if persisted_count:
-        _invalidate_search_cache(normalize_match_text(query))
+        _invalidate_empty_search_cache(normalize_match_text(query))
     _log_search_metrics({
         "event": "search_background_metrics",
         "query_hash": query_hash,
@@ -5811,7 +5812,7 @@ def _foreground_external_search(
     return items, errors, provider_metrics
 
 
-def _search_mangas(query: str, limit: int) -> dict:
+def _search_mangas(query: str, limit: int, *, defer_refresh: bool = False) -> dict:
     # Desktop/JSON conserva o fluxo anterior; no Kari Web PostgreSQL e a fonte
     # de verdade e providers nunca bloqueiam uma obra ja conhecida.
     if catalog_repository is None:
@@ -5874,7 +5875,9 @@ def _search_mangas(query: str, limit: int) -> dict:
     )
     ranked_local = _rank_persistent_search_items(query, local_items, limit)
     if ranked_local:
-        background_started = _schedule_search_refresh(query, limit, query_hash)
+        background_started = (
+            True if defer_refresh else _schedule_search_refresh(query, limit, query_hash)
+        )
         data = {
             "items": ranked_local,
             "sections": [{"title": "Resultados", "items": ranked_local}],
@@ -5888,7 +5891,9 @@ def _search_mangas(query: str, limit: int) -> dict:
             "errors": [f"PostgreSQL: {postgres_error}"] if postgres_error else [],
             "cached": False,
         }
-        search_cache[cache_key] = CacheEntry(time.time(), data)
+        search_cache[cache_key] = CacheEntry(time.time(), dict(data))
+        if defer_refresh:
+            data["_refresh_deferred"] = {"query_hash": query_hash}
         total_ms = _elapsed_ms(request_started_at)
         _log_search_metrics({
             "request_id": request_id,
@@ -5919,7 +5924,9 @@ def _search_mangas(query: str, limit: int) -> dict:
     external_refresh_ms = _elapsed_ms(external_started_at)
     ranked_external = _rank_persistent_search_items(query, external_items, limit)
     persisted_count = _persist_catalog_items(external_items)
-    background_started = _schedule_search_refresh(query, limit, query_hash)
+    background_started = (
+        True if defer_refresh else _schedule_search_refresh(query, limit, query_hash)
+    )
     data = {
         "items": ranked_external,
         "sections": [{"title": "Resultados", "items": ranked_external}],
@@ -5933,7 +5940,9 @@ def _search_mangas(query: str, limit: int) -> dict:
         "errors": errors,
         "cached": False,
     }
-    search_cache[cache_key] = CacheEntry(time.time(), data)
+    search_cache[cache_key] = CacheEntry(time.time(), dict(data))
+    if defer_refresh:
+        data["_refresh_deferred"] = {"query_hash": query_hash}
     total_ms = _elapsed_ms(request_started_at)
     _log_search_metrics({
         "request_id": request_id,
@@ -7565,13 +7574,14 @@ def list_mangas(
     """
     _enforce_rate_limit(request, "catalog", SEARCH_RATE_LIMIT, resource=q.strip().lower())
     if q.strip():
-        return _build_search_payload(q, genre, limit, offset)
+        return _build_search_payload(q, genre, limit, offset, background_tasks)
     return _build_home_payload(genre, limit, offset)
 
 
 @app.get("/api/search", response_model=SearchResponse)
 def search_mangas(
     request: Request,
+    background_tasks: BackgroundTasks,
     q: str = Query(..., description="Termo de busca por titulo em fontes reais."),
     genre: str = Query(default="", description="Filtro local por genero."),
     limit: int = Query(default=DEFAULT_LIMIT, ge=1, le=200),
@@ -7579,7 +7589,7 @@ def search_mangas(
 ) -> SearchResponse:
     """Busca tipada: retorna MangaSearchItem (sinopse, generos, autores, etc.)."""
     _enforce_rate_limit(request, "search", SEARCH_RATE_LIMIT, resource=q.strip().lower())
-    return SearchResponse(**_build_search_payload(q, genre, limit, offset))
+    return SearchResponse(**_build_search_payload(q, genre, limit, offset, background_tasks))
 
 
 @app.get("/api/home", response_model=HomeResponse)
@@ -8050,12 +8060,30 @@ def _light_novel_catalog_items(query: str = "") -> list[dict]:
     return items
 
 
-def _build_search_payload(q: str, genre: str, limit: int, offset: int) -> dict:
+def _build_search_payload(
+    q: str,
+    genre: str,
+    limit: int,
+    offset: int,
+    background_tasks: BackgroundTasks | None = None,
+) -> dict:
     """Logica de BUSCA: payload completo (poucos itens), com traducao."""
     query = q.strip()
     _matches_genre = _matches_genre_factory(genre)
 
-    data = _search_mangas(query, limit=max(limit + offset, limit))
+    data = _search_mangas(
+        query,
+        limit=max(limit + offset, limit),
+        defer_refresh=background_tasks is not None,
+    )
+    deferred_refresh = data.pop("_refresh_deferred", None)
+    if background_tasks is not None and deferred_refresh:
+        background_tasks.add_task(
+            _schedule_search_refresh,
+            query,
+            max(limit + offset, limit),
+            str(deferred_refresh["query_hash"]),
+        )
     local_sections = [
         ("Minha biblioteca de HQs", _hq_catalog_items(query)),
         ("Minha biblioteca de Light Novels", _light_novel_catalog_items(query)),

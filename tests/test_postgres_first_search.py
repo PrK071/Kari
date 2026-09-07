@@ -74,6 +74,18 @@ class PostgresFirstSearchTests(unittest.TestCase):
         self.assertLess(duration, 0.1)
         external.assert_not_called()
 
+    def test_http_flow_defers_refresh_until_after_response(self) -> None:
+        main.catalog_repository = FakeCatalogRepository([manga()])
+        with patch("backend.main._schedule_search_refresh") as schedule:
+            result = main._search_mangas(
+                "hunter x hunter",
+                8,
+                defer_refresh=True,
+            )
+
+        self.assertIn("_refresh_deferred", result)
+        schedule.assert_not_called()
+
     def test_external_result_is_persisted_then_postgres_serves_it(self) -> None:
         repository = FakeCatalogRepository()
         main.catalog_repository = repository
