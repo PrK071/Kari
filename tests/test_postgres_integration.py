@@ -29,7 +29,7 @@ class RealPostgresIntegrationTests(unittest.TestCase):
                 connection.execute(text(f'CREATE SCHEMA "{schema}"'))
 
             isolated_url = make_url(POSTGRES_URL).update_query_dict(
-                {"options": f"-csearch_path={schema}"}
+                {"options": f"-csearch_path={schema},public"}
             )
             unused = lambda: Path("unused.json")
             repositories = build_repositories(
@@ -73,6 +73,15 @@ class RealPostgresIntegrationTests(unittest.TestCase):
                 "profile-test",
             )
             self.assertNotIn("raw-token-not-persisted", repositories.sessions.all())
+            self.assertIsNotNone(repositories.catalog)
+            repositories.catalog.upsert_item({
+                "title": "HUNTER × HUNTER",
+                "aliases": ["Hunter x Hunter"],
+                "provider": "mangalivre",
+                "source_url": "https://mangalivre.blog/manga/hunter-x-hunter/",
+            })
+            catalog_results = repositories.catalog.search("hunter x hunter", 8)
+            self.assertEqual(catalog_results[0]["title"], "HUNTER × HUNTER")
         finally:
             if repositories and repositories.engine:
                 repositories.engine.dispose()

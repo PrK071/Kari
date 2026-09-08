@@ -8088,7 +8088,7 @@ def _build_search_payload(
             max(limit + offset, limit),
             str(deferred_refresh["query_hash"]),
         )
-    local_sections = [
+    local_sections = [] if settings.is_web else [
         ("Minha biblioteca de HQs", _hq_catalog_items(query)),
         ("Minha biblioteca de Light Novels", _light_novel_catalog_items(query)),
     ]

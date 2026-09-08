@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
+
+from fastapi import BackgroundTasks
 
 from backend import main
 
@@ -85,6 +88,21 @@ class PostgresFirstSearchTests(unittest.TestCase):
 
         self.assertIn("_refresh_deferred", result)
         schedule.assert_not_called()
+
+    def test_web_search_does_not_scan_desktop_libraries(self) -> None:
+        main.catalog_repository = FakeCatalogRepository([manga()])
+        with (
+            patch("backend.main.settings", SimpleNamespace(is_web=True)),
+            patch("backend.main._hq_catalog_items") as hq_items,
+            patch("backend.main._light_novel_catalog_items") as novel_items,
+        ):
+            result = main._build_search_payload(
+                "hunter x hunter", "", 8, 0, BackgroundTasks()
+            )
+
+        self.assertEqual(result["items"][0]["title"], "Hunter x Hunter")
+        hq_items.assert_not_called()
+        novel_items.assert_not_called()
 
     def test_external_result_is_persisted_then_postgres_serves_it(self) -> None:
         repository = FakeCatalogRepository()

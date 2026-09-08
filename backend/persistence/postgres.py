@@ -162,28 +162,29 @@ class PostgresCatalogRepository:
             return []
         with self._sessions() as database:
             if database.bind is not None and database.bind.dialect.name == "postgresql":
-                candidate_ids = list(database.execute(
-                    text(
-                        """
-                        SELECT id
-                        FROM catalog_items
-                        WHERE normalized_title = :query
-                           OR normalized_aliases @> CAST(:alias_json AS jsonb)
-                           OR normalized_title LIKE :prefix
-                           OR search_text % :query
-                           OR search_text LIKE :contains
-                        ORDER BY
-                          CASE
-                            WHEN normalized_title = :query THEN 0
-                            WHEN normalized_aliases @> CAST(:alias_json AS jsonb) THEN 1
-                            WHEN normalized_title LIKE :prefix THEN 2
-                            ELSE 3
-                          END,
-                          similarity(search_text, :query) DESC,
-                          last_seen_at DESC
-                        LIMIT :candidate_limit
-                        """
-                    ),
+                statement = select(CatalogItemModel).from_statement(text(
+                    """
+                    SELECT catalog_items.*
+                    FROM catalog_items
+                    WHERE normalized_title = :query
+                       OR normalized_aliases @> CAST(:alias_json AS jsonb)
+                       OR normalized_title LIKE :prefix
+                       OR search_text % :query
+                       OR search_text LIKE :contains
+                    ORDER BY
+                      CASE
+                        WHEN normalized_title = :query THEN 0
+                        WHEN normalized_aliases @> CAST(:alias_json AS jsonb) THEN 1
+                        WHEN normalized_title LIKE :prefix THEN 2
+                        ELSE 3
+                      END,
+                      similarity(search_text, :query) DESC,
+                      last_seen_at DESC
+                    LIMIT :candidate_limit
+                    """
+                ))
+                return list(database.scalars(
+                    statement,
                     {
                         "query": normalized,
                         "alias_json": json.dumps([normalized]),
@@ -191,14 +192,7 @@ class PostgresCatalogRepository:
                         "contains": f"%{normalized}%",
                         "candidate_limit": max(limit * 4, 20),
                     },
-                ).scalars())
-                if not candidate_ids:
-                    return []
-                models = list(database.scalars(
-                    select(CatalogItemModel).where(CatalogItemModel.id.in_(candidate_ids))
                 ))
-                by_id = {model.id: model for model in models}
-                return [by_id[item_id] for item_id in candidate_ids if item_id in by_id]
 
             models = list(database.scalars(select(CatalogItemModel)))
             ranked: list[tuple[int, float, float, CatalogItemModel]] = []
