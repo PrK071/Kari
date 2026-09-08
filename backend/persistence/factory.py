@@ -59,7 +59,10 @@ def build_repositories(
     if backend != "postgres":
         raise ValueError(f"Backend de persistencia desconhecido: {backend}")
 
-    engine = create_engine(database_url, pool_pre_ping=True)
+    # O pre-ping adiciona um round-trip PostgreSQL a toda operacao. No Render
+    # distante do Neon isso custava centenas de ms por busca; reciclar conexoes
+    # antigas preserva o caminho ativo sem pagar esse ping em cada checkout.
+    engine = create_engine(database_url, pool_pre_ping=False, pool_recycle=240)
     sessions = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
     cipher = OAuthTokenCipher(secret_key)
     return PersistenceRepositories(
