@@ -89,6 +89,16 @@ class PostgresFirstSearchTests(unittest.TestCase):
         self.assertIn("_refresh_deferred", result)
         schedule.assert_not_called()
 
+    def test_fresh_catalog_result_does_not_start_external_refresh(self) -> None:
+        fresh = manga()
+        fresh["_catalog_last_seen_at"] = time.time()
+        main.catalog_repository = FakeCatalogRepository([fresh])
+        with patch("backend.main._schedule_search_refresh") as schedule:
+            result = main._search_mangas("hunter x hunter", 8)
+
+        self.assertEqual(result["items"][0]["title"], "Hunter x Hunter")
+        schedule.assert_not_called()
+
     def test_web_search_does_not_scan_desktop_libraries(self) -> None:
         main.catalog_repository = FakeCatalogRepository([manga()])
         with (

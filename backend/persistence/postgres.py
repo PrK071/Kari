@@ -144,6 +144,7 @@ class PostgresCatalogRepository:
             "genres": list(model.genres or []),
             "alternative_titles": list(model.aliases or []),
             "catalog_home_ready": bool(model.is_home_ready),
+            "_catalog_last_seen_at": model.last_seen_at,
         })
         if not payload.get("cover_url") and model.cover_url:
             payload["cover_url"] = model.cover_url

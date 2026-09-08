@@ -115,6 +115,7 @@ OAUTH_RATE_LIMIT = RateLimitPolicy(limit=10, window_seconds=10 * 60)
 
 CATALOG_CACHE_TTL_SECONDS = 30 * 60
 SEARCH_CACHE_TTL_SECONDS = 5 * 60
+CATALOG_SEARCH_REFRESH_TTL_SECONDS = 30 * 60
 SOURCE_RESOLUTION_CACHE_TTL_SECONDS = 10 * 60
 CHAPTER_COUNT_CACHE_TTL_SECONDS = 20 * 60
 CHAPTERS_CACHE_TTL_SECONDS = 10 * 60
@@ -2118,6 +2119,14 @@ def _persistent_catalog_search(query: str, limit: int) -> tuple[list[dict], floa
         ], _elapsed_ms(started_at), None
     except Exception as exc:
         return [], _elapsed_ms(started_at), _safe_error(exc)
+
+
+def _catalog_search_refresh_due(items: list[dict], now: float | None = None) -> bool:
+    newest_seen = max(
+        (float(item.get("_catalog_last_seen_at") or 0) for item in items),
+        default=0.0,
+    )
+    return newest_seen <= 0 or (now or time.time()) - newest_seen >= CATALOG_SEARCH_REFRESH_TTL_SECONDS
 
 
 def _dedupe(items: list[dict]) -> list[dict]:
@@ -5721,6 +5730,7 @@ def _rank_persistent_search_items(query: str, items: list[dict], limit: int) -> 
         if score <= 0 or not _title_contains_query_tokens(query, item):
             continue
         candidate = dict(item)
+        candidate.pop("_catalog_last_seen_at", None)
         candidate["relevance"] = round(score, 4)
         candidate["_search_tier"] = _search_rank_tier(query, candidate)
         ranked.append(candidate)
@@ -5885,7 +5895,8 @@ def _search_mangas(
     )
     ranked_local = _rank_persistent_search_items(query, local_items, limit)
     if ranked_local:
-        background_started = (
+        refresh_due = _catalog_search_refresh_due(local_items)
+        background_started = refresh_due and (
             True if defer_refresh else _schedule_search_refresh(query, limit, query_hash)
         )
         data = {
@@ -5902,7 +5913,7 @@ def _search_mangas(
             "cached": False,
         }
         search_cache[cache_key] = CacheEntry(time.time(), dict(data))
-        if defer_refresh:
+        if defer_refresh and refresh_due:
             data["_refresh_deferred"] = {"query_hash": query_hash}
         total_ms = _elapsed_ms(request_started_at)
         timings.update({
