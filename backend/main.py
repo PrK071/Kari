@@ -5812,11 +5812,19 @@ def _foreground_external_search(
     return items, errors, provider_metrics
 
 
-def _search_mangas(query: str, limit: int, *, defer_refresh: bool = False) -> dict:
+def _search_mangas(
+    query: str,
+    limit: int,
+    *,
+    defer_refresh: bool = False,
+    timings: dict[str, float] | None = None,
+) -> dict:
     # Desktop/JSON conserva o fluxo anterior; no Kari Web PostgreSQL e a fonte
     # de verdade e providers nunca bloqueiam uma obra ja conhecida.
     if catalog_repository is None:
         return _legacy_search_mangas(query, limit)
+
+    timings = timings if timings is not None else {}
 
     request_started_at = time.perf_counter()
     normalized_query = normalize_match_text(query)
@@ -5833,6 +5841,7 @@ def _search_mangas(query: str, limit: int, *, defer_refresh: bool = False) -> di
         "cached": False,
     }
     if len(normalized_query) < 2:
+        timings.update({"postgres_search_ms": 0.0, "search_total_ms": _elapsed_ms(request_started_at)})
         _log_search_metrics({
             "request_id": request_id,
             "query_hash": query_hash,
@@ -5853,6 +5862,7 @@ def _search_mangas(query: str, limit: int, *, defer_refresh: bool = False) -> di
     if _cache_is_fresh(cached, SEARCH_CACHE_TTL_SECONDS):
         data = {**cached.data, "cached": True}
         total_ms = _elapsed_ms(request_started_at)
+        timings.update({"postgres_search_ms": 0.0, "search_total_ms": total_ms})
         _log_search_metrics({
             "request_id": request_id,
             "query_hash": query_hash,
@@ -5895,6 +5905,10 @@ def _search_mangas(query: str, limit: int, *, defer_refresh: bool = False) -> di
         if defer_refresh:
             data["_refresh_deferred"] = {"query_hash": query_hash}
         total_ms = _elapsed_ms(request_started_at)
+        timings.update({
+            "postgres_search_ms": postgres_search_ms,
+            "search_total_ms": total_ms,
+        })
         _log_search_metrics({
             "request_id": request_id,
             "query_hash": query_hash,
@@ -5944,6 +5958,10 @@ def _search_mangas(query: str, limit: int, *, defer_refresh: bool = False) -> di
     if defer_refresh:
         data["_refresh_deferred"] = {"query_hash": query_hash}
     total_ms = _elapsed_ms(request_started_at)
+    timings.update({
+        "postgres_search_ms": postgres_search_ms,
+        "search_total_ms": total_ms,
+    })
     _log_search_metrics({
         "request_id": request_id,
         "query_hash": query_hash,
@@ -7591,8 +7609,19 @@ def search_mangas(
     """Busca tipada: retorna MangaSearchItem (sinopse, generos, autores, etc.)."""
     _enforce_rate_limit(request, "search", SEARCH_RATE_LIMIT, resource=q.strip().lower())
     started_at = time.perf_counter()
-    payload = _build_search_payload(q, genre, limit, offset, background_tasks)
-    response.headers["Server-Timing"] = f"search;dur={_elapsed_ms(started_at):.2f}"
+    timings: dict[str, float] = {}
+    payload = _build_search_payload(
+        q,
+        genre,
+        limit,
+        offset,
+        background_tasks,
+        timings,
+    )
+    response.headers["Server-Timing"] = ", ".join((
+        f"search;dur={_elapsed_ms(started_at):.2f}",
+        f"postgres;dur={timings.get('postgres_search_ms', 0.0):.2f}",
+    ))
     return SearchResponse(**payload)
 
 
@@ -8070,6 +8099,7 @@ def _build_search_payload(
     limit: int,
     offset: int,
     background_tasks: BackgroundTasks | None = None,
+    timings: dict[str, float] | None = None,
 ) -> dict:
     """Logica de BUSCA: payload completo (poucos itens), com traducao."""
     query = q.strip()
@@ -8079,6 +8109,7 @@ def _build_search_payload(
         query,
         limit=max(limit + offset, limit),
         defer_refresh=background_tasks is not None,
+        timings=timings,
     )
     deferred_refresh = data.pop("_refresh_deferred", None)
     if background_tasks is not None and deferred_refresh:
