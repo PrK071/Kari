@@ -4,9 +4,11 @@ import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import patch
 
 import requests
 
+from backend import main
 from plugins.fliptru import FliptruPlugin
 
 
@@ -39,6 +41,19 @@ class ProviderRequestTimeoutTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             plugin.session.close()
+
+    def test_bounded_brasuka_search_does_not_multiply_timeout_with_retries(self) -> None:
+        bounded_reader = main._search_reader("mangasbrasuka", (0.05, 0.05))
+        with patch(
+            "reader_server.requests.get",
+            side_effect=requests.exceptions.ReadTimeout(),
+        ) as request:
+            with self.assertRaises(requests.exceptions.ReadTimeout):
+                bounded_reader._mangasbrasuka_get_html(
+                    "https://mangasbrasuka.com.br/manga/teste/"
+                )
+
+        request.assert_called_once()
 
 
 if __name__ == "__main__":

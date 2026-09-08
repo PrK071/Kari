@@ -38,7 +38,11 @@ class FliptruPlugin:
     def __init__(self, request_timeout: float | tuple[float, float] | None = None) -> None:
         self.request_timeout = request_timeout or (5, 22)
         self.session = requests.Session()
-        adapter = HTTPAdapter(max_retries=2, pool_connections=10, pool_maxsize=10)
+        adapter = HTTPAdapter(
+            max_retries=0 if request_timeout is not None else 2,
+            pool_connections=10,
+            pool_maxsize=10,
+        )
         self.session.mount("https://", adapter)
         self.session.headers.update(
             {

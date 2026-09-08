@@ -4449,7 +4449,11 @@ class MangaReader:
 
     def _mangasbrasuka_get_html(self, url: str, referer: str | None = None) -> str:
         last_error: Exception | None = None
-        for attempt in range(1, 4):
+        # A busca web injeta connect/read timeout curto. Nesse caminho, retries
+        # internos multiplicariam o orcamento e manteriam o worker vivo depois
+        # de o lote desistir; o refresh seguinte/circuit breaker faz a nova tentativa.
+        attempts = 1 if isinstance(self.args.timeout, tuple) else 3
+        for attempt in range(1, attempts + 1):
             try:
                 response = requests.get(
                     url,
@@ -4457,14 +4461,14 @@ class MangaReader:
                     headers=self._mangasbrasuka_headers(referer),
                     allow_redirects=True,
                 )
-                if response.status_code in {429, 500, 502, 503, 504} and attempt < 3:
+                if response.status_code in {429, 500, 502, 503, 504} and attempt < attempts:
                     time.sleep(0.6 * attempt)
                     continue
                 response.raise_for_status()
                 return response.text
             except requests.RequestException as exc:
                 last_error = exc
-                if attempt < 3:
+                if attempt < attempts:
                     time.sleep(0.6 * attempt)
                     continue
                 raise
