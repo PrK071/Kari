@@ -1,168 +1,169 @@
 # Kari
 
-Catálogo/leitor local de mangás e manhwas com back-end FastAPI e front-end React/Vite.
+O Kari é uma plataforma de descoberta, organização e leitura de mangás,
+manhwas, HQs e web novels. Ele reúne obras de diferentes fontes em uma interface
+única, mantém histórico e favoritos por perfil e também permite importar uma
+biblioteca diretamente do computador ou celular.
 
-## Fontes
+## Acesse o Kari
 
-### Catalogo principal
+**[Abrir o Kari](https://kari-phi.vercel.app)**
 
+> O backend utiliza o plano gratuito do Render. Depois de um período sem uso, a
+> primeira abertura pode demorar enquanto a instância é iniciada. Usuários
+> recorrentes ainda conseguem consultar o último catálogo público salvo no
+> navegador durante a reconexão.
+
+## Principais recursos
+
+- Busca unificada por título e aliases, incluindo acentos e variações Unicode.
+- Catálogo PostgreSQL-first com índice residente em memória para respostas
+  rápidas de obras conhecidas.
+- Leitor de capítulos com suporte a diferentes fontes e idiomas.
+- Histórico, favoritos e biblioteca persistidos por perfil.
+- Cadastro tradicional e autenticação com Discord.
+- Vinculação e sincronização com AniList e MyAnimeList.
+- Avatar, background do perfil e background da Home.
+- Importação de HQs e web novels pelo navegador usando IndexedDB.
+- Importação desktop de CBZ, ZIP, CBR, PDF, EPUB, TXT e Markdown.
+- Cache público do catálogo no navegador, sem dados privados ou credenciais.
+
+## Arquitetura web
+
+```text
+Navegador
+  ├── React + Vite na Vercel
+  ├── IndexedDB: catálogo público e biblioteca importada
+  └── FastAPI no Render
+        ├── índice descartável em RAM
+        ├── PostgreSQL Neon: fonte de verdade
+        ├── Backblaze B2: mídia persistente de perfis
+        └── providers externos atualizados em background
+```
+
+Uma busca conhecida percorre:
+
+```text
+cache curto → índice em RAM → resposta
+```
+
+Quando a obra não está no índice, o Kari usa PostgreSQL como fallback e só
+depois consulta providers externos dentro de um orçamento limitado. Resultados
+novos são persistidos no PostgreSQL e atualizam o índice somente após o commit.
+
+## Fontes e plugins
+
+O catálogo integra fontes como:
+
+- MangaLivre
 - MangaDex
 - Fliptru
-- Nexus Mangas
-- MangaGeek
 - MangaKatana
-- MangasBrasuka
-- MangaLivre
+- Nexus Mangás
+- Mangás Brasuka
+- MangaGeek
 
-Sakura Mangas entra sob demanda na busca, pois usa um navegador local
-dedicado. One Piece Project e usado somente como fonte preferencial de One
-Piece, com fallback para MangaLivre quando estiver indisponivel.
+Plugins adicionais oferecem:
 
-### Plugins
+- HQ Now para busca e leitura de HQs.
+- Novel Mania, Central Novel, Tensura Fan e Pleiades Translations para web
+  novels.
+- HQ Local e Web Novel Local no desktop.
+- Sakura Mangás sob demanda no ambiente desktop, usando navegador local
+  dedicado. Sakura e Playwright permanecem desativados no backend web.
 
-- HQ Now: busca e leitura de HQs, isolada do catalogo principal.
-- HQ Local: importacao de CBZ, ZIP, CBR e PDF.
-- Web Novels: Novel Mania, Central Novel, Tensura Fan e Pleiades Translations.
-- Web Novel Local: importacao de EPUB, TXT e Markdown.
+## Tecnologias
 
-## HQ Local
+### Backend
 
-Use `Plugins > HQs` para importar arquivos proprios. Cada arquivo vira
-uma edicao/capitulo e usa mesmo leitor, historico e favoritos do Kari. Titulo e
-numero podem ser informados no painel ou detectados pelo nome do arquivo.
+- Python e FastAPI
+- SQLAlchemy e Alembic
+- PostgreSQL/Neon
+- Backblaze B2 via API compatível com S3
+- Argon2 para senhas
+- OAuth2 para integrações externas
 
-Arquivos e indice ficam em `backend/.cache/hq_library/`, pasta ignorada pelo
-Git. Paginas sao normalizadas para WebP; nenhum caminho local e exposto ao
-navegador.
+### Frontend
 
-Rotas: `GET /api/hq/library`, `POST /api/hq/import`,
-`DELETE /api/hq/{comic_id}` e `GET /api/hq/assets/{comic_id}/{issue_id}/{page}`.
+- React
+- Vite
+- TanStack Query
+- Tailwind CSS
+- IndexedDB
 
-## Web Novel Local
+## Executar localmente
 
-Use `Plugins > Web Novels` para importar `EPUB`, `TXT` ou `MD`. EPUB respeita ordem
-do `spine`, metadados, autor e capa. TXT/Markdown sao divididos por headings ou
-marcadores como Capitulo, Chapter, Prologo e Epilogo. Sem capa, Kari gera uma
-capa WebP local.
-
-Texto e indice ficam em `backend/.cache/light_novel_library/`, fora do Git. O
-leitor textual possui brilho, tamanho de fonte, seletor e navegacao de capitulos;
-historico e favoritos usam mesmo perfil.
-
-Rotas: `GET /api/light-novels/library`, `POST /api/light-novels/import`,
-`DELETE /api/light-novels/{novel_id}` e
-`GET /api/light-novels/assets/{novel_id}/cover.webp`.
-
-O menu `Plugins > Web Novels` tambem oferece catalogos remotos do Novel Mania,
-Central Novel, Tensura Fan e Pleiades Translations, com busca, metadados, lista
-de capitulos/volumes, texto e ilustracoes.
-Essas fontes ficam isoladas do catalogo principal. Rotas:
-`GET /api/plugins/novel-mania`, `GET /api/plugins/central-novel` e
-`GET /api/plugins/tensura-fan` e `GET /api/plugins/pleiades-translations`.
-
-## Rodar
-
-Back-end:
+### Backend
 
 ```powershell
-cd "C:\Users\User\Documents\Kari"
+git clone https://github.com/PrK071/Kari.git
+cd Kari
+python -m venv .venv
+./.venv/Scripts/Activate.ps1
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
+python -m alembic upgrade head
 python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-Front-end:
+### Frontend
+
+Em outro terminal:
 
 ```powershell
-cd "C:\Users\User\Documents\Kari\frontend"
+cd frontend
+npm install
+Copy-Item .env.example .env
 npm run dev
 ```
 
 Abra `http://127.0.0.1:5173`.
 
-Login Google/Discord usa OAuth2 e cria ou reutiliza perfil local do Kari. Configure
-credenciais no `.env` da raiz usando `.env.example` como base. Redirects:
+As variáveis do backend estão documentadas em `.env.example`. O frontend usa
+`frontend/.env.example`, incluindo `VITE_API_BASE_URL` quando a API não estiver
+na mesma origem.
 
-- Google: `http://127.0.0.1:8000/api/auth/google/callback`
+## OAuth local
+
+Cadastre somente as integrações que deseja utilizar:
+
 - Discord: `http://127.0.0.1:8000/api/auth/discord/callback`
+- Google: `http://127.0.0.1:8000/api/auth/google/callback`
+- AniList: `http://127.0.0.1:8000/api/oauth/anilist/callback`
+- MyAnimeList: `http://127.0.0.1:8000/api/oauth/myanimelist/callback`
 
-Sem credenciais do provedor, botao correspondente fica oculto. Tokens externos
-servem apenas durante callback; navegador recebe somente token de sessao do Kari.
+Credenciais ficam no `.env` e nunca devem ser commitadas. Tokens externos são
+armazenados somente pelo backend; o navegador recebe apenas a sessão do Kari.
 
-## API Principal
+## Testes
 
-- `GET /api/mangas`
-- `GET /api/mangas?q=slime`
-- `GET /api/chapters?url=...&title=...&lang=pt-br`
-- `GET /api/chapter?url=...`
-- `GET /api/image/{index}`
-
-## Perfil (foto, background e contas)
-
-O perfil e local (id salvo no navegador, dados em `backend/.cache/profiles.json`).
-
-- Foto e background: enviados no painel de Perfil (arquivo ou URL). Uploads sao
-  validados/normalizados via Pillow e salvos em `backend/static/profiles/<id>/`.
-- Contas AniList/MyAnimeList: vinculo via OAuth2. Preencha as credenciais no
-  `.env` da raiz (veja `.env.example`) e cadastre os apps com o redirect:
-  - AniList: `http://127.0.0.1:8000/api/oauth/anilist/callback`
-  - MyAnimeList: `http://127.0.0.1:8000/api/oauth/myanimelist/callback`
-
-  Sem credenciais, o botao "Vincular" fica desabilitado. Tokens ficam so no
-  servidor (`profiles.json`), nunca no payload da API.
-
-Depois de vincular, use `Sincronizar` no perfil. Kari importa listas de manga,
-ignora itens descartados, casa titulos com obras legiveis do catalogo e mescla
-resultados nos favoritos sem remover favoritos locais. MyAnimeList renova token
-automaticamente quando refresh token estiver disponivel.
-
-Rotas: `PUT /api/profiles/{id}/avatar`, `PUT /api/profiles/{id}/background`
-(corpo `{"url": ...}` ou `{"data": "data:image/...;base64,..."}`, corpo vazio
-limpa), `POST /api/profiles/{id}/link/{provider}`,
-`GET /api/oauth/{provider}/callback`, `DELETE /api/profiles/{id}/link/{provider}`,
-`GET /api/profiles/{id}/link/status` e `POST /api/profiles/{id}/sync/{provider}`.
-
-## Notas
-
-- Capas e imagens de personagens ficam remotas/proxy, sem salvar permanente no PC.
-- Cache de leitura é temporário por capítulo.
-- Busca tenta fontes PT-BR completas antes de fallback internacional.
-- Debug MangasBrasuka: `tools/debug/mangasbrasuka_scraper.py`.
-- Saída local `downloads_brasuka/` fica ignorada pelo Git.
-
-## Sakura Mangas (`blob:`)
-
-### Arquitetura e seguranca
-
-Sakura usa um Chromium dedicado porque o leitor entrega as paginas como `blob:`
-e pode apresentar desafio Cloudflare. O Kari nao tenta burlar CAPTCHA: a
-verificacao ocorre na janela normal do navegador, pelo proprio usuario.
-
-1. `tools/start_sakura_browser.py` abre Chrome, Brave ou Edge com perfil
-   dedicado e CDP preso a `127.0.0.1:9333`.
-2. O backend aceita CDP somente em `127.0.0.1`, `localhost` ou `::1`; qualquer
-   endereco remoto e rejeitado.
-3. Playwright conecta ao perfil local, abre uma pagina Sakura por vez e fecha
-   somente a pagina criada. Ele nunca fecha o navegador que contem a sessao.
-4. Um script de pagina observa os `blob:` gerados pelo leitor. Os bytes sao
-   extraidos, validados como imagem, deduplicados por SHA-256 e gravados apenas
-   no cache temporario do capitulo.
-5. React recebe paginas pelo endpoint local `/api/image/{index}`. URLs `blob:`,
-   cookies, headers e caminhos do perfil nunca chegam ao navegador do Kari.
-
-O perfil dedicado preserva cookies e `cf_clearance` localmente. CDP, perfil,
-cache, proxy e chaves de solver ficam fora do Git. Nunca exponha a porta `9333`
-na rede nem reutilize o perfil Sakura para navegacao pessoal.
-
-### Configuracao e diagnostico
-
-Opcionalmente, crie `.env` a partir de `.env.example`:
+Backend:
 
 ```powershell
-Copy-Item .env.example .env
+python -m pytest -q
 ```
 
-- `SAKURA_PROXY`: proxy usado por navegador, requisicoes HTTP e solver. Use o
-  mesmo IP durante toda sessao; `cf_clearance` fica vinculado ao IP.
-- `CAPSOLVER_API_KEY` ou `TWOCAPTCHA_API_KEY`: resolucao automatica opcional.
-  Sem chave, conclua desafio manualmente na janela do navegador.
-- `SAKURA_BASE_URL`, `SAKURA_CDP_URL`, `SAKURA_PROFILE_DIR` e
-  `SAKURA_CHALLENGE_TIMEOUT`: sobrescrevem valores padrao quando necessario.
+Frontend:
+
+```powershell
+cd frontend
+npm test
+npm run build
+```
+
+## Documentação técnica
+
+- [Segurança e persistência](docs/SECURITY.md)
+- [Benchmark e arquitetura de busca](docs/SEARCH_PERFORMANCE.md)
+- [Deploy](docs/DEPLOYMENT.md)
+- [Arquitetura web](docs/WEB_ARCHITECTURE.md)
+
+## Observações
+
+- PostgreSQL é a fonte de verdade do catálogo web; caches em RAM, filesystem e
+  IndexedDB são descartáveis.
+- O Kari não utiliza keepalive artificial para evitar o spin-down do Render.
+- Playwright, Sakura e bibliotecas desktop não participam do caminho crítico da
+  busca web.
+- Nunca exponha a porta CDP usada pelo plugin Sakura na rede nem reutilize seu
+  perfil dedicado para navegação pessoal.
