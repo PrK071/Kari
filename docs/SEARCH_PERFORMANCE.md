@@ -252,3 +252,51 @@ inteiro: o ganho adicional nao justificaria o risco estrutural para desktop.
 - Vite production build: PASS (1.854 modulos transformados).
 - `/health`, `/ready`, `/api/home` e `/api/catalog-index` no Render: HTTP 200.
 - PostgreSQL/Neon, B2, providers, schema e hospedagem: inalterados.
+
+## Perfil detalhado de imports (2026-09-09)
+
+Esta fase foi somente diagnostica. Nenhum novo lazy-load ou refactor de desktop
+foi aplicado. Foram executados cinco processos Python 3.13 limpos com
+`-X importtime`; os valores abaixo sao medianas locais. Tempos cumulativos se
+sobrepoem e, portanto, nao devem ser somados.
+
+| Modulo/familia | self p50 | cumulativo p50 | Leitura |
+|---|---:|---:|---|
+| `backend.main` | 211,33 ms | 1.777,31 ms | aplicacao inteira |
+| FastAPI/Pydantic | 1,18 ms (`fastapi`) | 446,23 ms | contratos/rotas obrigatorios |
+| `backend.persistence` | 0,79 ms | 449,71 ms | SQLAlchemy, models, drivers e crypto |
+| SQLAlchemy | 1,73 ms | 222,50 ms | ORM/engine obrigatorio |
+| `reader_server` | 6,04 ms | 193,65 ms | reader, HTTP e plugins |
+| requests/urllib3 | 1,30 ms | 143,16 ms | cliente HTTP compartilhado |
+| psycopg | 13,35 ms | 109,49 ms | driver PostgreSQL |
+| Fliptru/BeautifulSoup | 0,99 ms | 81,42 ms | maior arvore de scraper especifico |
+| argon2 | 1,19 ms | 57,70 ms | biblioteca de senha |
+| curl_cffi | ~1,07 ms | ~34 ms | transporte alternativo do reader |
+| cloudscraper | ~1,28 ms | ~19 ms | transporte de scraper |
+| Pillow (`PIL.Image`) | ~3,07 ms | ~15 ms | validacao/imagens |
+
+Como contraprova, imports isolados em subprocessos deram `reader_server` ~560
+ms, `backend.persistence` ~727 ms, FastAPI ~679 ms e SQLAlchemy ~541 ms de wall
+p50. Cada processo vazio custa ~71,5 ms neste ambiente; esses numeros isolados
+tambem compartilham dependencias e nao sao aditivos.
+
+O hash sentinela Argon2 custou ~76,18 ms p50 local. Ele pertence a
+`module_setup_other_ms`, nao aos 14,5 s de `module_imports_ms`. No Render, o
+setup restante medido foi 2.703,86 ms e repository/engine 1.311,16 ms, ambos
+separados dos imports.
+
+Conclusao: os imports locais levam ~1,27--1,78 s, mas as duas amostras reais do
+Render levaram 10,09 s e 14,51 s. A diferenca de ~8--11x e consistente com CPU
+Free fortemente limitada e cold filesystem/page cache. O custo nao vem de uma
+query SQL nem de um unico import opcional. Ele esta distribuido principalmente
+entre FastAPI/Pydantic, persistencia/SQLAlchemy/psycopg e `reader_server`.
+
+Playwright, PyMuPDF e boto3 continuam ausentes do startup, conforme o lazy-load
+ja validado. Remover mais segundos exigiria separar imports centrais de
+`reader_server` ou do framework/persistencia, uma mudanca de risco
+desproporcional agora que Home e busca estao estaveis. A decisao desta fase e
+parar sem novas alteracoes de produto.
+
+**MEMORY CATALOG INDEX PASSED**
+
+**SEARCH PERFORMANCE TARGET PASSED**
