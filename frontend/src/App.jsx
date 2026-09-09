@@ -15,6 +15,11 @@ import {
 } from "./profileStorage.js"
 import { authenticatedHeaders } from "./profileMedia.js"
 import { useAuthedMedia } from "./useAuthedMedia.js"
+import {
+  buildCachedCatalogPayload,
+  readPublicCatalogSnapshot,
+  savePublicCatalogSnapshot,
+} from "./publicCatalogCache.js"
 
 const API_BASE_URL = import.meta.env.VITE_DESKTOP_BUILD === "1"
   ? window.location.origin
@@ -3125,6 +3130,7 @@ export default function App() {
   const [genreFilter, setGenreFilter] = useState("")
   const [catalogOffset, setCatalogOffset] = useState(0)
   const [catalogPages, setCatalogPages] = useState([])
+  const [publicCatalogSnapshot, setPublicCatalogSnapshot] = useState(null)
   const [favorites, setFavorites] = useState([])
   const [history, setHistory] = useState([])
   const [historyChapterUpdates, setHistoryChapterUpdates] = useState({})
@@ -3141,6 +3147,17 @@ export default function App() {
 
   const headerHideTimer = useRef(null)
   const headerScrolled = useRef(false)
+  const catalogIndexSyncAt = useRef(0)
+
+  useEffect(() => {
+    let cancelled = false
+    readPublicCatalogSnapshot()
+      .then((snapshot) => {
+        if (!cancelled && snapshot) setPublicCatalogSnapshot(snapshot)
+      })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [])
 
   const revealHeader = useCallback(() => {
     if (headerHideTimer.current) window.clearTimeout(headerHideTimer.current)
@@ -3471,7 +3488,35 @@ export default function App() {
     },
   })
 
-  const payload = catalogQuery.data
+  useEffect(() => {
+    if (!catalogQuery.isSuccess || !catalogQuery.dataUpdatedAt) return undefined
+    if (Date.now() - catalogIndexSyncAt.current < 5 * 60 * 1000) return undefined
+    catalogIndexSyncAt.current = Date.now()
+    const controller = new AbortController()
+    fetch(`${API_BASE_URL}/api/catalog-index`, {
+      signal: controller.signal,
+      headers: { Accept: "application/json" },
+    })
+      .then((response) => response.ok ? response.json() : null)
+      .then((data) => data ? savePublicCatalogSnapshot(data) : null)
+      .then((snapshot) => {
+        if (snapshot && !controller.signal.aborted) setPublicCatalogSnapshot(snapshot)
+      })
+      .catch(() => {})
+    return () => controller.abort()
+  }, [catalogQuery.dataUpdatedAt, catalogQuery.isSuccess])
+
+  const cachedCatalogPayload = useMemo(() => buildCachedCatalogPayload(
+    publicCatalogSnapshot,
+    {
+      query: debouncedQuery,
+      genre: genreFilter,
+      limit: CATALOG_PAGE_SIZE,
+      offset: requestOffset,
+    },
+  ), [debouncedQuery, genreFilter, publicCatalogSnapshot, requestOffset])
+  const usingBrowserCatalog = !catalogQuery.data && Boolean(cachedCatalogPayload)
+  const payload = catalogQuery.data ?? cachedCatalogPayload
   const mangas = payload?.items ?? []
   const sections = payload?.sections ?? []
   const hydratedHistory = useMemo(() => {
@@ -3517,13 +3562,14 @@ export default function App() {
     && !genreFilter
     && !libraryView
     && !pluginView
+    && !payload?.browserCached
     && payload?.refreshing
     && mangas.length <= 1,
   )
   // Skeleton SO no primeiro carregamento (sem dado em cache). Voltar do modal
   // serve o cache -> isPending=false -> aparece instantaneo.
   const loading = (catalogQuery.isPending && !payload) || catalogBootstrapping
-  const error = catalogQuery.isError ? "Nao consegui carregar o catalogo." : ""
+  const error = catalogQuery.isError && !usingBrowserCatalog ? "Nao consegui carregar o catalogo." : ""
 
   const heroSection = (sections ?? []).find(
     (s) => s.layout === "carousel" && s.title === "Em alta",
@@ -3909,6 +3955,11 @@ export default function App() {
       {!pluginView && error && (
         <div className="mx-5 mt-4 rounded-md border border-red-900 bg-red-950/30 px-4 py-3 text-sm text-red-200">
           {error}
+        </div>
+      )}
+      {!pluginView && usingBrowserCatalog && (
+        <div className="mx-5 mt-4 rounded-md border border-amber-300/20 bg-amber-300/10 px-4 py-2 text-xs text-amber-100">
+          Exibindo dados salvos neste dispositivo enquanto o Kari reconecta ao servidor.
         </div>
       )}
       {pluginView ? (
