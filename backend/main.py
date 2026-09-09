@@ -1056,6 +1056,16 @@ app = FastAPI(
 def _initialize_catalog_memory_index() -> dict[str, float | int | bool | str]:
     metrics: dict[str, float | int | bool | str] = dict(_STARTUP_TIMINGS)
     postgres_started_at = time.perf_counter()
+    pre_startup_ms = round((postgres_started_at - _PROCESS_MODULE_STARTED_AT) * 1000, 2)
+    measured_setup_ms = sum(float(metrics.get(name, 0.0)) for name in (
+        "module_imports_ms",
+        "config_load_ms",
+        "scraper_init_ms",
+        "repository_init_ms",
+        "object_storage_init_ms",
+        "reader_init_ms",
+    ))
+    metrics["module_setup_other_ms"] = round(max(0.0, pre_startup_ms - measured_setup_ms), 2)
     try:
         items = catalog_repository.list_index_items() if catalog_repository is not None else []
         metrics["postgres_init_ms"] = _elapsed_ms(postgres_started_at)
