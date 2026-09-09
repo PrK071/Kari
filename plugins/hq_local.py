@@ -17,10 +17,12 @@ from uuid import uuid4
 
 from PIL import Image, UnidentifiedImageError
 
-try:
-    import fitz
-except Exception:  # PyMuPDF e opcional ate o usuario importar um PDF.
-    fitz = None
+def _load_fitz():
+    try:
+        import fitz
+    except Exception:  # PyMuPDF e opcional ate o usuario importar um PDF.
+        return None
+    return fitz
 
 try:
     import rarfile
@@ -513,6 +515,7 @@ class HQLocalPlugin:
             raise ValueError(f"CBR invalido ou indisponivel: {exc}") from exc
 
     def _import_pdf(self, source: Path, target_dir: Path) -> int:
+        fitz = _load_fitz()
         if fitz is None:
             raise RuntimeError("Suporte PDF ausente. Instale dependencia PyMuPDF.")
         try:

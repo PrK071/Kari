@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import mimetypes
 import re
+import threading
 from pathlib import Path
 from typing import Protocol
 from urllib.parse import quote
@@ -192,6 +193,58 @@ class S3ProfileMediaStorage:
         return f"/api/profiles/{quote(profile_id, safe='')}/media/{quote(kind, safe='')}"
 
 
+class LazyS3ProfileMediaStorage:
+    """Build the boto3 client only when profile media is actually accessed."""
+
+    writable = True
+
+    def __init__(self, settings) -> None:
+        self._settings = settings
+        self._storage: S3ProfileMediaStorage | None = None
+        self._lock = threading.Lock()
+
+    def _get(self) -> S3ProfileMediaStorage:
+        if self._storage is not None:
+            return self._storage
+        with self._lock:
+            if self._storage is not None:
+                return self._storage
+            try:
+                import boto3
+
+                client = boto3.client(
+                    "s3",
+                    endpoint_url=self._settings.object_storage_endpoint,
+                    region_name=self._settings.object_storage_region,
+                    aws_access_key_id=self._settings.object_storage_access_key_id,
+                    aws_secret_access_key=self._settings.object_storage_secret_access_key,
+                )
+            except Exception as exc:
+                raise MediaStorageUnavailable("Object Storage indisponivel.") from exc
+            self._storage = S3ProfileMediaStorage(
+                client,
+                bucket=self._settings.object_storage_bucket,
+                public_base_url=self._settings.object_storage_public_base_url,
+            )
+            return self._storage
+
+    def delete(self, profile_id: str, kind: str) -> None:
+        self._get().delete(profile_id, kind)
+
+    def read(self, profile_id: str, kind: str) -> tuple[bytes, str] | None:
+        return self._get().read(profile_id, kind)
+
+    def replace(
+        self,
+        profile_id: str,
+        kind: str,
+        suffix: str,
+        content: bytes,
+        content_type: str,
+    ) -> str:
+        return self._get().replace(profile_id, kind, suffix, content, content_type)
+
+
 def build_profile_media_storage(settings, static_dir: Path) -> ProfileMediaStorage:
     if settings.storage_backend == "filesystem":
         if settings.is_web:
@@ -200,17 +253,4 @@ def build_profile_media_storage(settings, static_dir: Path) -> ProfileMediaStora
     if settings.storage_backend != "object_storage":
         raise ValueError("Backend de midia desconhecido.")
 
-    import boto3
-
-    client = boto3.client(
-        "s3",
-        endpoint_url=settings.object_storage_endpoint,
-        region_name=settings.object_storage_region,
-        aws_access_key_id=settings.object_storage_access_key_id,
-        aws_secret_access_key=settings.object_storage_secret_access_key,
-    )
-    return S3ProfileMediaStorage(
-        client,
-        bucket=settings.object_storage_bucket,
-        public_base_url=settings.object_storage_public_base_url,
-    )
+    return LazyS3ProfileMediaStorage(settings)

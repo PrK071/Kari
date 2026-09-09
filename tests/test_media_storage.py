@@ -4,6 +4,7 @@ import asyncio
 import io
 import tempfile
 import unittest
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -14,9 +15,11 @@ from backend import main
 from backend.config import ConfigurationError, load_settings
 from backend.media_storage import (
     DisabledProfileMediaStorage,
+    LazyS3ProfileMediaStorage,
     LocalProfileMediaStorage,
     MediaStorageUnavailable,
     S3ProfileMediaStorage,
+    build_profile_media_storage,
 )
 
 
@@ -52,6 +55,26 @@ class _FakeS3Client:
 
 
 class ProfileMediaStorageTests(unittest.TestCase):
+    def test_object_storage_client_is_lazy(self) -> None:
+        client = _FakeS3Client()
+        boto3 = SimpleNamespace(client=lambda *_args, **_kwargs: client)
+        settings = SimpleNamespace(
+            storage_backend="object_storage",
+            object_storage_endpoint="https://s3.example.test",
+            object_storage_region="test",
+            object_storage_access_key_id="access",
+            object_storage_secret_access_key="secret",
+            object_storage_bucket="kari-media",
+            object_storage_public_base_url="",
+            is_web=True,
+        )
+        with patch.dict(sys.modules, {"boto3": boto3}):
+            storage = build_profile_media_storage(settings, Path("unused"))
+            self.assertIsInstance(storage, LazyS3ProfileMediaStorage)
+            self.assertIsNone(storage._storage)
+            storage.delete("profile-1", "avatar")
+            self.assertIsNotNone(storage._storage)
+
     def test_local_storage_is_scoped_and_replaceable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             storage = LocalProfileMediaStorage(Path(directory))

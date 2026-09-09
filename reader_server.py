@@ -43,16 +43,34 @@ try:
 except Exception:
     curl_requests = None
 
-try:
-    from playwright.sync_api import (
-        Error as PlaywrightError,
-        TimeoutError as PlaywrightTimeoutError,
-        sync_playwright,
-    )
-except Exception:
-    PlaywrightError = RuntimeError
-    PlaywrightTimeoutError = TimeoutError
-    sync_playwright = None
+PlaywrightError = RuntimeError
+PlaywrightTimeoutError = TimeoutError
+sync_playwright = None
+_playwright_loaded = False
+_playwright_import_lock = threading.Lock()
+
+
+def _load_playwright() -> None:
+    global PlaywrightError, PlaywrightTimeoutError, sync_playwright, _playwright_loaded
+    if _playwright_loaded:
+        return
+    with _playwright_import_lock:
+        if _playwright_loaded:
+            return
+        try:
+            from playwright.sync_api import (
+                Error as loaded_error,
+                TimeoutError as loaded_timeout_error,
+                sync_playwright as loaded_sync_playwright,
+            )
+        except Exception:
+            loaded_error = RuntimeError
+            loaded_timeout_error = TimeoutError
+            loaded_sync_playwright = None
+        PlaywrightError = loaded_error
+        PlaywrightTimeoutError = loaded_timeout_error
+        sync_playwright = loaded_sync_playwright
+        _playwright_loaded = True
 
 
 @dataclass
@@ -1549,6 +1567,7 @@ class MangaReader:
         return self._dragontea_collect_urls(page)
 
     def _load_dragontea_chapter(self, url: str) -> dict:
+        _load_playwright()
         if sync_playwright is None:
             raise RuntimeError(
                 "Playwright nao esta instalado. Rode: python -m pip install -r requirements.txt"
@@ -2038,6 +2057,7 @@ class MangaReader:
         )
 
     def _sakura_run_page(self, url: str, action, init_script: str | None = None):
+        _load_playwright()
         if sync_playwright is None:
             raise RuntimeError(
                 "Playwright nao esta instalado. Rode: python -m pip install -r requirements.txt"
