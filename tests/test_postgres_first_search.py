@@ -6,8 +6,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import BackgroundTasks
+from fastapi.testclient import TestClient
 
 from backend import main
+from backend.catalog_index import CatalogMemoryIndex
 
 
 def manga(title: str = "Hunter x Hunter", provider: str = "mangalivre") -> dict:
@@ -29,8 +31,14 @@ class FakeCatalogRepository:
     def __init__(self, items: list[dict] | None = None) -> None:
         self.items = list(items or [])
         self.upsert_calls = 0
+        self.search_calls = 0
+        self.home_calls = 0
+
+    def list_index_items(self) -> list[dict]:
+        return [dict(item) for item in self.items]
 
     def search(self, query: str, limit: int) -> list[dict]:
+        self.search_calls += 1
         normalized = main.normalize_match_text(query)
         return [
             dict(item)
@@ -48,18 +56,22 @@ class FakeCatalogRepository:
         return len(items)
 
     def list_home(self, limit: int) -> list[dict]:
+        self.home_calls += 1
         return [dict(item) for item in self.items if item.get("catalog_home_ready")][:limit]
 
 
 class PostgresFirstSearchTests(unittest.TestCase):
     def setUp(self) -> None:
         self.original_repository = main.catalog_repository
+        self.original_memory_index = main.catalog_memory_index
         self.original_catalog_cache = main.catalog_cache
+        main.catalog_memory_index = CatalogMemoryIndex()
         main.search_cache.clear()
         main.catalog_cache = None
 
     def tearDown(self) -> None:
         main.catalog_repository = self.original_repository
+        main.catalog_memory_index = self.original_memory_index
         main.catalog_cache = self.original_catalog_cache
         main.search_cache.clear()
 
@@ -76,6 +88,17 @@ class PostgresFirstSearchTests(unittest.TestCase):
         self.assertEqual(result["items"][0]["title"], "Hunter x Hunter")
         self.assertLess(duration, 0.1)
         external.assert_not_called()
+
+    def test_resident_index_hit_skips_postgres_search(self) -> None:
+        repository = FakeCatalogRepository([manga()])
+        main.catalog_repository = repository
+        main.catalog_memory_index.rebuild(repository.list_index_items())
+        repository.search_calls = 0
+
+        result = main._search_mangas("hunter x hunter", 8)
+
+        self.assertEqual(result["items"][0]["title"], "Hunter x Hunter")
+        self.assertEqual(repository.search_calls, 0)
 
     def test_http_flow_defers_refresh_until_after_response(self) -> None:
         main.catalog_repository = FakeCatalogRepository([manga()])
@@ -126,7 +149,9 @@ class PostgresFirstSearchTests(unittest.TestCase):
             patch("backend.main._schedule_search_refresh", return_value=True),
         ):
             first = main._search_mangas("vinland saga", 8)
-            main.search_cache.clear()  # simula restart do cache descartavel
+            main.search_cache.clear()
+            main.catalog_memory_index = CatalogMemoryIndex()  # simula restart da RAM
+            main.catalog_memory_index.rebuild(repository.list_index_items())
             second = main._search_mangas("VINLAND SAGA", 8)
 
         self.assertEqual(first["items"][0]["title"], "Vinland Saga")
@@ -166,6 +191,67 @@ class PostgresFirstSearchTests(unittest.TestCase):
         self.assertTrue(result["persistent"])
         self.assertEqual(result["items"][0]["title"], "Hunter x Hunter")
         snapshot.assert_not_called()
+
+    def test_home_uses_resident_snapshot_without_postgres_round_trip(self) -> None:
+        repository = FakeCatalogRepository([manga()])
+        main.catalog_repository = repository
+        main.catalog_memory_index.rebuild(repository.list_index_items())
+        repository.home_calls = 0
+
+        with patch("backend.main._schedule_catalog_refresh"):
+            result = main._build_catalog(8)
+
+        self.assertTrue(result["persistent"])
+        self.assertEqual(repository.home_calls, 0)
+
+    def test_failed_database_write_does_not_update_resident_index(self) -> None:
+        repository = FakeCatalogRepository([manga()])
+        main.catalog_repository = repository
+        main.catalog_memory_index.rebuild(repository.list_index_items())
+        before = main.catalog_memory_index.stats()["item_count"]
+
+        with patch.object(repository, "upsert_many", side_effect=RuntimeError("database down")):
+            persisted = main._persist_catalog_items([manga("Berserk")])
+
+        self.assertEqual(persisted, 0)
+        self.assertEqual(main.catalog_memory_index.stats()["item_count"], before)
+        self.assertEqual(main.catalog_memory_index.search("berserk", 5), [])
+
+    def test_startup_rebuilds_resident_index_from_postgres(self) -> None:
+        main.catalog_repository = FakeCatalogRepository([manga()])
+
+        metrics = main._initialize_catalog_memory_index()
+
+        self.assertTrue(metrics["catalog_index_ready"])
+        self.assertEqual(metrics["catalog_index_items"], 1)
+        self.assertEqual(main.catalog_memory_index.search("hunter x hunter", 5)[0]["title"], "Hunter x Hunter")
+
+    def test_search_response_exposes_resident_index_timings(self) -> None:
+        main.catalog_repository = FakeCatalogRepository([manga()])
+        with (
+            patch("backend.main._schedule_search_refresh", return_value=False),
+            TestClient(main.app) as client,
+        ):
+            response = client.get("/api/search", params={"q": "hunter x hunter", "limit": 8})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["x-kari-index-hit"], "true")
+        self.assertEqual(response.headers["x-kari-cache-hit"], "false")
+        self.assertIn("memory_index;dur=", response.headers["server-timing"])
+        self.assertIn("postgres;dur=0.00", response.headers["server-timing"])
+
+    def test_browser_catalog_endpoint_exposes_only_public_fields(self) -> None:
+        item = manga()
+        item["cover_url"] = "https://example.test/cover.jpg?X-Amz-Signature=private"
+        main.catalog_repository = FakeCatalogRepository([item])
+        with TestClient(main.app) as client:
+            response = client.get("/api/catalog-index")
+
+        self.assertEqual(response.status_code, 200)
+        public_item = response.json()["items"][0]
+        self.assertEqual(public_item["cover_url"], "")
+        self.assertNotIn("_catalog_last_seen_at", public_item)
+        self.assertNotIn("payload", public_item)
 
 
 if __name__ == "__main__":

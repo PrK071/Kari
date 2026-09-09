@@ -73,3 +73,16 @@ def test_catalog_survives_repository_restart_and_drives_home(tmp_path: Path) -> 
     restarted = _repository(database_path)
     assert restarted.search("hunter x hunter", 10)
     assert restarted.list_home(10)[0]["title"] == "Hunter x Hunter"
+
+
+def test_catalog_index_snapshot_excludes_complementary_payload(tmp_path: Path) -> None:
+    repository = _repository(tmp_path / "catalog.sqlite")
+    repository.upsert_item(_hunter(description="large complementary value"))
+
+    snapshot = repository.list_index_items()
+
+    assert len(snapshot) == 1
+    assert snapshot[0]["canonical_title"] == "Hunter x Hunter"
+    assert snapshot[0]["chapter_count"] == 420
+    assert "description" not in snapshot[0]
+    assert "payload" not in snapshot[0]

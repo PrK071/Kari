@@ -157,6 +157,37 @@ class PostgresCatalogRepository:
             payload["chapter_preview"] = metadata["preview"]
         return payload
 
+    @staticmethod
+    def _index_payload(model: CatalogItemModel) -> dict:
+        metadata = dict(model.chapter_metadata or {})
+        return {
+            "catalog_id": model.id,
+            "canonical_key": model.canonical_key,
+            "canonical_title": model.canonical_title,
+            "normalized_title": model.normalized_title,
+            "alternative_titles": list(model.aliases or []),
+            "provider": model.provider,
+            "source": model.source,
+            "source_identifier": model.source_identifier,
+            "source_url": model.source_url,
+            "cover_url": model.cover_url,
+            "genres": list(model.genres or []),
+            "chapter_count": model.chapter_count,
+            "chapter_count_verified": bool(metadata.get("verified")),
+            "latest_chapter": str(metadata.get("latest_chapter") or ""),
+            "chapter_preview": list(metadata.get("preview") or [])[:3],
+            "chapter_languages": list(metadata.get("languages") or [])[:8],
+            "_catalog_last_seen_at": model.last_seen_at,
+            "catalog_home_ready": bool(model.is_home_ready),
+        }
+
+    def list_index_items(self) -> list[dict]:
+        with self._sessions() as database:
+            models = list(database.scalars(
+                select(CatalogItemModel).order_by(CatalogItemModel.last_seen_at.desc())
+            ))
+            return [self._index_payload(model) for model in models]
+
     def _ordered_candidates(self, query: str, limit: int) -> list[CatalogItemModel]:
         normalized = normalize_match_text(query)
         if not normalized or limit < 1:

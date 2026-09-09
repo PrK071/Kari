@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+from time import perf_counter as _startup_perf_counter, time as _startup_wall_time
+
+_PROCESS_MODULE_STARTED_AT = _startup_perf_counter()
+_STARTUP_TIMINGS: dict[str, float | int | bool] = {
+    "process_start_epoch_ms": round(_startup_wall_time() * 1000, 2),
+}
+
 import copy
 import atexit
 import time
@@ -21,6 +28,7 @@ import tempfile
 from uuid import uuid4
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from concurrent.futures import TimeoutError as FuturesTimeoutError
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -38,6 +46,7 @@ from pydantic import BaseModel, Field
 
 from backend.config import load_settings
 from backend.background import BackgroundTaskRunner
+from backend.catalog_index import CatalogMemoryIndex
 from backend.concurrency import BoundedExecutor, BoundedWorkCoordinator, WorkCapacityExceeded
 from backend.media_storage import MediaStorageUnavailable, build_profile_media_storage
 from backend.network_security import UnsafeRemoteURLError, validate_public_http_url
@@ -89,7 +98,17 @@ except Exception:  # noqa: BLE001 - sem dotenv o app ainda roda (OAuth fica desl
     pass
 
 
+_STARTUP_TIMINGS["module_imports_ms"] = round(
+    (_startup_perf_counter() - _PROCESS_MODULE_STARTED_AT) * 1000,
+    2,
+)
+_config_started_at = _startup_perf_counter()
 settings = load_settings()
+_STARTUP_TIMINGS["config_load_ms"] = round(
+    (_startup_perf_counter() - _config_started_at) * 1000,
+    2,
+)
+_scraper_init_started_at = _startup_perf_counter()
 rate_limit_backend = MemoryRateLimitBackend()
 rate_limiter = RateLimiter(rate_limit_backend)
 scraper_coordinator = BoundedWorkCoordinator(
@@ -104,6 +123,10 @@ atexit.register(scraper_executor.shutdown, wait=False, cancel_futures=True)
 background_task_runner = BackgroundTaskRunner(settings.background_max_concurrency)
 provider_circuit_breaker = ProviderCircuitBreaker()
 external_search_coalescer = SearchCoalescer()
+_STARTUP_TIMINGS["scraper_init_ms"] = round(
+    (_startup_perf_counter() - _scraper_init_started_at) * 1000,
+    2,
+)
 
 REGISTER_RATE_LIMIT = RateLimitPolicy(limit=30, window_seconds=60 * 60)
 LOGIN_RATE_LIMIT = RateLimitPolicy(limit=30, window_seconds=5 * 60)
@@ -182,6 +205,7 @@ PBKDF2_ITERATIONS = 200_000
 _password_hasher = PasswordHasher()
 _DUMMY_PASSWORD_HASH = _password_hasher.hash("kari-login-timing-sentinel")
 
+_repository_init_started_at = _startup_perf_counter()
 repositories = build_repositories(
     backend=settings.persistence_backend,
     database_url=settings.database_url,
@@ -194,6 +218,11 @@ profile_repository: ProfileRepository = repositories.profiles
 user_repository: UserRepository = repositories.users
 session_repository: SessionRepository = repositories.sessions
 catalog_repository: CatalogRepository | None = repositories.catalog
+catalog_memory_index = CatalogMemoryIndex()
+_STARTUP_TIMINGS["repository_init_ms"] = round(
+    (_startup_perf_counter() - _repository_init_started_at) * 1000,
+    2,
+)
 # Obras adicionadas manualmente (ex.: via tools/add_sakura_manga.py). Mescladas
 # ao CURATED_CATALOG p/ aparecerem na home como as fontes fixas.
 CUSTOM_CATALOG_PATH = KARI_DATA_DIR / "custom_catalog.json"
@@ -289,7 +318,12 @@ COVERS_DIR = STATIC_DIR / "covers"
 COVERS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Desktop usa filesystem; web desabilita uploads locais ou usa Object Storage.
+_object_storage_init_started_at = _startup_perf_counter()
 profile_media_storage = build_profile_media_storage(settings, STATIC_DIR)
+_STARTUP_TIMINGS["object_storage_init_ms"] = round(
+    (_startup_perf_counter() - _object_storage_init_started_at) * 1000,
+    2,
+)
 
 # Backgrounds pre-definidos (o leitor escolhe). Qualquer imagem/video colocado
 # em static/backgrounds/ aparece automaticamente no seletor do perfil.
@@ -594,6 +628,7 @@ class ImageCacheEntry:
     media_type: str
 
 
+_reader_init_started_at = _startup_perf_counter()
 reader = MangaReader(
     SimpleNamespace(
         librewolf_path=None,
@@ -602,6 +637,10 @@ reader = MangaReader(
         readfull_api_url="https://readfullapi.herokuapp.com",
         dragontea_browser="edge",
     )
+)
+_STARTUP_TIMINGS["reader_init_ms"] = round(
+    (_startup_perf_counter() - _reader_init_started_at) * 1000,
+    2,
 )
 
 
@@ -998,11 +1037,46 @@ def _resilient_list_chapters(
     )
 
 
+@asynccontextmanager
+async def _app_lifespan(_app: FastAPI):
+    _initialize_catalog_memory_index()
+    yield
+
+
 app = FastAPI(
     title="MangaTemp API",
     version="0.2.0",
     description="API REST local com fontes reais para alimentar o front-end React do MangaTemp.",
+    lifespan=_app_lifespan,
 )
+
+
+def _initialize_catalog_memory_index() -> dict[str, float | int | bool | str]:
+    metrics: dict[str, float | int | bool | str] = dict(_STARTUP_TIMINGS)
+    postgres_started_at = time.perf_counter()
+    try:
+        items = catalog_repository.list_index_items() if catalog_repository is not None else []
+        metrics["postgres_init_ms"] = _elapsed_ms(postgres_started_at)
+        index_stats = catalog_memory_index.rebuild(items)
+        metrics.update({
+            "catalog_index_ready": bool(index_stats["ready"]),
+            "catalog_index_items": int(index_stats["item_count"]),
+            "catalog_index_rebuild_ms": float(index_stats["rebuild_ms"]),
+            "catalog_index_memory_bytes": int(index_stats["memory_bytes"]),
+        })
+    except Exception as exc:
+        metrics["postgres_init_ms"] = _elapsed_ms(postgres_started_at)
+        metrics["catalog_index_ready"] = False
+        metrics["catalog_index_error"] = _safe_error(exc)
+    metrics["app_ready_ms"] = round(
+        (time.perf_counter() - _PROCESS_MODULE_STARTED_AT) * 1000,
+        2,
+    )
+    logging.getLogger("uvicorn.error").info(
+        "startup_metrics %s",
+        json.dumps(metrics, ensure_ascii=True, separators=(",", ":")),
+    )
+    return metrics
 
 
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
@@ -1056,7 +1130,7 @@ app.add_middleware(
     allow_origins=list(settings.allowed_origins),
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=["Accept", "Authorization", "Content-Type", "X-Request-ID"],
-    expose_headers=["X-Request-ID"],
+    expose_headers=["X-Request-ID", "Server-Timing", "X-Kari-Cache-Hit", "X-Kari-Index-Hit"],
     allow_credentials=False,
 )
 
@@ -2092,6 +2166,7 @@ def _catalog_persistence_item(item: dict) -> dict:
 
 
 def _persist_catalog_items(items: list[dict]) -> int:
+    global catalog_cache
     if catalog_repository is None or not items:
         return 0
     prepared = [
@@ -2100,25 +2175,56 @@ def _persist_catalog_items(items: list[dict]) -> int:
         if isinstance(item, dict)
     ]
     try:
-        return catalog_repository.upsert_many(prepared)
+        persisted = catalog_repository.upsert_many(prepared)
     except Exception as exc:
         logger.warning("catalog persistence error=%s", _safe_error(exc))
         return 0
+    if persisted:
+        try:
+            catalog_memory_index.upsert_many(prepared)
+        except Exception as exc:
+            logger.warning("catalog memory index update error=%s", _safe_error(exc))
+        catalog_cache = None
+        search_cache.clear()
+    return persisted
 
 
-def _persistent_catalog_search(query: str, limit: int) -> tuple[list[dict], float, str | None]:
-    started_at = time.perf_counter()
+def _persistent_catalog_search(
+    query: str,
+    limit: int,
+) -> tuple[list[dict], float, float, bool, str | None]:
+    memory_started_at = time.perf_counter()
+    memory_items = catalog_memory_index.search(query, limit)
+    memory_index_ms = _elapsed_ms(memory_started_at)
+    if memory_items:
+        return [
+            _refresh_cover_fields(dict(item))
+            for item in memory_items
+        ], memory_index_ms, 0.0, True, None
+
+    postgres_started_at = time.perf_counter()
     if catalog_repository is None:
-        return _catalog_search_matches(query, limit), _elapsed_ms(started_at), None
+        return (
+            _catalog_search_matches(query, limit),
+            memory_index_ms,
+            0.0,
+            False,
+            None,
+        )
     try:
         items = catalog_repository.search(query, limit)
+        postgres_search_ms = _elapsed_ms(postgres_started_at)
+        try:
+            catalog_memory_index.upsert_many(items)
+        except Exception as exc:
+            logger.warning("catalog memory index hydrate error=%s", _safe_error(exc))
         return [
             _refresh_cover_fields(dict(item))
             for item in items
             if isinstance(item, dict)
-        ], _elapsed_ms(started_at), None
+        ], memory_index_ms, postgres_search_ms, False, None
     except Exception as exc:
-        return [], _elapsed_ms(started_at), _safe_error(exc)
+        return [], memory_index_ms, _elapsed_ms(postgres_started_at), False, _safe_error(exc)
 
 
 def _catalog_search_refresh_due(items: list[dict], now: float | None = None) -> bool:
@@ -3018,36 +3124,43 @@ def _build_catalog(limit: int) -> dict:
     if _cache_is_fresh(catalog_cache, CATALOG_CACHE_TTL_SECONDS):
         return _snapshot_payload(catalog_cache.data, limit)
 
-    if catalog_repository is not None:
+    persistent_items = [
+        _refresh_cover_fields(dict(item))
+        for item in catalog_memory_index.list_home(max(limit, DEFAULT_LIMIT))
+    ]
+    resident_hit = bool(persistent_items)
+    if not persistent_items and not catalog_memory_index.ready and catalog_repository is not None:
         try:
             persistent_items = [
                 _refresh_cover_fields(dict(item))
                 for item in catalog_repository.list_home(max(limit, DEFAULT_LIMIT))
             ]
+            catalog_memory_index.upsert_many(persistent_items)
         except Exception as exc:
             logger.warning("catalog home persistence error=%s", _safe_error(exc))
             persistent_items = []
-        persistent_items = _dedupe(persistent_items)
-        if persistent_items:
-            data = {
-                "items": persistent_items,
-                "sections": _build_sections_from_items(persistent_items, per_section=12),
-                "total": len(persistent_items),
-                "limit": limit,
-                "offset": 0,
-                "sources": list(dict.fromkeys(
-                    str(item.get("source") or _source_label(str(item.get("provider") or "")))
-                    for item in persistent_items
-                    if item.get("source") or item.get("provider")
-                )),
-                "cached": True,
-                "refreshing": True,
-                "version": CATALOG_SNAPSHOT_VERSION,
-                "persistent": True,
-            }
-            catalog_cache = CacheEntry(time.time(), data)
-            _schedule_catalog_refresh(max(limit, DEFAULT_LIMIT))
-            return _snapshot_payload(data, limit)
+    persistent_items = _dedupe(persistent_items)
+    if persistent_items:
+        data = {
+            "items": persistent_items,
+            "sections": _build_sections_from_items(persistent_items, per_section=12),
+            "total": len(persistent_items),
+            "limit": limit,
+            "offset": 0,
+            "sources": list(dict.fromkeys(
+                str(item.get("source") or _source_label(str(item.get("provider") or "")))
+                for item in persistent_items
+                if item.get("source") or item.get("provider")
+            )),
+            "cached": resident_hit,
+            "refreshing": True,
+            "version": CATALOG_SNAPSHOT_VERSION,
+            "persistent": True,
+            "resident": resident_hit,
+        }
+        catalog_cache = CacheEntry(time.time(), data)
+        _schedule_catalog_refresh(max(limit, DEFAULT_LIMIT))
+        return _snapshot_payload(data, limit)
 
     # Compatibilidade de transicao: snapshots antigos podem popular a tela
     # enquanto a migration/seed persistente ainda nao terminou.
@@ -5827,7 +5940,7 @@ def _search_mangas(
     limit: int,
     *,
     defer_refresh: bool = False,
-    timings: dict[str, float] | None = None,
+    timings: dict[str, float | bool] | None = None,
 ) -> dict:
     # Desktop/JSON conserva o fluxo anterior; no Kari Web PostgreSQL e a fonte
     # de verdade e providers nunca bloqueiam uma obra ja conhecida.
@@ -5851,7 +5964,13 @@ def _search_mangas(
         "cached": False,
     }
     if len(normalized_query) < 2:
-        timings.update({"postgres_search_ms": 0.0, "search_total_ms": _elapsed_ms(request_started_at)})
+        timings.update({
+            "memory_index_ms": 0.0,
+            "postgres_search_ms": 0.0,
+            "search_total_ms": _elapsed_ms(request_started_at),
+            "cache_hit": False,
+            "index_hit": False,
+        })
         _log_search_metrics({
             "request_id": request_id,
             "query_hash": query_hash,
@@ -5859,6 +5978,8 @@ def _search_mangas(
             "search_total_ms": _elapsed_ms(request_started_at),
             "request_total_ms": _elapsed_ms(request_started_at),
             "postgres_search_ms": 0.0,
+            "memory_index_ms": 0.0,
+            "index_hit": False,
             "local_results": 0,
             "cache_hit": False,
             "background_refresh_started": False,
@@ -5872,7 +5993,13 @@ def _search_mangas(
     if _cache_is_fresh(cached, SEARCH_CACHE_TTL_SECONDS):
         data = {**cached.data, "cached": True}
         total_ms = _elapsed_ms(request_started_at)
-        timings.update({"postgres_search_ms": 0.0, "search_total_ms": total_ms})
+        timings.update({
+            "memory_index_ms": 0.0,
+            "postgres_search_ms": 0.0,
+            "search_total_ms": total_ms,
+            "cache_hit": True,
+            "index_hit": False,
+        })
         _log_search_metrics({
             "request_id": request_id,
             "query_hash": query_hash,
@@ -5880,6 +6007,8 @@ def _search_mangas(
             "search_total_ms": total_ms,
             "request_total_ms": total_ms,
             "postgres_search_ms": 0.0,
+            "memory_index_ms": 0.0,
+            "index_hit": False,
             "local_results": len(data.get("items") or []),
             "cache_hit": True,
             "background_refresh_started": False,
@@ -5889,7 +6018,7 @@ def _search_mangas(
         })
         return data
 
-    local_items, postgres_search_ms, postgres_error = _persistent_catalog_search(
+    local_items, memory_index_ms, postgres_search_ms, index_hit, postgres_error = _persistent_catalog_search(
         query,
         _search_source_limit(limit),
     )
@@ -5917,8 +6046,11 @@ def _search_mangas(
             data["_refresh_deferred"] = {"query_hash": query_hash}
         total_ms = _elapsed_ms(request_started_at)
         timings.update({
+            "memory_index_ms": memory_index_ms,
             "postgres_search_ms": postgres_search_ms,
             "search_total_ms": total_ms,
+            "cache_hit": False,
+            "index_hit": index_hit,
         })
         _log_search_metrics({
             "request_id": request_id,
@@ -5927,11 +6059,13 @@ def _search_mangas(
             "search_total_ms": total_ms,
             "request_total_ms": total_ms,
             "postgres_search_ms": postgres_search_ms,
+            "memory_index_ms": memory_index_ms,
+            "index_hit": index_hit,
             "local_results": len(ranked_local),
             "cache_hit": False,
             "background_refresh_started": background_started,
             "external_refresh_ms": None,
-            "time_to_first_result_ms": postgres_search_ms,
+            "time_to_first_result_ms": memory_index_ms + postgres_search_ms,
             "providers": [],
         })
         return data
@@ -5970,8 +6104,11 @@ def _search_mangas(
         data["_refresh_deferred"] = {"query_hash": query_hash}
     total_ms = _elapsed_ms(request_started_at)
     timings.update({
+        "memory_index_ms": memory_index_ms,
         "postgres_search_ms": postgres_search_ms,
         "search_total_ms": total_ms,
+        "cache_hit": False,
+        "index_hit": index_hit,
     })
     _log_search_metrics({
         "request_id": request_id,
@@ -5980,6 +6117,8 @@ def _search_mangas(
         "search_total_ms": total_ms,
         "request_total_ms": total_ms,
         "postgres_search_ms": postgres_search_ms,
+        "memory_index_ms": memory_index_ms,
+        "index_hit": index_hit,
         "postgres_error": postgres_error,
         "local_results": 0,
         "cache_hit": False,
@@ -5987,7 +6126,8 @@ def _search_mangas(
         "external_refresh_ms": external_refresh_ms,
         "persisted_count": persisted_count,
         "time_to_first_result_ms": (
-            postgres_search_ms + external_refresh_ms if ranked_external else None
+            memory_index_ms + postgres_search_ms + external_refresh_ms
+            if ranked_external else None
         ),
         "providers": provider_metrics,
     })
@@ -5997,6 +6137,60 @@ def _search_mangas(
 @app.get("/api/capabilities")
 def capabilities() -> dict:
     return settings.public_capabilities()
+
+
+def _public_catalog_url(value: object) -> str:
+    url = str(value or "").strip()
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    if parsed.username or parsed.password:
+        return ""
+    sensitive_query_names = {
+        "access_token", "api_key", "credential", "key", "secret", "signature",
+        "token", "x-amz-credential", "x-amz-security-token", "x-amz-signature",
+    }
+    query_values = parse_qs(parsed.query)
+    if sensitive_query_names.intersection(key.casefold() for key in query_values):
+        return ""
+    for values in query_values.values():
+        for nested_url in values:
+            if "://" in nested_url and not _public_catalog_url(nested_url):
+                return ""
+    return url
+
+
+@app.get("/api/catalog-index")
+def public_catalog_index(request: Request, response: Response) -> dict:
+    """Small public discovery snapshot for a disposable browser-side cache."""
+    _enforce_rate_limit(request, "catalog-index", SEARCH_RATE_LIMIT)
+    items = []
+    version = 0
+    for compact_item in catalog_memory_index.snapshot():
+        item = _refresh_cover_fields(compact_item)
+        last_seen_at = int(float(item.get("_catalog_last_seen_at") or 0))
+        version = max(version, last_seen_at)
+        items.append({
+            "id": str(item.get("id") or ""),
+            "title": str(item.get("title") or ""),
+            "alternative_titles": [
+                str(alias) for alias in (item.get("alternative_titles") or [])
+                if str(alias or "").strip()
+            ],
+            "provider": str(item.get("provider") or ""),
+            "source": str(item.get("source") or ""),
+            "source_url": _public_catalog_url(item.get("source_url")),
+            "cover_url": _public_catalog_url(item.get("cover_url")),
+            "genres": [
+                str(genre) for genre in (item.get("genres") or [])
+                if str(genre or "").strip()
+            ],
+            "chapter_count": int(item.get("chapter_count") or 0),
+            "latest_chapter": str(item.get("latest_chapter") or ""),
+            "catalog_home_ready": bool(item.get("catalog_home_ready")),
+        })
+    response.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=300"
+    return {"version": version, "items": items}
 
 
 @app.get("/health")
@@ -7620,7 +7814,7 @@ def search_mangas(
     """Busca tipada: retorna MangaSearchItem (sinopse, generos, autores, etc.)."""
     _enforce_rate_limit(request, "search", SEARCH_RATE_LIMIT, resource=q.strip().lower())
     started_at = time.perf_counter()
-    timings: dict[str, float] = {}
+    timings: dict[str, float | bool] = {}
     payload = _build_search_payload(
         q,
         genre,
@@ -7631,8 +7825,11 @@ def search_mangas(
     )
     response.headers["Server-Timing"] = ", ".join((
         f"search;dur={_elapsed_ms(started_at):.2f}",
-        f"postgres;dur={timings.get('postgres_search_ms', 0.0):.2f}",
+        f"memory_index;dur={float(timings.get('memory_index_ms', 0.0)):.2f}",
+        f"postgres;dur={float(timings.get('postgres_search_ms', 0.0)):.2f}",
     ))
+    response.headers["X-Kari-Cache-Hit"] = str(bool(timings.get("cache_hit"))).lower()
+    response.headers["X-Kari-Index-Hit"] = str(bool(timings.get("index_hit"))).lower()
     return SearchResponse(**payload)
 
 
@@ -8110,7 +8307,7 @@ def _build_search_payload(
     limit: int,
     offset: int,
     background_tasks: BackgroundTasks | None = None,
-    timings: dict[str, float] | None = None,
+    timings: dict[str, float | bool] | None = None,
 ) -> dict:
     """Logica de BUSCA: payload completo (poucos itens), com traducao."""
     query = q.strip()
