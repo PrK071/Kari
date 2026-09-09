@@ -40,6 +40,7 @@ GIN `gin_trgm_ops` em `search_text`.
 ```text
 request
   -> cache curto descartavel
+  -> indice compacto residente em memoria
   -> catalog_items no PostgreSQL
   -> resposta local
   -> refresh externo posterior (somente se last_seen_at estiver vencido)
@@ -154,3 +155,100 @@ duracoes agregadas no header `Server-Timing`; nenhum termo pesquisado e exposto.
 - Suite Python: 102 passed + 16 subtests passed (PostgreSQL real incluido).
 - Frontend: 15 passed.
 - Vite production build: PASS (1.853 modules transformed).
+
+## Indice residente e cold-start percebido (2026-09-09)
+
+O PostgreSQL continua sendo a fonte de verdade. No startup, uma unica leitura de
+`catalog_items` constroi um snapshot compacto; buscas conhecidas e a Home passam
+a ler esse snapshot. Miss do indice ainda faz fallback PostgreSQL e resultados
+persistidos por scrapers so entram na RAM depois do commit. Falha de rebuild nao
+altera o snapshot anterior nem o banco.
+
+Estado medido no Render: 490 registros, 1.015.863 bytes (~992 KiB) de RAM e
+176,25 ms para projetar, indexar e medir o snapshot depois da leitura SQL. No
+ambiente local, a mesma operacao levou 52--56 ms. Exact title/alias usa mapas;
+prefix/contains faz varredura simples e fuzzy so roda se os estagios anteriores
+nao encontrarem nada.
+
+### Benchmark aquecido
+
+Foram feitas 15 buscas com chaves de cache HTTP novas (tres por titulo) e depois
+15 repeticoes, sempre com o Render acordado. `index_hit=true` e
+`postgres;dur=0.00` ocorreram em todos os misses conhecidos.
+
+| Metrica | Antes (PostgreSQL por miss) | Depois (RAM por miss) | Delta |
+|---|---:|---:|---:|
+| cliente p50 | 631,10 ms | 138,79 ms | -78,0% |
+| servidor p50 | 481,12 ms | 0,51 ms | -99,9% |
+| PostgreSQL p50 no request | 472,70 ms | 0,00 ms | -100% |
+| indice RAM p50 | n/a | 0,03 ms | n/a |
+| cliente p95 amostral | n/a | 250,27 ms | n/a |
+| servidor p95 amostral | n/a | 0,86 ms | n/a |
+
+Smoke test no ultimo deploy (uma amostra por query):
+
+| Query | cliente (ms) | servidor (ms) | indice RAM (ms) | PostgreSQL (ms) |
+|---|---:|---:|---:|---:|
+| hunter x hunter | 140,80 | 0,84 | 0,05 | 0,00 |
+| naruto | 138,75 | 0,52 | 0,02 | 0,00 |
+| berserk | 139,56 | 0,51 | 0,02 | 0,00 |
+| one piece | 137,84 | 0,74 | 0,04 | 0,00 |
+| vinland saga | 141,02 | 0,54 | 0,03 | 0,00 |
+
+Repeticoes ficaram em 139,55 ms p50 no cliente e 0,29 ms p50 no servidor. Em
+10 requests simultaneos, o servidor continuou em ~0,30 ms p50, mas o cliente
+subiu para ~1,98 s p50. Portanto essa degradacao concorrente esta no caminho
+publico/instancia Free, nao no algoritmo de busca ou no Neon.
+
+### IndexedDB publico
+
+O frontend salva um snapshot separado com whitelist estrita: id, titulo,
+aliases, provider/source e URL publica da obra, capa publica, generos e resumo de
+capitulos. Tokens, perfil, historico, favoritos, credenciais e URLs assinadas sao
+descartados. O snapshot atual tem 490 itens e ~300.037 bytes em JSON. A busca
+local sobre ele levou em media 6,47 ms em 1.000 execucoes no Node local.
+
+Em visita recorrente, a Home e a busca podem mostrar o ultimo catalogo enquanto
+o Render acorda; a interface sinaliza explicitamente que exibe dados salvos e
+esta reconectando. A leitura IndexedDB real varia por navegador e nao foi usada
+como numero de benchmark. Depois que qualquer request ao backend conclui, a
+sincronizacao de `/api/catalog-index` ocorre em background.
+
+### Startup real
+
+`startup_metrics` agora separa as fases e pode ser consultado em
+`/api/diagnostics/startup`. Duas inicializacoes reais de deploy no Render deram
+17,19 s e 21,90 s ate o app pronto. A amostra mais recente:
+
+| Fase | Duracao |
+|---|---:|
+| imports Python | 14.507,10 ms |
+| config | 0,14 ms |
+| scraper runtime | 0,07 ms |
+| repository/engine | 1.311,16 ms |
+| Object Storage | 0,01 ms |
+| MangaReader | 85,05 ms |
+| restante do setup de modulo | 2.703,86 ms |
+| primeira leitura PostgreSQL | 3.114,82 ms |
+| rebuild/medicao do indice | 176,25 ms |
+| app pronto (cumulativo) | 21.898,51 ms |
+
+O baseline externo de ~53 s inclui tanto provisionamento/roteamento do Render
+quanto o startup Python. Comparando amostras nao simultaneas, o residuo de
+plataforma fica aproximadamente em 31--36 s; isso e estimativa, nao uma nova
+medicao controlada de spin-down. Nenhum keepalive foi adicionado.
+
+PyMuPDF, Playwright e boto3/client B2 agora sao carregados somente no primeiro
+uso. Em tres imports locais, Playwright/PyMuPDF/boto3 permaneceram ausentes de
+`sys.modules`; Object Storage caiu de 508,08 ms para 0,01 ms no caminho de
+startup local. As operacoes desktop/PDF/browser e B2 preservam as interfaces e
+foram verificadas depois da mudanca. Nao foi tentado lazy-load do `reader_server`
+inteiro: o ganho adicional nao justificaria o risco estrutural para desktop.
+
+### Verificacao desta fase
+
+- Python: 116 passed + 16 subtests passed.
+- Frontend: 19 passed.
+- Vite production build: PASS (1.854 modulos transformados).
+- `/health`, `/ready`, `/api/home` e `/api/catalog-index` no Render: HTTP 200.
+- PostgreSQL/Neon, B2, providers, schema e hospedagem: inalterados.
