@@ -224,6 +224,7 @@ class PostgresFirstSearchTests(unittest.TestCase):
 
         self.assertTrue(metrics["catalog_index_ready"])
         self.assertEqual(metrics["catalog_index_items"], 1)
+        self.assertEqual(main.startup_metrics["catalog_index_items"], 1)
         self.assertEqual(main.catalog_memory_index.search("hunter x hunter", 5)[0]["title"], "Hunter x Hunter")
 
     def test_search_response_exposes_resident_index_timings(self) -> None:

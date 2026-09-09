@@ -5,7 +5,9 @@ from time import perf_counter as _startup_perf_counter, time as _startup_wall_ti
 _PROCESS_MODULE_STARTED_AT = _startup_perf_counter()
 _STARTUP_TIMINGS: dict[str, float | int | bool] = {
     "process_start_epoch_ms": round(_startup_wall_time() * 1000, 2),
+    "process_start_ms": 0.0,
 }
+startup_metrics: dict[str, float | int | bool | str] = {}
 
 import copy
 import atexit
@@ -1072,6 +1074,8 @@ def _initialize_catalog_memory_index() -> dict[str, float | int | bool | str]:
         (time.perf_counter() - _PROCESS_MODULE_STARTED_AT) * 1000,
         2,
     )
+    startup_metrics.clear()
+    startup_metrics.update(metrics)
     logging.getLogger("uvicorn.error").info(
         "startup_metrics %s",
         json.dumps(metrics, ensure_ascii=True, separators=(",", ":")),
@@ -6137,6 +6141,12 @@ def _search_mangas(
 @app.get("/api/capabilities")
 def capabilities() -> dict:
     return settings.public_capabilities()
+
+
+@app.get("/api/diagnostics/startup")
+def startup_diagnostics(request: Request) -> dict:
+    _enforce_rate_limit(request, "startup-diagnostics", SEARCH_RATE_LIMIT)
+    return dict(startup_metrics)
 
 
 def _public_catalog_url(value: object) -> str:
